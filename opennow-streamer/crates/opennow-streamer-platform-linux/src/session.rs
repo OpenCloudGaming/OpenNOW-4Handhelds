@@ -1,0 +1,2389 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use crate::audio::{AudioSink, OpusDecoder, open_audio_fallback, open_audio_sink};
+use crate::queue::{BoundedQueue, QueuePop, QueuePush};
+use crate::timing::{DecodeTimingProbe, DecodeTimings};
+use crate::video::{VideoDecoder, open_v4l2};
+use crate::{
+    AudioBackend, AudioConfig, AudioPacket, DecodedVideoFrame, EncodedVideoFrame, Error, Result,
+    StreamFormat, Subsystem, VideoCodec,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderBackend {
+    Mpp,
+    Vulkan,
+    Cuda,
+    VaApi,
+    V4l2,
+    Ffmpeg,
+}
+
+impl DecoderBackend {
+    pub fn embedded_presentation_error(self) -> Option<&'static str> {
+        (self == Self::Vulkan).then_some(
+            "embedded Vulkan requires a shared device with an isolated Qt graphics queue; an independent device cannot be presented by this stream view",
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderPreference {
+    Automatic,
+    HardwareOnly,
+    MppOnly,
+    VulkanOnly,
+    CudaOnly,
+    VaApiThenV4l2,
+    V4l2ThenVaApi,
+    VaApiOnly,
+    V4l2Only,
+    SoftwareOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleState {
+    Starting,
+    Running,
+    Reconfiguring,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+impl LifecycleState {
+    fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Starting,
+                Self::Running | Self::Failed | Self::Stopping
+            ) | (
+                Self::Running,
+                Self::Reconfiguring | Self::Stopping | Self::Failed
+            ) | (
+                Self::Reconfiguring,
+                Self::Running | Self::Stopping | Self::Failed
+            ) | (Self::Stopping, Self::Stopped | Self::Failed)
+                | (Self::Failed, Self::Stopping)
+        ) || self == next
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub codec: VideoCodec,
+    pub stream_format: StreamFormat,
+    pub decoder_preference: DecoderPreference,
+    pub embedded_presentation: bool,
+    pub vulkan_device: Option<Arc<crate::SharedVulkanDevice>>,
+    pub v4l2_device: Option<PathBuf>,
+    pub encoded_queue_depth: usize,
+    pub decoded_queue_depth: usize,
+    pub audio: Option<AudioConfig>,
+}
+
+impl SessionConfig {
+    pub fn new(stream_format: StreamFormat) -> Self {
+        Self {
+            codec: VideoCodec::H264,
+            stream_format,
+            decoder_preference: DecoderPreference::Automatic,
+            embedded_presentation: false,
+            vulkan_device: None,
+            v4l2_device: None,
+            // Hardware decoders can briefly stop consuming while the driver
+            // retires a large frame or reallocates surfaces. Four frames is
+            // too small for a 120 Hz stream and turns a harmless burst into a
+            // decoder reset. Keep this bounded, but absorb roughly two frame
+            // batches before initiating keyframe recovery.
+            encoded_queue_depth: 16,
+            decoded_queue_depth: 3,
+            audio: Some(AudioConfig::default()),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.stream_format.validate()?;
+        if self.encoded_queue_depth == 0 || self.encoded_queue_depth > 64 {
+            return Err(Error::InvalidFormat(
+                "encoded video queue depth must be between 1 and 64".to_owned(),
+            ));
+        }
+        if self.decoded_queue_depth == 0 || self.decoded_queue_depth > 16 {
+            return Err(Error::InvalidFormat(
+                "decoded video queue depth must be between 1 and 16".to_owned(),
+            ));
+        }
+        if let Some(audio) = &self.audio {
+            audio.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    Queued,
+    DroppedOldest,
+    Paused,
+    AudioDisabled,
+}
+
+#[derive(Debug)]
+pub enum BackendEvent {
+    StateChanged(LifecycleState),
+    DecoderSelected(DecoderBackend),
+    DecoderChanged {
+        from: DecoderBackend,
+        to: DecoderBackend,
+        reason: String,
+    },
+    AudioSelected(AudioBackend),
+    AudioDecodeError {
+        message: String,
+        consecutive: u32,
+    },
+    AudioOutputError {
+        backend: AudioBackend,
+        message: String,
+    },
+    AudioOutputRecovered {
+        from: AudioBackend,
+        to: AudioBackend,
+    },
+    AudioUnavailable {
+        backend: AudioBackend,
+        reason: String,
+        rejected: u64,
+    },
+    FormatChanged(StreamFormat),
+    NeedKeyframe,
+    QueueOverflow {
+        media: &'static str,
+    },
+    DeviceLost {
+        subsystem: Subsystem,
+        reason: String,
+    },
+    Error(String),
+}
+
+enum VideoCommand {
+    Decode {
+        frame: EncodedVideoFrame,
+        generation: u64,
+        reset: bool,
+    },
+    Reconfigure {
+        format: StreamFormat,
+        generation: u64,
+    },
+}
+
+type EventQueue = Arc<BoundedQueue<BackendEvent>>;
+
+pub struct LinuxSession {
+    config: SessionConfig,
+    state: Arc<Mutex<LifecycleState>>,
+    video_commands: Arc<BoundedQueue<VideoCommand>>,
+    decoded_frames: Arc<BoundedQueue<DecodedVideoFrame>>,
+    audio_packets: Option<Arc<BoundedQueue<AudioPacket>>>,
+    audio_unavailable: Arc<AtomicBool>,
+    events: EventQueue,
+    video_generation: AtomicU64,
+    video_needs_keyframe: AtomicBool,
+    paused: AtomicBool,
+    video_submit: Mutex<()>,
+    decode_timings: DecodeTimingProbe,
+    video_worker: Option<JoinHandle<()>>,
+    audio_worker: Option<JoinHandle<()>>,
+}
+
+impl LinuxSession {
+    pub fn start(config: SessionConfig) -> Result<Self> {
+        config.validate()?;
+        let state = Arc::new(Mutex::new(LifecycleState::Starting));
+        let video_commands = Arc::new(BoundedQueue::new(config.encoded_queue_depth));
+        let decoded_frames = Arc::new(BoundedQueue::new(config.decoded_queue_depth));
+        let events = Arc::new(BoundedQueue::new(64));
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let decode_timings = DecodeTimingProbe::default();
+        let video_worker = {
+            let config = config.clone();
+            let state = Arc::clone(&state);
+            let commands = Arc::clone(&video_commands);
+            let decoded = Arc::clone(&decoded_frames);
+            let events = Arc::clone(&events);
+            let decode_timings = decode_timings.clone();
+            thread::Builder::new()
+                .name("opennow-linux-video".to_owned())
+                .spawn(move || {
+                    run_video_worker(
+                        config,
+                        state,
+                        commands,
+                        decoded,
+                        events,
+                        decode_timings,
+                        startup_tx,
+                    )
+                })
+                .map_err(|error| Error::io(Subsystem::Session, error))?
+        };
+        match startup_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                video_commands.close();
+                let _ = video_worker.join();
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                video_commands.close();
+                let _ = video_worker.join();
+                return Err(Error::WorkerPanic("video startup"));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                video_commands.close();
+                let _ = video_worker.join();
+                return Err(Error::backend(
+                    Subsystem::Session,
+                    "video worker startup timed out and was cancelled",
+                ));
+            }
+        }
+
+        let audio_unavailable = Arc::new(AtomicBool::new(false));
+        let (audio_packets, audio_worker) = if let Some(audio_config) = config.audio.clone() {
+            let queue = Arc::new(BoundedQueue::new(audio_config.queue_depth));
+            let (audio_start_tx, audio_start_rx) = mpsc::sync_channel(1);
+            let worker = {
+                let queue = Arc::clone(&queue);
+                let events = Arc::clone(&events);
+                let unavailable = Arc::clone(&audio_unavailable);
+                match thread::Builder::new()
+                    .name("opennow-linux-audio".to_owned())
+                    .spawn(move || {
+                        run_audio_worker(audio_config, queue, events, unavailable, audio_start_tx)
+                    }) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        video_commands.close();
+                        let _ = video_worker.join();
+                        return Err(Error::io(Subsystem::Session, error));
+                    }
+                }
+            };
+            match audio_start_rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Ok(_)) => (Some(queue), Some(worker)),
+                Ok(Err(error)) => {
+                    queue.close();
+                    let _ = worker.join();
+                    video_commands.close();
+                    let _ = video_worker.join();
+                    return Err(error);
+                }
+                Err(_) => {
+                    queue.close();
+                    let _ = worker.join();
+                    video_commands.close();
+                    let _ = video_worker.join();
+                    return Err(Error::backend(
+                        Subsystem::Session,
+                        "audio worker startup timed out",
+                    ));
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            config,
+            state,
+            video_commands,
+            decoded_frames,
+            audio_packets,
+            audio_unavailable,
+            events,
+            video_generation: AtomicU64::new(0),
+            video_needs_keyframe: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            video_submit: Mutex::new(()),
+            decode_timings,
+            video_worker: Some(video_worker),
+            audio_worker,
+        })
+    }
+
+    pub fn state(&self) -> LifecycleState {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub fn decode_timings(&self) -> DecodeTimings {
+        self.decode_timings.snapshot()
+    }
+
+    pub fn submit_video(&self, frame: EncodedVideoFrame) -> Result<PushOutcome> {
+        frame.validate()?;
+        if self.state() != LifecycleState::Running {
+            return Err(Error::NotRunning);
+        }
+        if self.paused.load(Ordering::Acquire) {
+            return Ok(PushOutcome::Paused);
+        }
+        let _submission = self
+            .video_submit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        queue_video_command(
+            &self.video_commands,
+            &self.events,
+            &self.video_generation,
+            &self.video_needs_keyframe,
+            frame,
+        )
+    }
+
+    pub fn submit_audio(&self, packet: AudioPacket) -> Result<PushOutcome> {
+        packet.validate()?;
+        if self.state() != LifecycleState::Running {
+            return Err(Error::NotRunning);
+        }
+        if self.audio_unavailable.load(Ordering::Acquire) {
+            return Ok(PushOutcome::AudioDisabled);
+        }
+        if self.paused.load(Ordering::Acquire) {
+            return Ok(PushOutcome::Paused);
+        }
+        let queue = self.audio_packets.as_ref().ok_or_else(|| {
+            Error::unavailable(Subsystem::Session, "audio is disabled for this session")
+        })?;
+        submit_audio_packet(queue, &self.audio_unavailable, &self.events, packet)
+    }
+
+    pub fn reconfigure(&self, format: StreamFormat) -> Result<()> {
+        format.validate()?;
+        if self.state() != LifecycleState::Running {
+            return Err(Error::NotRunning);
+        }
+        let _submission = self
+            .video_submit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.video_needs_keyframe.store(true, Ordering::Release);
+        let generation = self.video_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        match self
+            .video_commands
+            .replace(VideoCommand::Reconfigure { format, generation })
+        {
+            QueuePush::Added | QueuePush::DroppedOldest => Ok(()),
+            QueuePush::Full => unreachable!(),
+            QueuePush::Closed => Err(Error::QueueClosed),
+        }
+    }
+
+    pub fn set_paused(&self, paused: bool) -> Result<()> {
+        if self.state() != LifecycleState::Running {
+            return Err(Error::NotRunning);
+        }
+        let was_paused = self.paused.swap(paused, Ordering::AcqRel);
+        if was_paused == paused {
+            return Ok(());
+        }
+        self.video_commands.clear();
+        self.decoded_frames.clear();
+        if let Some(audio) = &self.audio_packets {
+            audio.clear();
+        }
+        if !paused {
+            self.reconfigure(self.config.stream_format)?;
+        }
+        Ok(())
+    }
+
+    pub fn try_recv_frame(&self) -> Option<DecodedVideoFrame> {
+        self.decoded_frames.try_pop()
+    }
+
+    pub fn try_recv_latest_frame(&self) -> Option<(DecodedVideoFrame, usize)> {
+        self.decoded_frames.try_pop_latest()
+    }
+
+    pub fn recv_frame_timeout(&self, timeout: Duration) -> Option<DecodedVideoFrame> {
+        self.decoded_frames.pop_timeout(timeout)
+    }
+
+    pub fn try_recv_event(&self) -> Option<BackendEvent> {
+        self.events.try_pop()
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        let current = self.state();
+        if matches!(current, LifecycleState::Stopped) {
+            return Ok(());
+        }
+        transition_state(&self.state, LifecycleState::Stopping, &self.events);
+        self.video_commands.close();
+        if let Some(queue) = &self.audio_packets {
+            queue.close();
+        }
+        let mut failure = None;
+        if let Some(worker) = self.video_worker.take() {
+            if worker.join().is_err() {
+                failure = Some(Error::WorkerPanic("video"));
+            }
+        }
+        if let Some(worker) = self.audio_worker.take() {
+            if worker.join().is_err() && failure.is_none() {
+                failure = Some(Error::WorkerPanic("audio"));
+            }
+        }
+        self.decoded_frames.close();
+        if self.state() == LifecycleState::Failed {
+            transition_state(&self.state, LifecycleState::Stopping, &self.events);
+        }
+        transition_state(&self.state, LifecycleState::Stopped, &self.events);
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub fn config(&self) -> &SessionConfig {
+        &self.config
+    }
+}
+
+impl Drop for LinuxSession {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn queue_video_command(
+    commands: &BoundedQueue<VideoCommand>,
+    events: &EventQueue,
+    generation: &AtomicU64,
+    needs_keyframe: &AtomicBool,
+    frame: EncodedVideoFrame,
+) -> Result<PushOutcome> {
+    // Once an access unit has been dropped, later inter-frames are no longer
+    // decodable. Do not let them fill the queue or evict the recovery IDR.
+    // The first keyframe atomically replaces only decode work (never control
+    // commands) and starts a fresh decoder generation.
+    if needs_keyframe.load(Ordering::Acquire) {
+        if !frame.keyframe {
+            return Ok(PushOutcome::DroppedOldest);
+        }
+        let generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        return match commands.replace_where(
+            VideoCommand::Decode {
+                frame,
+                generation,
+                reset: true,
+            },
+            |queued| matches!(queued, VideoCommand::Decode { .. }),
+        ) {
+            QueuePush::Added => {
+                needs_keyframe.store(false, Ordering::Release);
+                Ok(PushOutcome::Queued)
+            }
+            QueuePush::DroppedOldest => {
+                needs_keyframe.store(false, Ordering::Release);
+                Ok(PushOutcome::DroppedOldest)
+            }
+            QueuePush::Full => Ok(PushOutcome::DroppedOldest),
+            QueuePush::Closed => Err(Error::QueueClosed),
+        };
+    }
+
+    let active_generation = generation.load(Ordering::Acquire);
+    match commands.push(VideoCommand::Decode {
+        frame: frame.clone(),
+        generation: active_generation,
+        reset: false,
+    }) {
+        QueuePush::Added => Ok(PushOutcome::Queued),
+        QueuePush::Full => {
+            emit(events, BackendEvent::QueueOverflow { media: "video" });
+            needs_keyframe.store(true, Ordering::Release);
+
+            // A keyframe that happens to arrive at the overflow boundary can
+            // recover immediately. Non-keyframes are deliberately discarded;
+            // preserving the already queued contiguous frames is preferable to
+            // repeatedly reopening the decoder with an undecodable P-frame.
+            if frame.keyframe {
+                let recovery_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                match commands.replace_where(
+                    VideoCommand::Decode {
+                        frame,
+                        generation: recovery_generation,
+                        reset: true,
+                    },
+                    |queued| matches!(queued, VideoCommand::Decode { .. }),
+                ) {
+                    QueuePush::Closed => return Err(Error::QueueClosed),
+                    QueuePush::Added | QueuePush::DroppedOldest => {
+                        needs_keyframe.store(false, Ordering::Release);
+                    }
+                    QueuePush::Full => {}
+                }
+            } else {
+                emit(events, BackendEvent::NeedKeyframe);
+            }
+            Ok(PushOutcome::DroppedOldest)
+        }
+        QueuePush::DroppedOldest => unreachable!(),
+        QueuePush::Closed => Err(Error::QueueClosed),
+    }
+}
+
+#[derive(Default)]
+struct ReferenceRecovery {
+    attempts_without_output: u8,
+}
+
+impl ReferenceRecovery {
+    fn try_recover(&mut self) -> bool {
+        if self.attempts_without_output >= 3 {
+            return false;
+        }
+        self.attempts_without_output += 1;
+        true
+    }
+
+    fn decoded_output(&mut self) {
+        self.attempts_without_output = 0;
+    }
+}
+
+fn publish_video_readiness(
+    state: &Mutex<LifecycleState>,
+    events: &EventQueue,
+    backend: DecoderBackend,
+    startup: &mpsc::SyncSender<Result<DecoderBackend>>,
+) -> bool {
+    emit(events, BackendEvent::DecoderSelected(backend));
+    transition_state(state, LifecycleState::Running, events);
+    startup.send(Ok(backend)).is_ok()
+}
+
+fn run_video_worker(
+    config: SessionConfig,
+    state: Arc<Mutex<LifecycleState>>,
+    commands: Arc<BoundedQueue<VideoCommand>>,
+    decoded: Arc<BoundedQueue<DecodedVideoFrame>>,
+    events: EventQueue,
+    decode_timings: DecodeTimingProbe,
+    startup: mpsc::SyncSender<Result<DecoderBackend>>,
+) {
+    let (mut backend, mut decoder) = match open_preferred_decoder(&config, config.stream_format) {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = startup.send(Err(error));
+            transition_state(&state, LifecycleState::Failed, &events);
+            return;
+        }
+    };
+    if !publish_video_readiness(&state, &events, backend, &startup) {
+        return;
+    }
+    // Never feed a fresh hardware decoder an inter-frame packet. In
+    // particular, an AV1 stream can deliver its sequence header separately;
+    // treating the following delta frame as startup input caused an avoidable
+    // backend fallback and a large visible hitch.
+    let mut need_keyframe = true;
+    let mut reference_recovery = ReferenceRecovery::default();
+    emit(&events, BackendEvent::NeedKeyframe);
+
+    let mut active_format = config.stream_format;
+    let mut active_generation = 0;
+    loop {
+        let poll_output = (backend == DecoderBackend::V4l2 || backend == DecoderBackend::Mpp)
+            && (config.codec == VideoCodec::H264 || config.codec == VideoCodec::H265);
+        let command =
+            match commands.wait_pop(Duration::from_millis(if poll_output { 5 } else { 100 })) {
+                QueuePop::Item(command) => Some(command),
+                QueuePop::TimedOut if poll_output => None,
+                QueuePop::TimedOut => continue,
+                QueuePop::Closed => break,
+            };
+        let frame = match command {
+            Some(VideoCommand::Reconfigure { format, generation }) => {
+                if generation < active_generation {
+                    continue;
+                }
+                transition_state(&state, LifecycleState::Reconfiguring, &events);
+                finish_decoder_drain(
+                    flush_decoder(&mut decoder),
+                    &decoded,
+                    &events,
+                    &decode_timings,
+                    "reconfigure",
+                );
+                decoded.clear();
+                decode_timings.clear();
+                match open_preferred_decoder(&config, format) {
+                    Ok((new_backend, new_decoder)) => {
+                        if new_backend != backend {
+                            emit(
+                                &events,
+                                BackendEvent::DecoderChanged {
+                                    from: backend,
+                                    to: new_backend,
+                                    reason: "stream format changed".to_owned(),
+                                },
+                            );
+                        }
+                        backend = new_backend;
+                        decoder = new_decoder;
+                        active_format = format;
+                        active_generation = generation;
+                        need_keyframe = true;
+                        emit(&events, BackendEvent::FormatChanged(format));
+                        emit(&events, BackendEvent::NeedKeyframe);
+                        transition_state(&state, LifecycleState::Running, &events);
+                    }
+                    Err(error) => {
+                        report_worker_error(&state, &events, error);
+                        return;
+                    }
+                }
+                continue;
+            }
+            Some(VideoCommand::Decode {
+                frame,
+                generation,
+                reset,
+            }) => {
+                if generation < active_generation {
+                    continue;
+                }
+                if reset || generation > active_generation {
+                    decoded.clear();
+                    decode_timings.clear();
+                    match open_preferred_decoder(&config, active_format) {
+                        Ok((new_backend, new_decoder)) => {
+                            if new_backend != backend {
+                                emit(
+                                    &events,
+                                    BackendEvent::DecoderChanged {
+                                        from: backend,
+                                        to: new_backend,
+                                        reason: "encoded queue discontinuity".to_owned(),
+                                    },
+                                );
+                            }
+                            backend = new_backend;
+                            decoder = new_decoder;
+                            active_generation = generation;
+                        }
+                        Err(error) => {
+                            report_worker_error(&state, &events, error);
+                            return;
+                        }
+                    }
+                    need_keyframe = true;
+                }
+                if need_keyframe && !frame.keyframe {
+                    continue;
+                }
+                Some(frame)
+            }
+            None => None,
+        };
+        if let Some(frame) = frame.as_ref() {
+            decode_timings.record_submission(frame.timestamp_us);
+        }
+        let call_started = Instant::now();
+        let result = if let Some(frame) = frame.as_ref() {
+            decode_frame(&mut decoder, frame)
+        } else {
+            poll_decoder(&mut decoder)
+        };
+        let call_duration = call_started.elapsed();
+        match result {
+            Ok(frames) => {
+                if frame.is_some() || !frames.is_empty() {
+                    need_keyframe = false;
+                }
+                if !frames.is_empty() {
+                    reference_recovery.decoded_output();
+                }
+                if let Some(format) = decoder.take_format_change() {
+                    active_format = format;
+                    emit(&events, BackendEvent::FormatChanged(format));
+                }
+                record_decoded_outputs(&decode_timings, &frames);
+                decode_timings.record_call(call_duration, !frames.is_empty());
+                enqueue_frames(&decoded, &events, frames);
+            }
+            Err(error @ Error::ReferenceLost { .. }) => {
+                decoded.clear();
+                if !reference_recovery.try_recover() {
+                    report_worker_error(&state, &events, error);
+                    return;
+                }
+                drop(decoder);
+                match open_decoder(&config, active_format, backend) {
+                    Ok(new_decoder) => decoder = new_decoder,
+                    Err(error) => {
+                        report_worker_error(&state, &events, error);
+                        return;
+                    }
+                }
+                decode_timings.clear();
+                need_keyframe = true;
+                emit(&events, BackendEvent::NeedKeyframe);
+            }
+            Err(error) => match open_fallback_decoder(&config, active_format, backend) {
+                Ok((new_backend, mut new_decoder)) => {
+                    let reason = error.to_string();
+                    emit(
+                        &events,
+                        BackendEvent::DecoderChanged {
+                            from: backend,
+                            to: new_backend,
+                            reason,
+                        },
+                    );
+                    backend = new_backend;
+                    decode_timings.clear();
+                    if let Some(frame) = frame.as_ref().filter(|frame| frame.keyframe) {
+                        decode_timings.record_submission(frame.timestamp_us);
+                        let retry_started = Instant::now();
+                        match decode_frame(&mut new_decoder, frame) {
+                            Ok(frames) => {
+                                if let Some(format) = new_decoder.take_format_change() {
+                                    active_format = format;
+                                    emit(&events, BackendEvent::FormatChanged(format));
+                                }
+                                record_decoded_outputs(&decode_timings, &frames);
+                                decode_timings
+                                    .record_call(retry_started.elapsed(), !frames.is_empty());
+                                enqueue_frames(&decoded, &events, frames);
+                            }
+                            Err(fallback_error) => {
+                                report_worker_error(&state, &events, fallback_error);
+                                return;
+                            }
+                        }
+                        need_keyframe = false;
+                    } else {
+                        need_keyframe = true;
+                        emit(&events, BackendEvent::NeedKeyframe);
+                    }
+                    decoder = new_decoder;
+                }
+                Err(_) => {
+                    report_worker_error(&state, &events, error);
+                    return;
+                }
+            },
+        }
+    }
+    finish_decoder_drain(
+        flush_decoder(&mut decoder),
+        &decoded,
+        &events,
+        &decode_timings,
+        "shutdown",
+    );
+}
+
+const AUDIO_DECODE_STRIKES_BEFORE_RESET: u32 = 8;
+const AUDIO_DECODER_RESET_LIMIT: u32 = 2;
+
+struct AudioRecovery {
+    consecutive_rejections: u32,
+    rejections: u64,
+    resets: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioRecoveryAction {
+    Skip,
+    ResetDecoder,
+    GiveUp,
+}
+
+impl AudioRecovery {
+    fn record_decoded(&mut self) {
+        self.consecutive_rejections = 0;
+    }
+
+    fn record_rejection(&mut self) -> AudioRecoveryAction {
+        self.consecutive_rejections += 1;
+        self.rejections += 1;
+        if self.consecutive_rejections < AUDIO_DECODE_STRIKES_BEFORE_RESET {
+            return AudioRecoveryAction::Skip;
+        }
+        if self.resets >= AUDIO_DECODER_RESET_LIMIT {
+            return AudioRecoveryAction::GiveUp;
+        }
+        AudioRecoveryAction::ResetDecoder
+    }
+
+    fn record_reset(&mut self) {
+        self.consecutive_rejections = 0;
+        self.resets += 1;
+    }
+}
+
+fn audio_unavailable(
+    packets: &BoundedQueue<AudioPacket>,
+    events: &EventQueue,
+    unavailable: &AtomicBool,
+    backend: AudioBackend,
+    recovery: &AudioRecovery,
+    reason: String,
+) {
+    unavailable.store(true, Ordering::Release);
+    packets.close();
+    emit(
+        events,
+        BackendEvent::AudioUnavailable {
+            backend,
+            reason,
+            rejected: recovery.rejections,
+        },
+    );
+}
+
+fn submit_audio_packet(
+    queue: &BoundedQueue<AudioPacket>,
+    unavailable: &AtomicBool,
+    events: &EventQueue,
+    packet: AudioPacket,
+) -> Result<PushOutcome> {
+    if unavailable.load(Ordering::Acquire) {
+        return Ok(PushOutcome::AudioDisabled);
+    }
+    match queue.push_latest(packet) {
+        QueuePush::Added => Ok(PushOutcome::Queued),
+        QueuePush::DroppedOldest => {
+            emit(events, BackendEvent::QueueOverflow { media: "audio" });
+            Ok(PushOutcome::DroppedOldest)
+        }
+        QueuePush::Full => unreachable!(),
+        QueuePush::Closed => {
+            if unavailable.load(Ordering::Acquire) {
+                Ok(PushOutcome::AudioDisabled)
+            } else {
+                Err(Error::QueueClosed)
+            }
+        }
+    }
+}
+
+fn run_audio_worker(
+    config: AudioConfig,
+    packets: Arc<BoundedQueue<AudioPacket>>,
+    events: EventQueue,
+    unavailable: Arc<AtomicBool>,
+    startup: mpsc::SyncSender<Result<AudioBackend>>,
+) {
+    let mut opus = match OpusDecoder::open(&config) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            let _ = startup.send(Err(error));
+            return;
+        }
+    };
+    let mut sink: Box<dyn AudioSink + Send> = match open_audio_sink(&config) {
+        Ok(sink) => sink,
+        Err(error) => {
+            let _ = startup.send(Err(error));
+            return;
+        }
+    };
+    let mut backend = sink.backend();
+    let _ = startup.send(Ok(backend));
+    emit(&events, BackendEvent::AudioSelected(backend));
+    let mut recovery = AudioRecovery {
+        consecutive_rejections: 0,
+        rejections: 0,
+        resets: 0,
+    };
+    let mut rebuild_decoder = false;
+    loop {
+        if rebuild_decoder {
+            rebuild_decoder = false;
+            match OpusDecoder::open(&config) {
+                Ok(decoder) => {
+                    opus = decoder;
+                    recovery.record_reset();
+                }
+                Err(error) => {
+                    audio_unavailable(
+                        &packets,
+                        &events,
+                        &unavailable,
+                        backend,
+                        &recovery,
+                        format!("the Opus decoder could not be rebuilt: {error}"),
+                    );
+                    return;
+                }
+            }
+        }
+        let mut packet = match packets.wait_pop(Duration::from_millis(100)) {
+            QueuePop::Item(packet) => packet,
+            QueuePop::TimedOut => continue,
+            QueuePop::Closed => break,
+        };
+        // A few late packets are fine. A pile means playback fell behind, and
+        // playing them all (or concealing the holes) turns into chop and static.
+        if packets.len() > 3 {
+            if let Some((latest, _)) = packets.try_pop_latest() {
+                opus.accept_discontinuity(&latest);
+                packet = latest;
+            }
+        }
+        let cancelled = || packets.is_closed();
+        let concealed = match opus.conceal_before(&packet) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                opus.record_dropped_packet(&packet);
+                match record_audio_decode_failure(&events, &mut recovery, error.to_string()) {
+                    AudioRecoveryAction::Skip => {}
+                    AudioRecoveryAction::ResetDecoder => rebuild_decoder = true,
+                    AudioRecoveryAction::GiveUp => {
+                        audio_unavailable(
+                            &packets,
+                            &events,
+                            &unavailable,
+                            backend,
+                            &recovery,
+                            format!("the audio decoder rejected {} packets", recovery.rejections),
+                        );
+                        return;
+                    }
+                }
+                continue;
+            }
+        };
+        if !concealed.is_empty() {
+            match write_audio(
+                &mut sink,
+                &mut backend,
+                &config,
+                &events,
+                concealed,
+                &cancelled,
+            ) {
+                Ok(()) => {}
+                Err(AudioWriteError::Closed) => return,
+                Err(AudioWriteError::Failed { backend, reason }) => {
+                    audio_unavailable(
+                        &packets,
+                        &events,
+                        &unavailable,
+                        backend,
+                        &recovery,
+                        format!("audio output was lost and could not be replaced: {reason}"),
+                    );
+                    return;
+                }
+            }
+        }
+        let pcm = match opus.decode(&packet) {
+            Ok(pcm) => {
+                recovery.record_decoded();
+                pcm
+            }
+            Err(error) => {
+                opus.record_dropped_packet(&packet);
+                match record_audio_decode_failure(&events, &mut recovery, error.to_string()) {
+                    AudioRecoveryAction::Skip => {}
+                    AudioRecoveryAction::ResetDecoder => rebuild_decoder = true,
+                    AudioRecoveryAction::GiveUp => {
+                        audio_unavailable(
+                            &packets,
+                            &events,
+                            &unavailable,
+                            backend,
+                            &recovery,
+                            format!("the audio decoder rejected {} packets", recovery.rejections),
+                        );
+                        return;
+                    }
+                }
+                continue;
+            }
+        };
+        match write_audio(&mut sink, &mut backend, &config, &events, pcm, &cancelled) {
+            Ok(()) => {}
+            Err(AudioWriteError::Closed) => return,
+            Err(AudioWriteError::Failed { backend, reason }) => {
+                audio_unavailable(
+                    &packets,
+                    &events,
+                    &unavailable,
+                    backend,
+                    &recovery,
+                    format!("audio output was lost and could not be replaced: {reason}"),
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn record_audio_decode_failure(
+    events: &EventQueue,
+    recovery: &mut AudioRecovery,
+    message: String,
+) -> AudioRecoveryAction {
+    let action = recovery.record_rejection();
+    emit(
+        events,
+        BackendEvent::AudioDecodeError {
+            message,
+            consecutive: recovery.consecutive_rejections,
+        },
+    );
+    action
+}
+
+enum AudioWriteError {
+    Closed,
+    Failed {
+        backend: AudioBackend,
+        reason: String,
+    },
+}
+
+fn write_audio(
+    sink: &mut Box<dyn AudioSink + Send>,
+    backend: &mut AudioBackend,
+    config: &AudioConfig,
+    events: &EventQueue,
+    pcm: &[f32],
+    cancelled: &dyn Fn() -> bool,
+) -> std::result::Result<(), AudioWriteError> {
+    if let Err(error) = sink.write(pcm, cancelled) {
+        if cancelled() {
+            return Err(AudioWriteError::Closed);
+        }
+        let message = error.to_string();
+        emit(
+            events,
+            BackendEvent::AudioOutputError {
+                backend: *backend,
+                message: message.clone(),
+            },
+        );
+        match open_audio_fallback(config, *backend) {
+            Ok(mut fallback) => {
+                let fallback_backend = fallback.backend();
+                if let Err(fallback_error) = fallback.write(pcm, cancelled) {
+                    if cancelled() {
+                        return Err(AudioWriteError::Closed);
+                    }
+                    emit(
+                        events,
+                        BackendEvent::AudioOutputError {
+                            backend: fallback_backend,
+                            message: fallback_error.to_string(),
+                        },
+                    );
+                    return Err(AudioWriteError::Failed {
+                        backend: fallback_backend,
+                        reason: fallback_error.to_string(),
+                    });
+                }
+                let lost_backend = *backend;
+                *backend = fallback_backend;
+                *sink = fallback;
+                emit(events, BackendEvent::AudioSelected(*backend));
+                emit(
+                    events,
+                    BackendEvent::AudioOutputRecovered {
+                        from: lost_backend,
+                        to: fallback_backend,
+                    },
+                );
+                return Ok(());
+            }
+            Err(fallback_error) => {
+                emit(
+                    events,
+                    BackendEvent::AudioOutputError {
+                        backend: *backend,
+                        message: fallback_error.to_string(),
+                    },
+                );
+            }
+        }
+        return Err(AudioWriteError::Failed {
+            backend: *backend,
+            reason: message,
+        });
+    }
+    Ok(())
+}
+
+fn open_preferred_decoder(
+    config: &SessionConfig,
+    format: StreamFormat,
+) -> Result<(DecoderBackend, Box<dyn VideoDecoder>)> {
+    let order = decoder_order(config.decoder_preference);
+    let mut failures = Vec::new();
+    for backend in order {
+        match open_decoder(config, format, *backend) {
+            Ok(decoder) => return Ok((*backend, decoder)),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    Err(Error::unavailable(
+        Subsystem::Session,
+        format!(
+            "no requested {} decoder opened: {}",
+            config.codec.label(),
+            failures.join("; ")
+        ),
+    ))
+}
+
+fn open_fallback_decoder(
+    config: &SessionConfig,
+    format: StreamFormat,
+    current: DecoderBackend,
+) -> Result<(DecoderBackend, Box<dyn VideoDecoder>)> {
+    let order = decoder_order(config.decoder_preference);
+    let Some(current_index) = order.iter().position(|backend| *backend == current) else {
+        return Err(Error::unavailable(
+            Subsystem::Session,
+            "active decoder is outside the configured fallback order",
+        ));
+    };
+    let mut failures = Vec::new();
+    for backend in &order[current_index + 1..] {
+        match open_decoder(config, format, *backend) {
+            Ok(decoder) => return Ok((*backend, decoder)),
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    Err(Error::unavailable(
+        Subsystem::Session,
+        format!("no fallback decoder opened: {}", failures.join("; ")),
+    ))
+}
+
+fn decoder_order(preference: DecoderPreference) -> &'static [DecoderBackend] {
+    match preference {
+        DecoderPreference::Automatic => &[
+            DecoderBackend::Mpp,
+            DecoderBackend::Vulkan,
+            DecoderBackend::Cuda,
+            DecoderBackend::VaApi,
+            DecoderBackend::V4l2,
+            DecoderBackend::Ffmpeg,
+        ],
+        DecoderPreference::HardwareOnly => &[
+            DecoderBackend::Mpp,
+            DecoderBackend::Vulkan,
+            DecoderBackend::Cuda,
+            DecoderBackend::VaApi,
+            DecoderBackend::V4l2,
+        ],
+        DecoderPreference::MppOnly => &[DecoderBackend::Mpp],
+        DecoderPreference::VulkanOnly => &[DecoderBackend::Vulkan],
+        DecoderPreference::CudaOnly => &[DecoderBackend::Cuda],
+        DecoderPreference::VaApiThenV4l2 => &[
+            DecoderBackend::Mpp,
+            DecoderBackend::VaApi,
+            DecoderBackend::V4l2,
+            DecoderBackend::Ffmpeg,
+        ],
+        DecoderPreference::V4l2ThenVaApi => &[
+            DecoderBackend::Mpp,
+            DecoderBackend::V4l2,
+            DecoderBackend::VaApi,
+            DecoderBackend::Ffmpeg,
+        ],
+        DecoderPreference::VaApiOnly => &[DecoderBackend::VaApi],
+        DecoderPreference::V4l2Only => &[DecoderBackend::V4l2],
+        DecoderPreference::SoftwareOnly => &[DecoderBackend::Ffmpeg],
+    }
+}
+
+fn open_decoder(
+    config: &SessionConfig,
+    format: StreamFormat,
+    backend: DecoderBackend,
+) -> Result<Box<dyn VideoDecoder>> {
+    if config.embedded_presentation && config.vulkan_device.is_none() {
+        validate_decoder_presentation(backend)?;
+    }
+    match backend {
+        DecoderBackend::Mpp => crate::video::open_mpp(format, config.codec),
+        #[cfg(all(feature = "ffmpeg", feature = "vulkan"))]
+        DecoderBackend::Vulkan if config.embedded_presentation => {
+            crate::video::FfmpegDecoder::open_shared(
+                config.codec,
+                format,
+                Arc::clone(config.vulkan_device.as_ref().ok_or_else(|| {
+                    Error::unavailable(
+                        Subsystem::Vulkan,
+                        "embedded Vulkan requires the shared device",
+                    )
+                })?),
+            )
+            .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+        }
+        DecoderBackend::Vulkan => open_ffmpeg_decoder(config.codec, format, backend),
+        DecoderBackend::Cuda => open_ffmpeg_decoder(config.codec, format, backend),
+        DecoderBackend::Ffmpeg => open_ffmpeg_decoder(config.codec, format, backend),
+        DecoderBackend::V4l2 if config.codec == VideoCodec::H264 => {
+            open_v4l2(format, config.v4l2_device.clone())
+        }
+        #[cfg(feature = "ffmpeg")]
+        DecoderBackend::V4l2 if config.codec == VideoCodec::H265 => {
+            if !config.embedded_presentation || config.v4l2_device.is_some() {
+                return Err(Error::unavailable(
+                    Subsystem::V4l2,
+                    "HEVC request decode requires embedded presentation and automatic media-device selection",
+                ));
+            }
+            crate::video::FfmpegDecoder::open(
+                config.codec,
+                format,
+                crate::video::FfmpegMode::V4l2Request,
+            )
+            .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+        }
+        DecoderBackend::V4l2 => Err(Error::unavailable(
+            Subsystem::V4l2,
+            format!(
+                "{} decode is not implemented by the V4L2 backend",
+                config.codec.label()
+            ),
+        )),
+        DecoderBackend::VaApi => {
+            #[cfg(feature = "ffmpeg")]
+            if config.codec != VideoCodec::H264
+                || format.pixel_format == crate::PixelFormat::P010
+                || format.color_transfer != crate::ColorTransfer::Sdr
+            {
+                return Ok(Box::new(crate::video::FfmpegDecoder::open(
+                    config.codec,
+                    format,
+                    crate::video::FfmpegMode::Vaapi,
+                )?));
+            }
+            if config.codec != VideoCodec::H264 {
+                return Err(Error::unavailable(
+                    Subsystem::VaApi,
+                    format!(
+                        "{} decode is not implemented by the native VA-API backend",
+                        config.codec.label()
+                    ),
+                ));
+            }
+            #[cfg(feature = "vaapi")]
+            {
+                crate::video::open_vaapi(format)
+            }
+            #[cfg(not(feature = "vaapi"))]
+            {
+                let _ = format;
+                Err(Error::unavailable(
+                    Subsystem::VaApi,
+                    "crate was built without the vaapi feature",
+                ))
+            }
+        }
+    }
+}
+
+fn validate_decoder_presentation(backend: DecoderBackend) -> Result<()> {
+    if let Some(reason) = backend.embedded_presentation_error() {
+        return Err(Error::unavailable(Subsystem::Vulkan, reason));
+    }
+    Ok(())
+}
+
+fn open_ffmpeg_decoder(
+    codec: VideoCodec,
+    format: StreamFormat,
+    backend: DecoderBackend,
+) -> Result<Box<dyn VideoDecoder>> {
+    #[cfg(feature = "ffmpeg")]
+    {
+        use crate::video::{FfmpegDecoder, FfmpegMode};
+
+        let mode = match backend {
+            DecoderBackend::Vulkan => FfmpegMode::Vulkan,
+            DecoderBackend::Cuda => FfmpegMode::Cuda,
+            DecoderBackend::Ffmpeg => FfmpegMode::Software,
+            _ => unreachable!("non-FFmpeg backend passed to open_ffmpeg_decoder"),
+        };
+        FfmpegDecoder::open(codec, format, mode)
+            .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+    }
+    #[cfg(not(feature = "ffmpeg"))]
+    {
+        let _ = (codec, format, backend);
+        Err(Error::unavailable(
+            Subsystem::Ffmpeg,
+            "crate was built without the ffmpeg feature",
+        ))
+    }
+}
+
+fn enqueue_frames(
+    queue: &BoundedQueue<DecodedVideoFrame>,
+    events: &EventQueue,
+    frames: Vec<DecodedVideoFrame>,
+) {
+    for frame in frames {
+        if queue.push_latest(frame) == QueuePush::DroppedOldest {
+            emit(
+                events,
+                BackendEvent::QueueOverflow {
+                    media: "decoded-video",
+                },
+            );
+        }
+    }
+}
+
+fn record_decoded_outputs(probe: &DecodeTimingProbe, frames: &[DecodedVideoFrame]) {
+    for frame in frames {
+        probe.record_output(frame.timestamp_us);
+    }
+}
+
+fn decode_frame(
+    decoder: &mut Box<dyn VideoDecoder>,
+    frame: &EncodedVideoFrame,
+) -> Result<Vec<DecodedVideoFrame>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(frame))).unwrap_or_else(
+        |panic| {
+            Err(Error::backend(
+                Subsystem::Session,
+                format!("decoder panicked: {}", panic_message(panic)),
+            ))
+        },
+    )
+}
+
+fn poll_decoder(decoder: &mut Box<dyn VideoDecoder>) -> Result<Vec<DecodedVideoFrame>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.poll())).unwrap_or_else(
+        |panic| {
+            Err(Error::backend(
+                Subsystem::Session,
+                format!("decoder panicked while polling: {}", panic_message(panic)),
+            ))
+        },
+    )
+}
+
+fn flush_decoder(decoder: &mut Box<dyn VideoDecoder>) -> Result<Vec<DecodedVideoFrame>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.flush())).unwrap_or_else(
+        |panic| {
+            Err(Error::backend(
+                Subsystem::Session,
+                format!("decoder panicked while flushing: {}", panic_message(panic)),
+            ))
+        },
+    )
+}
+
+fn finish_decoder_drain(
+    result: Result<Vec<DecodedVideoFrame>>,
+    decoded: &BoundedQueue<DecodedVideoFrame>,
+    events: &EventQueue,
+    decode_timings: &DecodeTimingProbe,
+    phase: &str,
+) {
+    match result {
+        Ok(frames) => {
+            record_decoded_outputs(decode_timings, &frames);
+            enqueue_frames(decoded, events, frames)
+        }
+        Err(error) => eprintln!("Linux decoder {phase} drain incomplete: {error}"),
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+fn transition_state(state: &Mutex<LifecycleState>, next: LifecycleState, events: &EventQueue) {
+    let mut current = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    if current.can_transition_to(next) && *current != next {
+        *current = next;
+        emit(events, BackendEvent::StateChanged(next));
+    }
+}
+
+fn report_worker_error(state: &Mutex<LifecycleState>, events: &EventQueue, error: Error) {
+    match error {
+        Error::DeviceLost { subsystem, reason } => {
+            emit(events, BackendEvent::DeviceLost { subsystem, reason });
+        }
+        other => {
+            emit(events, BackendEvent::Error(other.to_string()));
+        }
+    }
+    transition_state(state, LifecycleState::Failed, events);
+}
+
+fn emit(events: &EventQueue, event: BackendEvent) {
+    events.push_latest(event);
+}
+
+#[cfg(test)]
+mod tests {
+    struct DelayedDecoder {
+        frame: Option<super::DecodedVideoFrame>,
+        reference_lost: bool,
+    }
+
+    impl super::VideoDecoder for DelayedDecoder {
+        fn decode(
+            &mut self,
+            _: &super::EncodedVideoFrame,
+        ) -> super::Result<Vec<super::DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn poll(&mut self) -> super::Result<Vec<super::DecodedVideoFrame>> {
+            if self.reference_lost {
+                return Err(super::Error::ReferenceLost {
+                    subsystem: super::Subsystem::V4l2,
+                    reason: "delayed capture error".to_owned(),
+                });
+            }
+            Ok(self.frame.take().into_iter().collect())
+        }
+
+        fn flush(&mut self) -> super::Result<Vec<super::DecodedVideoFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn take_format_change(&mut self) -> Option<super::StreamFormat> {
+            None
+        }
+    }
+
+    #[test]
+    fn idle_poll_retrieves_delayed_output_and_preserves_reference_loss() {
+        let format = super::StreamFormat::video_default(2, 2).unwrap();
+        let mut decoder: Box<dyn super::VideoDecoder> = Box::new(DelayedDecoder {
+            frame: Some(super::DecodedVideoFrame {
+                format,
+                timestamp_us: 1234,
+                planes: Vec::new(),
+                dmabuf: None,
+                vulkan: None,
+            }),
+            reference_lost: false,
+        });
+        let input = super::EncodedVideoFrame::new(vec![1], 1234, true).unwrap();
+        assert!(
+            super::decode_frame(&mut decoder, &input)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            super::poll_decoder(&mut decoder).unwrap()[0].timestamp_us,
+            1234
+        );
+        assert!(super::poll_decoder(&mut decoder).unwrap().is_empty());
+        decoder = Box::new(DelayedDecoder {
+            frame: None,
+            reference_lost: true,
+        });
+        assert!(matches!(
+            super::poll_decoder(&mut decoder),
+            Err(super::Error::ReferenceLost { .. })
+        ));
+    }
+
+    #[test]
+    fn reference_loss_recovery_is_bounded_until_decoded_output() {
+        let mut recovery = super::ReferenceRecovery::default();
+        for _ in 0..3 {
+            assert!(recovery.try_recover());
+        }
+        assert!(!recovery.try_recover());
+        recovery.decoded_output();
+        assert!(recovery.try_recover());
+    }
+    use super::*;
+
+    #[test]
+    fn incomplete_transition_drains_do_not_emit_fatal_events() {
+        let decoded = BoundedQueue::new(2);
+        let events = Arc::new(BoundedQueue::new(8));
+        let decode_timings = DecodeTimingProbe::default();
+        for phase in ["reconfigure", "shutdown"] {
+            finish_decoder_drain(
+                Err(Error::backend(Subsystem::V4l2, "decoder drain timed out")),
+                &decoded,
+                &events,
+                &decode_timings,
+                phase,
+            );
+            assert!(events.try_pop().is_none());
+            assert!(decoded.try_pop().is_none());
+            finish_decoder_drain(
+                Ok(vec![DecodedVideoFrame {
+                    format: StreamFormat::video_default(2, 2).unwrap(),
+                    timestamp_us: 1234,
+                    planes: Vec::new(),
+                    dmabuf: None,
+                    vulkan: None,
+                }]),
+                &decoded,
+                &events,
+                &decode_timings,
+                phase,
+            );
+            assert_eq!(decoded.try_pop().unwrap().timestamp_us, 1234);
+            assert!(events.try_pop().is_none());
+        }
+    }
+
+    #[test]
+    fn embedded_vulkan_rejection_preserves_configured_fallback_policy() {
+        let format = StreamFormat::video_default(2, 2).unwrap();
+        let mut config = SessionConfig::new(format);
+        assert!(!config.embedded_presentation);
+        config.embedded_presentation = true;
+        config.decoder_preference = DecoderPreference::VulkanOnly;
+        let error = open_preferred_decoder(&config, format)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("independent device"));
+        assert!(open_fallback_decoder(&config, format, DecoderBackend::Vulkan).is_err());
+        assert!(validate_decoder_presentation(DecoderBackend::Cuda).is_ok());
+        assert!(validate_decoder_presentation(DecoderBackend::VaApi).is_ok());
+        assert!(validate_decoder_presentation(DecoderBackend::Ffmpeg).is_ok());
+        assert!(!decoder_order(DecoderPreference::HardwareOnly).contains(&DecoderBackend::Ffmpeg));
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn embedded_automatic_selection_can_open_software_after_incompatible_vulkan() {
+        let format = StreamFormat::video_default(2, 2).unwrap();
+        let mut config = SessionConfig::new(format);
+        config.embedded_presentation = true;
+        let (backend, _) = open_preferred_decoder(&config, format).unwrap();
+        assert_ne!(backend, DecoderBackend::Vulkan);
+    }
+
+    #[test]
+    fn lifecycle_allows_reconfigure_and_orderly_stop() {
+        assert!(LifecycleState::Starting.can_transition_to(LifecycleState::Running));
+        assert!(LifecycleState::Running.can_transition_to(LifecycleState::Reconfiguring));
+        assert!(LifecycleState::Reconfiguring.can_transition_to(LifecycleState::Running));
+        assert!(LifecycleState::Running.can_transition_to(LifecycleState::Stopping));
+        assert!(LifecycleState::Stopping.can_transition_to(LifecycleState::Stopped));
+    }
+
+    #[test]
+    fn lifecycle_rejects_restart_after_stop_or_failure() {
+        assert!(!LifecycleState::Stopped.can_transition_to(LifecycleState::Running));
+        assert!(!LifecycleState::Failed.can_transition_to(LifecycleState::Running));
+        assert!(!LifecycleState::Running.can_transition_to(LifecycleState::Starting));
+        assert!(LifecycleState::Failed.can_transition_to(LifecycleState::Stopping));
+    }
+
+    #[test]
+    fn stop_can_recover_from_a_worker_failure_during_shutdown() {
+        assert!(LifecycleState::Stopping.can_transition_to(LifecycleState::Failed));
+        assert!(LifecycleState::Failed.can_transition_to(LifecycleState::Stopping));
+        assert!(LifecycleState::Stopping.can_transition_to(LifecycleState::Stopped));
+    }
+
+    #[test]
+    fn video_readiness_is_published_only_after_running() {
+        let state = Arc::new(Mutex::new(LifecycleState::Starting));
+        let events: EventQueue = Arc::new(BoundedQueue::new(8));
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let worker = {
+            let state = Arc::clone(&state);
+            let events = Arc::clone(&events);
+            thread::spawn(move || {
+                publish_video_readiness(&state, &events, DecoderBackend::Ffmpeg, &startup_tx)
+            })
+        };
+
+        assert!(matches!(
+            events.pop_timeout(Duration::from_secs(5)),
+            Some(BackendEvent::DecoderSelected(DecoderBackend::Ffmpeg))
+        ));
+        assert_eq!(*guard, LifecycleState::Starting);
+        assert!(matches!(
+            startup_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(guard);
+        assert!(worker.join().unwrap());
+        assert_eq!(
+            *state.lock().unwrap_or_else(|poison| poison.into_inner()),
+            LifecycleState::Running
+        );
+        assert_eq!(
+            startup_rx.try_recv().map(|result| result.unwrap()),
+            Ok(DecoderBackend::Ffmpeg)
+        );
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn successful_start_accepts_the_first_video_submission() {
+        let format = StreamFormat::video_default(64, 64).unwrap();
+        let mut config = SessionConfig::new(format);
+        config.decoder_preference = DecoderPreference::SoftwareOnly;
+        config.audio = None;
+
+        let mut session = LinuxSession::start(config).unwrap();
+        assert_eq!(session.state(), LifecycleState::Running);
+
+        let frame = EncodedVideoFrame::new(vec![0_u8; 32], 0, true).unwrap();
+        assert_eq!(session.submit_video(frame).unwrap(), PushOutcome::Queued);
+
+        assert!(session.stop().is_ok());
+    }
+
+    #[test]
+    fn overflow_preserves_recovery_keyframe_and_rejects_inter_frames_until_it_arrives() {
+        let commands = BoundedQueue::new(2);
+        let events = Arc::new(BoundedQueue::new(8));
+        let generation = AtomicU64::new(0);
+        let needs_keyframe = AtomicBool::new(false);
+        let frame = |timestamp_us, keyframe| {
+            EncodedVideoFrame::new(vec![timestamp_us as u8 + 1], timestamp_us, keyframe).unwrap()
+        };
+
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(0, false),
+            )
+            .unwrap(),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(1, false),
+            )
+            .unwrap(),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(2, false),
+            )
+            .unwrap(),
+            PushOutcome::DroppedOldest
+        );
+        assert!(needs_keyframe.load(Ordering::Acquire));
+
+        // This P-frame is discarded instead of evicting queued recovery work.
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(3, false),
+            )
+            .unwrap(),
+            PushOutcome::DroppedOldest
+        );
+        assert_eq!(commands.len(), 2);
+
+        // The IDR atomically replaces stale decode work. Its following P-frame
+        // is queued behind it with the same generation.
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(4, true),
+            )
+            .unwrap(),
+            PushOutcome::DroppedOldest
+        );
+        assert!(!needs_keyframe.load(Ordering::Acquire));
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(5, false),
+            )
+            .unwrap(),
+            PushOutcome::Queued
+        );
+
+        let QueuePop::Item(VideoCommand::Decode {
+            frame,
+            generation: keyframe_generation,
+            reset,
+        }) = commands.wait_pop(Duration::ZERO)
+        else {
+            panic!("expected queued recovery keyframe");
+        };
+        assert!(frame.keyframe);
+        assert!(reset);
+        let QueuePop::Item(VideoCommand::Decode {
+            frame,
+            generation: inter_generation,
+            reset,
+        }) = commands.wait_pop(Duration::ZERO)
+        else {
+            panic!("expected inter-frame after recovery keyframe");
+        };
+        assert!(!frame.keyframe);
+        assert!(!reset);
+        assert_eq!(inter_generation, keyframe_generation);
+    }
+
+    const VALID_OPUS_PACKET: [u8; 1] = [0x08];
+    const MALFORMED_OPUS_PACKET: [u8; 40] = [0xff; 40];
+
+    fn audio_worker_config(
+        alsa_device: &str,
+        preference: crate::AudioBackendPreference,
+    ) -> super::AudioConfig {
+        super::AudioConfig {
+            alsa_device: alsa_device.to_owned(),
+            preference,
+            ..super::AudioConfig::default()
+        }
+    }
+
+    fn use_audio_failure_fixture() {
+        unsafe {
+            std::env::set_var(
+                "ALSA_CONFIG_PATH",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/audio-failure.conf"
+                ),
+            )
+        };
+    }
+
+    struct RejectingAudioSink {
+        backend: crate::AudioBackend,
+    }
+
+    impl super::AudioSink for RejectingAudioSink {
+        fn backend(&self) -> crate::AudioBackend {
+            self.backend
+        }
+
+        fn write(&mut self, _: &[f32], _: &dyn Fn() -> bool) -> crate::Result<()> {
+            Err(crate::Error::backend(
+                crate::Subsystem::Alsa,
+                "test sink rejected PCM",
+            ))
+        }
+    }
+
+    fn rejecting_output_sink(backend: crate::AudioBackend) -> Box<dyn super::AudioSink + Send> {
+        Box::new(RejectingAudioSink { backend })
+    }
+
+    fn audio_packet(data: &[u8], rtp_timestamp: u32) -> super::AudioPacket {
+        super::AudioPacket::new(Arc::<[u8]>::from(data.to_vec()), rtp_timestamp, 48_000, 7)
+            .expect("valid audio packet input")
+    }
+
+    fn spawn_audio_worker(
+        config: super::AudioConfig,
+    ) -> (
+        Arc<super::BoundedQueue<super::AudioPacket>>,
+        Arc<AtomicBool>,
+        super::EventQueue,
+        thread::JoinHandle<()>,
+    ) {
+        use_audio_failure_fixture();
+        let packets = Arc::new(super::BoundedQueue::new(64));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(512));
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let worker = {
+            let packets = Arc::clone(&packets);
+            let unavailable = Arc::clone(&unavailable);
+            let events = Arc::clone(&events);
+            thread::Builder::new()
+                .name("opennow-test-audio-policy".to_owned())
+                .spawn(move || {
+                    super::run_audio_worker(config, packets, events, unavailable, startup_tx)
+                })
+                .expect("audio worker")
+        };
+        let startup = startup_rx.recv_timeout(Duration::from_secs(3));
+        assert!(
+            matches!(startup, Ok(Ok(_))),
+            "audio worker startup: {startup:?}"
+        );
+        (packets, unavailable, events, worker)
+    }
+
+    fn collect_events(events: &super::EventQueue) -> Vec<super::BackendEvent> {
+        let mut collected = Vec::new();
+        while let Some(event) = events.try_pop() {
+            collected.push(event);
+        }
+        collected
+    }
+
+    fn wait_for_event(
+        events: &super::EventQueue,
+        timeout: Duration,
+        predicate: impl Fn(&super::BackendEvent) -> bool,
+    ) -> Vec<super::BackendEvent> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut collected = Vec::new();
+        loop {
+            match events.wait_pop(Duration::from_millis(5)) {
+                super::QueuePop::Item(event) => {
+                    let matched = predicate(&event);
+                    collected.push(event);
+                    if matched {
+                        break;
+                    }
+                }
+                super::QueuePop::TimedOut => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                super::QueuePop::Closed => break,
+            }
+        }
+        collected.extend(collect_events(events));
+        collected
+    }
+
+    #[test]
+    fn terminal_audio_state_is_observed_across_queue_closure() {
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(8));
+        let queue = super::BoundedQueue::new(4);
+        let unavailable = AtomicBool::new(false);
+        queue.close();
+        unavailable.store(true, Ordering::Release);
+        assert_eq!(
+            super::submit_audio_packet(
+                &queue,
+                &unavailable,
+                &events,
+                audio_packet(&VALID_OPUS_PACKET, 0),
+            )
+            .expect("terminal audio state"),
+            super::PushOutcome::AudioDisabled
+        );
+        assert!(collect_events(&events).is_empty());
+
+        let queue = super::BoundedQueue::new(4);
+        let unavailable = AtomicBool::new(false);
+        queue.close();
+        assert!(
+            super::submit_audio_packet(
+                &queue,
+                &unavailable,
+                &events,
+                audio_packet(&VALID_OPUS_PACKET, 0),
+            )
+            .is_err(),
+            "a closed queue without a terminal audio state stays an error"
+        );
+
+        let queue = super::BoundedQueue::new(4);
+        let unavailable = AtomicBool::new(true);
+        assert_eq!(
+            super::submit_audio_packet(
+                &queue,
+                &unavailable,
+                &events,
+                audio_packet(&VALID_OPUS_PACKET, 0),
+            )
+            .expect("terminal audio state"),
+            super::PushOutcome::AudioDisabled
+        );
+    }
+
+    #[test]
+    fn concurrent_audio_submission_never_reports_a_queue_error() {
+        let queue = Arc::new(super::BoundedQueue::new(8));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(64));
+        let publisher = {
+            let queue = Arc::clone(&queue);
+            let unavailable = Arc::clone(&unavailable);
+            thread::spawn(move || {
+                unavailable.store(true, Ordering::Release);
+                queue.close();
+            })
+        };
+        let mut outcomes = Vec::new();
+        let mut attempts = 0_u32;
+        while !queue.is_closed() && attempts < 100_000 {
+            outcomes.push(super::submit_audio_packet(
+                &queue,
+                &unavailable,
+                &events,
+                audio_packet(&VALID_OPUS_PACKET, 0),
+            ));
+            attempts += 1;
+        }
+        publisher.join().expect("publisher thread");
+        for _ in 0..8 {
+            outcomes.push(super::submit_audio_packet(
+                &queue,
+                &unavailable,
+                &events,
+                audio_packet(&VALID_OPUS_PACKET, 0),
+            ));
+        }
+        assert!(
+            outcomes.iter().all(|outcome| outcome.is_ok()),
+            "a submitter racing the terminal audio state must not see a queue error: {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .rev()
+                .take(8)
+                .all(|outcome| *outcome.as_ref().expect("terminal outcome")
+                    == super::PushOutcome::AudioDisabled),
+            "after the terminal audio state the submitter must report disabled: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn audio_recovery_policy_bounds_decoder_rebuilds_and_gives_up() {
+        let mut recovery = super::AudioRecovery {
+            consecutive_rejections: 0,
+            rejections: 0,
+            resets: 0,
+        };
+        for expected_consecutive in 1..super::AUDIO_DECODE_STRIKES_BEFORE_RESET {
+            assert_eq!(
+                recovery.record_rejection(),
+                super::AudioRecoveryAction::Skip
+            );
+            assert_eq!(recovery.consecutive_rejections, expected_consecutive);
+        }
+        assert_eq!(
+            recovery.record_rejection(),
+            super::AudioRecoveryAction::ResetDecoder
+        );
+        assert_eq!(recovery.rejections, 8);
+        recovery.record_reset();
+        assert_eq!(recovery.consecutive_rejections, 0);
+        assert_eq!(recovery.resets, 1);
+
+        recovery.record_decoded();
+        assert_eq!(recovery.consecutive_rejections, 0);
+        for _ in 1..super::AUDIO_DECODE_STRIKES_BEFORE_RESET {
+            assert_eq!(
+                recovery.record_rejection(),
+                super::AudioRecoveryAction::Skip
+            );
+        }
+        assert_eq!(
+            recovery.record_rejection(),
+            super::AudioRecoveryAction::ResetDecoder
+        );
+        recovery.record_reset();
+        for _ in 1..super::AUDIO_DECODE_STRIKES_BEFORE_RESET {
+            assert_eq!(
+                recovery.record_rejection(),
+                super::AudioRecoveryAction::Skip
+            );
+        }
+        assert_eq!(
+            recovery.record_rejection(),
+            super::AudioRecoveryAction::GiveUp
+        );
+        assert_eq!(
+            recovery.rejections,
+            3 * u64::from(super::AUDIO_DECODE_STRIKES_BEFORE_RESET)
+        );
+        assert_eq!(recovery.resets, super::AUDIO_DECODER_RESET_LIMIT);
+    }
+
+    #[test]
+    fn malformed_opus_does_not_fail_the_shared_session() {
+        let (packets, unavailable, events, worker) = spawn_audio_worker(audio_worker_config(
+            "opennow_test_output",
+            crate::AudioBackendPreference::AlsaOnly,
+        ));
+        packets.push(audio_packet(&VALID_OPUS_PACKET, 0));
+        packets.push(audio_packet(&[0x0c], 960));
+        thread::sleep(Duration::from_millis(50));
+        let startup = collect_events(&events);
+        assert!(
+            startup
+                .iter()
+                .all(|event| matches!(event, super::BackendEvent::AudioSelected(_))),
+            "valid Opus packets must not raise errors, saw {startup:?}"
+        );
+
+        packets.push(audio_packet(&MALFORMED_OPUS_PACKET, 1920));
+        let observed = wait_for_event(&events, Duration::from_secs(3), |event| {
+            matches!(event, super::BackendEvent::AudioDecodeError { .. })
+        });
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioDecodeError { message, consecutive }
+                    if message.contains("corrupted stream") && *consecutive == 1
+            )),
+            "expected an Opus-scoped decode error, saw {observed:?}"
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, super::BackendEvent::StateChanged(_))),
+            "audio decode errors must not change the shared session state, saw {observed:?}"
+        );
+        assert!(!packets.is_closed(), "audio must keep running");
+        assert!(!unavailable.load(Ordering::Acquire));
+
+        packets.push(audio_packet(&VALID_OPUS_PACKET, 2880));
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            collect_events(&events).is_empty(),
+            "audio must decode normally after a rejected packet"
+        );
+        assert!(!packets.is_closed());
+
+        packets.close();
+        worker.join().expect("audio worker thread");
+    }
+
+    #[test]
+    fn continuous_opus_rejections_disable_audio_only() {
+        let (packets, unavailable, events, worker) = spawn_audio_worker(audio_worker_config(
+            "opennow_test_output",
+            crate::AudioBackendPreference::AlsaOnly,
+        ));
+        let rejections = 3 * super::AUDIO_DECODE_STRIKES_BEFORE_RESET;
+        for index in 0..rejections {
+            packets.push(audio_packet(&MALFORMED_OPUS_PACKET, index * 960));
+        }
+        let observed = wait_for_event(&events, Duration::from_secs(5), |event| {
+            matches!(event, super::BackendEvent::AudioUnavailable { .. })
+        });
+        let decode_errors = observed
+            .iter()
+            .filter(|event| matches!(event, super::BackendEvent::AudioDecodeError { .. }))
+            .count();
+        assert_eq!(
+            decode_errors, rejections as usize,
+            "every rejected packet is reported, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioUnavailable { backend, rejected, .. }
+                    if *backend == crate::AudioBackend::Alsa
+                        && *rejected == u64::from(rejections)
+            )),
+            "expected an audio-only escalation, saw {observed:?}"
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, super::BackendEvent::StateChanged(_))),
+            "audio escalation must not fail the shared session, saw {observed:?}"
+        );
+        assert!(packets.is_closed());
+        assert!(unavailable.load(Ordering::Acquire));
+        worker.join().expect("audio worker thread");
+    }
+
+    fn drive_until_audio_unavailable(
+        packets: &Arc<super::BoundedQueue<super::AudioPacket>>,
+        events: &super::EventQueue,
+    ) -> Vec<super::BackendEvent> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut observed = Vec::new();
+        let mut pushed = 0_u64;
+        while std::time::Instant::now() < deadline {
+            observed.extend(collect_events(events));
+            if observed
+                .iter()
+                .any(|event| matches!(event, super::BackendEvent::AudioUnavailable { .. }))
+            {
+                break;
+            }
+            if pushed < 64 {
+                packets.push(audio_packet(&VALID_OPUS_PACKET, (pushed as u32) * 960));
+                pushed += 1;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        observed.extend(collect_events(events));
+        observed
+    }
+
+    #[test]
+    fn failing_audio_output_disables_audio_only() {
+        let (packets, unavailable, events, worker) = spawn_audio_worker(audio_worker_config(
+            "opennow_test_failing_output",
+            crate::AudioBackendPreference::AlsaOnly,
+        ));
+        let observed = drive_until_audio_unavailable(&packets, &events);
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioOutputError { backend, message }
+                    if *backend == crate::AudioBackend::Alsa
+                        && message.contains("Input/output error")
+            )),
+            "expected an audio output error, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioUnavailable { backend, .. }
+                    if *backend == crate::AudioBackend::Alsa
+            )),
+            "expected audio to be disabled, saw {observed:?}"
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, super::BackendEvent::StateChanged(_))),
+            "an audio output failure must not fail the shared session, saw {observed:?}"
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event, super::BackendEvent::AudioOutputRecovered { .. })),
+            "a terminal output failure must not report recovery, saw {observed:?}"
+        );
+        assert!(packets.is_closed());
+        assert!(unavailable.load(Ordering::Acquire));
+        worker.join().expect("audio worker thread");
+    }
+
+    #[test]
+    fn fixed_audio_output_never_falls_back_and_stays_isolated() {
+        let config = super::AudioConfig {
+            output_device: "alsa:opennow_test_failing_output".to_owned(),
+            ..audio_worker_config("unused", crate::AudioBackendPreference::AlsaOnly)
+        };
+        let (packets, unavailable, events, worker) = spawn_audio_worker(config);
+        let observed = drive_until_audio_unavailable(&packets, &events);
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioOutputError { message, .. }
+                    if message.contains("forbids fallback")
+            )),
+            "a fixed route must refuse fallback, saw {observed:?}"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, super::BackendEvent::AudioSelected(_)))
+                .count(),
+            1,
+            "a fixed route must never select another sink, saw {observed:?}"
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, super::BackendEvent::StateChanged(_))),
+            "a fixed output failure must not fail the shared session, saw {observed:?}"
+        );
+        assert!(packets.is_closed());
+        assert!(unavailable.load(Ordering::Acquire));
+        worker.join().expect("audio worker thread");
+    }
+
+    #[test]
+    fn audio_output_recovery_is_reported_once_the_replacement_sink_accepts_output() {
+        use_audio_failure_fixture();
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(32));
+        let config = super::AudioConfig {
+            alsa_device: "opennow_test_output".to_owned(),
+            preference: crate::AudioBackendPreference::PipeWireThenAlsa,
+            ..super::AudioConfig::default()
+        };
+        let pcm = [0.0f32; 960 * 2];
+        let mut sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+        let mut backend = crate::AudioBackend::PipeWire;
+        assert!(
+            super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false).is_ok(),
+            "the ALSA fallback must accept output"
+        );
+        assert_eq!(backend, crate::AudioBackend::Alsa);
+        let observed = collect_events(&events);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, super::BackendEvent::AudioOutputRecovered { .. }))
+                .count(),
+            1,
+            "one accepted replacement is one recovery observation, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioOutputError { backend, message }
+                    if *backend == crate::AudioBackend::PipeWire
+                        && message.contains("test sink rejected PCM")
+            )),
+            "the lost sink is reported before recovery, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioOutputRecovered { from, to }
+                    if *from == crate::AudioBackend::PipeWire && *to == crate::AudioBackend::Alsa
+            )),
+            "the recovery pairs the lost sink with the accepting one, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                super::BackendEvent::AudioSelected(backend)
+                    if *backend == crate::AudioBackend::Alsa
+            )),
+            "the accepting sink becomes the selected sink, saw {observed:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_audio_output_recoveries_report_each_accepted_replacement_once() {
+        use_audio_failure_fixture();
+        let events: super::EventQueue = Arc::new(super::BoundedQueue::new(64));
+        let config = super::AudioConfig {
+            alsa_device: "opennow_test_output".to_owned(),
+            preference: crate::AudioBackendPreference::PipeWireThenAlsa,
+            ..super::AudioConfig::default()
+        };
+        let pcm = [0.0f32; 960 * 2];
+        let mut sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+        let mut backend = crate::AudioBackend::PipeWire;
+        for _ in 0..2 {
+            assert!(
+                super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false)
+                    .is_ok(),
+                "the ALSA fallback must accept output"
+            );
+            assert_eq!(backend, crate::AudioBackend::Alsa);
+            assert!(
+                super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false)
+                    .is_ok(),
+                "the selected sink must keep accepting output"
+            );
+            let accepted = collect_events(&events);
+            assert_eq!(
+                accepted
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        super::BackendEvent::AudioOutputRecovered { .. }
+                    ))
+                    .count(),
+                1,
+                "an accepted replacement reports recovery once, saw {accepted:?}"
+            );
+            sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+            backend = crate::AudioBackend::PipeWire;
+        }
+        let observed = collect_events(&events);
+        assert!(
+            observed
+                .iter()
+                .all(|event| !matches!(event, super::BackendEvent::StateChanged(_))),
+            "audio output recovery must not fail the shared session, saw {observed:?}"
+        );
+    }
+
+    #[test]
+    fn audio_output_loss_without_an_accepting_replacement_reports_no_recovery() {
+        use_audio_failure_fixture();
+        let pcm = [0.0f32; 960 * 2];
+        for (scenario, config) in [
+            (
+                "a fixed output device refuses fallback",
+                super::AudioConfig {
+                    output_device: "alsa:opennow_test_output".to_owned(),
+                    ..audio_worker_config(
+                        "opennow_test_output",
+                        crate::AudioBackendPreference::PipeWireThenAlsa,
+                    )
+                },
+            ),
+            (
+                "the replacement sink does not open",
+                super::AudioConfig {
+                    alsa_device: "opennow_test_missing_output".to_owned(),
+                    ..audio_worker_config("", crate::AudioBackendPreference::PipeWireThenAlsa)
+                },
+            ),
+        ] {
+            let events: super::EventQueue = Arc::new(super::BoundedQueue::new(32));
+            let mut sink = rejecting_output_sink(crate::AudioBackend::PipeWire);
+            let mut backend = crate::AudioBackend::PipeWire;
+            assert!(
+                super::write_audio(&mut sink, &mut backend, &config, &events, &pcm, &|| false)
+                    .is_err(),
+                "{scenario} must not accept output"
+            );
+            assert_eq!(backend, crate::AudioBackend::PipeWire, "{scenario}");
+            let observed = collect_events(&events);
+            assert!(
+                observed.iter().all(|event| !matches!(
+                    event,
+                    super::BackendEvent::AudioOutputRecovered { .. }
+                )),
+                "{scenario} must not report recovery, saw {observed:?}"
+            );
+            assert!(
+                observed.iter().any(|event| matches!(
+                    event,
+                    super::BackendEvent::AudioOutputError { backend, .. }
+                        if *backend == crate::AudioBackend::PipeWire
+                )),
+                "{scenario} must still report the loss, saw {observed:?}"
+            );
+        }
+    }
+}

@@ -1,0 +1,7 @@
+builds/
+**/target/
+*.log
+data/
+*.tokens.json
+gfn_tokens.json
+.env
