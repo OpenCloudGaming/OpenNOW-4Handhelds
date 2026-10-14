@@ -45,8 +45,8 @@ build.sh             R36S build on Linux
 ```
 
 # Acknowledgements
-[OpenNOW](https://github.com/OpenCloudGaming/OpenNOW), amazing project ^_^
-[GreenOvercast](https://github.com/Producdevity/GreenOvercast) for giving an understanding on how to take advantage of hardware acceleration.
+- [OpenNOW](https://github.com/OpenCloudGaming/OpenNOW), amazing project ^_^
+- [GreenOvercast](https://github.com/Producdevity/GreenOvercast) for giving an understanding on how to take advantage of hardware acceleration.
 
 ## License
 MIT. Copyright (c) 2025 Zortos. See [LICENSE](LICENSE).
