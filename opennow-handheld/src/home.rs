@@ -49,6 +49,12 @@ pub enum Request {
     OpenSettings,
     RetryLibrary,
     Play,
+    /// Remove the highlighted title's current store version from the library.
+    Remove { id: String, variant_id: String },
+    /// Make this store version the one Play launches, adding it first when needed.
+    ChooseStore { id: String, variant_id: String, owned: bool },
+    /// Load every store variant for this game. The library list only includes the owned one.
+    LoadStores { id: String },
     Toast(&'static str),
 }
 
@@ -87,6 +93,10 @@ pub struct Home {
     shelf_index: usize,
     dock_index: usize,
     focus: Focus,
+    /// Library menu for the highlighted title. None hides it.
+    menu: Option<LibraryMenu>,
+    /// The store list is waiting for the full catalog game.
+    stores_loading: bool,
     system_open: bool,
     scroll: f32,
 }
@@ -97,7 +107,15 @@ fn tile_x(index: usize) -> f32 {
 
 impl Home {
     pub fn new() -> Self {
-        Self { shelf_index: 0, dock_index: 0, focus: Focus::Shelf, system_open: false, scroll: 0.0 }
+        Self { shelf_index: 0, dock_index: 0, focus: Focus::Shelf, menu: None, stores_loading: false, system_open: false, scroll: 0.0 }
+    }
+
+    /// Shows or hides the spinner inside the store list.
+    pub fn note_store_load(&mut self, loading: bool) {
+        self.stores_loading = loading && matches!(self.menu, Some(LibraryMenu::Stores(_)));
+        if !loading {
+            self.stores_loading = false;
+        }
     }
 
     /// Returns to the first tile, for a new account or a reloaded library.
@@ -139,6 +157,9 @@ impl Home {
             }
             return None;
         }
+        if self.menu.is_some() {
+            return self.menu_action(action, view);
+        }
         match (action, &self.focus) {
             (Action::Escape, _) => return Some(Request::Quit),
             (Action::Left, Focus::Shelf) => self.shelf_index = self.shelf_index.saturating_sub(1),
@@ -155,8 +176,8 @@ impl Home {
                 }
                 return Some(Request::Toast("The store isn't connected yet"));
             }
-            (Action::Options, Focus::Shelf) if self.shelf_index < games => {
-                return Some(Request::Toast("Tile options are coming soon"));
+            (Action::Options | Action::Select(true), Focus::Shelf) if self.shelf_index < games => {
+                self.menu = Some(LibraryMenu::Main(0));
             }
             (Action::Left, Focus::Dock) => self.dock_index = self.dock_index.saturating_sub(1),
             (Action::Right, Focus::Dock) => self.dock_index = (self.dock_index + 1).min(DOCK_ITEMS.len() - 1),
@@ -167,6 +188,67 @@ impl Home {
                 Image::Settings => return Some(Request::OpenSettings),
                 _ => return Some(Request::Quit),
             },
+            _ => {}
+        }
+        None
+    }
+
+    fn menu_action(&mut self, action: Action, view: &HomeView) -> Option<Request> {
+        let Some(menu) = self.menu else {
+            return None;
+        };
+        let Some(game) = view.games.get(self.shelf_index) else {
+            self.menu = None;
+            return None;
+        };
+        let rows = menu_rows(game, menu);
+        let row = menu.row();
+        if self.stores_loading && matches!(menu, LibraryMenu::Stores(_)) {
+            if matches!(action, Action::Back | Action::Escape) {
+                self.stores_loading = false;
+                self.menu = Some(LibraryMenu::Main(1));
+            }
+            return None;
+        }
+        match action {
+            Action::Up => self.menu = Some(menu.with_row(row.saturating_sub(1))),
+            Action::Down => self.menu = Some(menu.with_row((row + 1).min(rows.len().saturating_sub(1)))),
+            Action::Back | Action::Escape => {
+                self.menu = match menu {
+                    LibraryMenu::Stores(_) => Some(LibraryMenu::Main(1)),
+                    LibraryMenu::Main(_) => None,
+                };
+            }
+            Action::Confirm => {
+                let kind = rows.get(row).map(|item| item.kind).unwrap_or(MenuKind::Close);
+                return match kind {
+                    MenuKind::Remove => {
+                        self.menu = None;
+                        Some(Request::Remove { id: game.id.clone(), variant_id: game.variant_id.clone() })
+                    }
+                    MenuKind::OpenStores => {
+                        self.menu = Some(LibraryMenu::Stores(0));
+                        self.stores_loading = true;
+                        Some(Request::LoadStores { id: game.id.clone() })
+                    }
+                    MenuKind::Store(index) => {
+                        self.menu = None;
+                        game.versions.get(index).map(|version| Request::ChooseStore {
+                            id: game.id.clone(),
+                            variant_id: version.id.clone(),
+                            owned: version.in_library,
+                        })
+                    }
+                    MenuKind::Back => {
+                        self.menu = Some(LibraryMenu::Main(1));
+                        None
+                    }
+                    MenuKind::Close => {
+                        self.menu = None;
+                        None
+                    }
+                };
+            }
             _ => {}
         }
         None
@@ -195,10 +277,22 @@ impl Home {
         if self.system_open {
             draw_system(painter, view);
         }
+        if self.menu.is_some() {
+            draw_menu(painter, self, view);
+        }
         theme::draw_footer(painter, &status, &self.hints(view));
     }
 
     fn hints(&self, view: &HomeView) -> Vec<(&'static str, &'static str)> {
+        if self.stores_loading {
+            return vec![("B", "Back")];
+        }
+        if matches!(self.menu, Some(LibraryMenu::Stores(_))) {
+            return vec![("A", "Select"), ("B", "Back")];
+        }
+        if self.menu.is_some() {
+            return vec![("A", "Select"), ("B", "Close")];
+        }
         if self.system_open {
             return vec![("X", "Sign out"), ("B", "Close")];
         }
@@ -206,7 +300,7 @@ impl Home {
             Focus::Dock => vec![("X", "System"), ("A", "Select")],
             Focus::Shelf if view.games.is_empty() && matches!(view.library, LibraryStatus::Failed(_)) => vec![("A", "Retry")],
             Focus::Shelf if self.shelf_index >= view.games.len() => vec![("A", "Add")],
-            Focus::Shelf => vec![("X", "Options"), ("A", "Start")],
+            Focus::Shelf => vec![("X", "Library"), ("A", "Start")],
         }
     }
 
@@ -273,6 +367,126 @@ impl Home {
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum LibraryMenu {
+    Main(usize),
+    Stores(usize),
+}
+
+impl LibraryMenu {
+    fn row(self) -> usize {
+        match self {
+            LibraryMenu::Main(row) | LibraryMenu::Stores(row) => row,
+        }
+    }
+
+    fn with_row(self, row: usize) -> Self {
+        match self {
+            LibraryMenu::Main(_) => LibraryMenu::Main(row),
+            LibraryMenu::Stores(_) => LibraryMenu::Stores(row),
+        }
+    }
+}
+
+fn draw_menu(painter: &mut Painter, home: &Home, view: &HomeView) {
+    let Some(menu) = home.menu else {
+        return;
+    };
+    let Some(game) = view.games.get(home.shelf_index) else {
+        return;
+    };
+    if home.stores_loading && matches!(menu, LibraryMenu::Stores(_)) {
+        draw_store_loading(painter, view.seconds);
+        return;
+    }
+    let rows = menu_rows(game, menu);
+    let (x, width, row_h) = (90.0, 460.0, 46.0);
+    let height = 72.0 + rows.len() as f32 * row_h;
+    let y = ((CANVAS.1 - height) / 2.0).max(24.0);
+    theme::draw_panel(painter, x, y, width, height);
+    let heading = match menu {
+        LibraryMenu::Stores(_) => "Select store",
+        LibraryMenu::Main(_) => game.title.as_str(),
+    };
+    painter.text_fit(x + 24.0, y + 18.0, 20.0, Weight::Black, heading, width - 48.0, TEXT);
+    let selected = menu.row();
+    for (index, item) in rows.iter().enumerate() {
+        let row_y = y + 56.0 + index as f32 * row_h;
+        if index == selected {
+            painter.fill(x + 16.0, row_y, width - 32.0, row_h - 6.0, 12.0, FOCUS);
+        }
+        let color = if index == selected { BACKGROUND } else { TEXT };
+        painter.text_fit(x + 32.0, row_y + 10.0, 16.0, Weight::ExtraBold, &item.label, width - 64.0, color);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MenuKind {
+    Remove,
+    OpenStores,
+    Store(usize),
+    Back,
+    Close,
+}
+
+struct MenuItem {
+    label: String,
+    kind: MenuKind,
+}
+
+fn menu_rows(game: &Game, menu: LibraryMenu) -> Vec<MenuItem> {
+    match menu {
+        LibraryMenu::Main(_) => vec![
+            MenuItem { label: "Remove from library".into(), kind: MenuKind::Remove },
+            MenuItem { label: select_store_label(game), kind: MenuKind::OpenStores },
+            MenuItem { label: "Close".into(), kind: MenuKind::Close },
+        ],
+        LibraryMenu::Stores(_) => {
+            let any_default = game.versions.iter().any(|version| version.selected);
+            let mut rows = game
+                .versions
+                .iter()
+                .enumerate()
+                .map(|(index, version)| {
+                    let fallback = !any_default && version.id == game.variant_id;
+                    MenuItem { label: store_choice_label(version, fallback), kind: MenuKind::Store(index) }
+                })
+                .collect::<Vec<_>>();
+            if rows.is_empty() {
+                rows.push(MenuItem { label: "Loading stores…".into(), kind: MenuKind::Back });
+            }
+            rows.push(MenuItem { label: "Back".into(), kind: MenuKind::Back });
+            rows
+        }
+    }
+}
+
+fn draw_store_loading(painter: &mut Painter, seconds: f32) {
+    let (x, y, width, height) = (90.0, 150.0, 460.0, 180.0);
+    theme::draw_panel(painter, x, y, width, height);
+    painter.text(x + 24.0, y + 18.0, 20.0, Weight::Black, "Select store", TEXT);
+    theme::draw_spinner(painter, x + width / 2.0, y + 96.0, 16.0, seconds);
+    let label = "Loading stores…";
+    let label_width = painter.measure(label, 15.0, Weight::Bold);
+    painter.text(x + (width - label_width) / 2.0, y + 132.0, 15.0, Weight::Bold, label, MUTED);
+}
+
+fn select_store_label(game: &Game) -> String {
+    let current = game
+        .versions
+        .iter()
+        .find(|version| version.selected)
+        .map(|version| version.store.as_str())
+        .filter(|store| !store.is_empty())
+        .unwrap_or(game.store.as_str());
+    if current.is_empty() { "Select store".into() } else { format!("Select store · {current}") }
+}
+
+fn store_choice_label(version: &crate::library::StoreVersion, fallback_default: bool) -> String {
+    let name = if version.store.is_empty() { "Store".to_owned() } else { version.store.clone() };
+    if version.selected || fallback_default { format!("{name} · default") } else { name }
 }
 
 fn draw_game_tile(painter: &mut Painter, game: &Game, artwork: &Artwork, x: f32) {

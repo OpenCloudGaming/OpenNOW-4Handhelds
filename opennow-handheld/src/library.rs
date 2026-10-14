@@ -13,6 +13,15 @@ const TEXTURE_BUDGET: usize = 32;
 /// Requested artwork width. Tiles are at most a few hundred pixels across.
 const ARTWORK_WIDTH: &str = ";w=400";
 
+/// One store version of a game, such as Steam or the NVIDIA bundle.
+#[derive(Clone)]
+pub struct StoreVersion {
+    pub id: String,
+    pub store: String,
+    pub in_library: bool,
+    pub selected: bool,
+}
+
 pub struct Game {
     pub id: String,
     pub variant_id: String,
@@ -20,6 +29,7 @@ pub struct Game {
     pub store: String,
     pub status: String,
     pub in_library: bool,
+    pub versions: Vec<StoreVersion>,
     pub color: [f32; 4],
     pub artwork: Option<String>,
 }
@@ -30,9 +40,31 @@ impl Game {
         if title.is_empty() {
             return None;
         }
-        let variants = value["variants"].as_array();
+        let variants = value["variants"].as_array().map(Vec::as_slice).unwrap_or(&[]);
         let selected = value["selectedVariantIndex"].as_u64().unwrap_or(0) as usize;
-        let variant = variants.and_then(|variants| variants.get(selected).or_else(|| variants.first()));
+        let versions = variants
+            .iter()
+            .filter_map(|variant| {
+                let id = variant["id"].as_str().filter(|id| !id.is_empty())?.to_owned();
+                let store = variant["store"]
+                    .as_str()
+                    .or_else(|| variant["appStore"].as_str())
+                    .map(store_label)
+                    .unwrap_or_default();
+                let status = variant["libraryStatus"]
+                    .as_str()
+                    .or_else(|| variant["gfn"]["library"]["status"].as_str());
+                let in_library = variant["inLibrary"].as_bool().unwrap_or_else(|| {
+                    matches!(status, Some("MANUAL" | "PLATFORM_SYNC" | "IN_LIBRARY"))
+                });
+                let selected = variant["librarySelected"]
+                    .as_bool()
+                    .or_else(|| variant["gfn"]["library"]["selected"].as_bool())
+                    .unwrap_or(false);
+                Some(StoreVersion { id, store, in_library, selected })
+            })
+            .collect::<Vec<_>>();
+        let variant = variants.get(selected).or_else(|| variants.first());
         let id = value["id"].as_str().unwrap_or("").to_owned();
         let variant_id = variant.and_then(|variant| variant["id"].as_str()).unwrap_or("").to_owned();
         let in_library = variant.and_then(|variant| variant["inLibrary"].as_bool()).unwrap_or(false);
@@ -45,7 +77,23 @@ impl Game {
             .iter()
             .find_map(|key| value[*key].as_str().filter(|url| !url.is_empty()))
             .map(|url| url.replace(";w=900", ARTWORK_WIDTH).replace(";w=1200", ARTWORK_WIDTH));
-        Some(Self { id, variant_id, color: placeholder_color(&title), title, store, status, in_library, artwork })
+        Some(Self { id, variant_id, color: placeholder_color(&title), title, store, status, in_library, versions, artwork })
+    }
+
+    /// Replaces the store list from a full catalog game, which includes every variant.
+    pub fn apply_detail(&mut self, value: &Value) {
+        let Some(detail) = Self::parse(value) else {
+            return;
+        };
+        if detail.versions.is_empty() {
+            return;
+        }
+        self.versions = detail.versions;
+        if let Some(current) = self.versions.iter().find(|version| version.selected) {
+            self.variant_id = current.id.clone();
+            self.store = current.store.clone();
+            self.in_library = current.in_library;
+        }
     }
 }
 

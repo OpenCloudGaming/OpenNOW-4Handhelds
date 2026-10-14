@@ -134,6 +134,10 @@ fn library_path() -> std::path::PathBuf {
         return path.into();
     }
     let name = if cfg!(windows) { "opennow_streamer_ffi.dll" } else { "libopennow_streamer_ffi.so" };
+    let bundled = executable_dir().join("libraries").join(&name);
+    if bundled.is_file() {
+        return bundled;
+    }
     executable_dir().join(name)
 }
 

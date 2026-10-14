@@ -351,7 +351,8 @@ impl MediaRuntime {
             let session = session.inspect_err(|reason| {
                 eprintln!("stream: Rockchip MPP did not start: {reason}");
                 let _ = self.commands.send(HostCommand::Stop);
-            })?;
+            });
+            let session = session?;
             if self.paused.load(Ordering::Acquire) {
                 session.set_paused(true);
             }

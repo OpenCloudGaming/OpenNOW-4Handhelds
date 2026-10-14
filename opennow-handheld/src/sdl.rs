@@ -328,9 +328,15 @@ impl Sdl {
                 button: event.bytes[12],
                 pressed: kind == EVENT_CONTROLLERBUTTONDOWN,
             },
+            // A mapped PC pad reports Select and Start through the controller
+            // API. Its raw buttons 12 and 13 are D-pad down and left, so
+            // forwarding them makes a roll of the D-pad hold Select and Start
+            // and quit. The R36S reports Select and Start only as raw buttons
+            // 12 and 13, including when SDL has a mapping, so Linux keeps them.
             EVENT_JOYBUTTONDOWN | EVENT_JOYBUTTONUP
                 if !self.controller_joysticks.contains(&which)
-                    || matches!(event.bytes[12], 12 | 13 | 14 | 15 | 16) =>
+                    || matches!(event.bytes[12], 14 | 15 | 16)
+                    || (cfg!(target_os = "linux") && matches!(event.bytes[12], 12 | 13)) =>
             {
                 Event::JoyButton {
                     which,

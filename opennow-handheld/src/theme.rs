@@ -42,7 +42,8 @@ pub struct Clock {
 
 pub fn draw_header(painter: &mut Painter, clock: &Clock) {
     painter.image(Image::Logo, EDGE, 22.0, 52.0, 30.0, WHITE);
-    painter.text(EDGE + 62.0, 24.0, 21.0, Weight::Black, "OpenNOW", TEXT);
+    let name_width = painter.text(EDGE + 62.0, 24.0, 21.0, Weight::Black, "OpenNOW", TEXT);
+    painter.text(EDGE + 62.0 + name_width + 8.0, 31.0, 13.0, Weight::Bold, "v0.1.0", MUTED);
 
     let mut right = CANVAS.0 - EDGE;
     if let Some(percent) = clock.battery {
@@ -81,6 +82,26 @@ pub fn draw_footer(painter: &mut Painter, status: &str, hints: &[(&str, &str)]) 
     painter.text_fit(EDGE, SEPARATOR_Y + 18.0, 13.0, Weight::Bold, status, right - EDGE, MUTED);
 }
 
+/// Draws `text` on as many lines as the words need. A line that is still too
+/// wide is shortened with an ellipsis.
+fn draw_wrapped(painter: &mut Painter, x: f32, y: f32, size: f32, weight: Weight, text: &str, max_width: f32, line_gap: f32, color: Color) {
+    let mut line = String::new();
+    let mut line_y = y;
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
+        if line.is_empty() || painter.measure(&candidate, size, weight) <= max_width {
+            line = candidate;
+            continue;
+        }
+        painter.text(x, line_y, size, weight, &line, color);
+        line_y += line_gap;
+        line = word.to_owned();
+    }
+    if !line.is_empty() {
+        painter.text_fit(x, line_y, size, weight, &line, max_width, color);
+    }
+}
+
 fn draw_button_glyph(painter: &mut Painter, x: f32, y: f32, glyph: &str) {
     painter.fill(x, y, 22.0, 22.0, 11.0, TEXT);
     let width = painter.measure(glyph, 13.0, Weight::Black);
@@ -100,7 +121,7 @@ pub fn draw_confirm(painter: &mut Painter, title: &str, body: &str, confirm: &st
     let (x, y, width, height) = (130.0, 140.0, 380.0, 190.0);
     draw_panel(painter, x, y, width, height);
     painter.text(x + 26.0, y + 24.0, 24.0, Weight::Black, title, TEXT);
-    painter.text_fit(x + 26.0, y + 62.0, 15.0, Weight::SemiBold, body, width - 52.0, MUTED);
+    draw_wrapped(painter, x + 26.0, y + 62.0, 15.0, Weight::SemiBold, body, width - 52.0, 20.0, MUTED);
     for (index, label) in ["Cancel", confirm].iter().enumerate() {
         let selected = (index == 1) == confirm_selected;
         let (button_x, button_y, button_width) = (x + 26.0 + index as f32 * 176.0, y + 118.0, 152.0);

@@ -13,5 +13,5 @@ if [ -e /dev/vpu_service ] && [ ! -w /dev/vpu_service ]; then
         sudo -n chmod a+rw /dev/vpu_service 2>/dev/null || true
     fi
 fi
-export LD_LIBRARY_PATH="$here/opennow${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$here/opennow/libraries${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ./opennow-handheld "$@" > "$here/opennow/opennow.log" 2>&1

@@ -43,6 +43,24 @@ fn decision(game: &Value, app_id: &str, variant_id: &str, subscription: &Value) 
 }
 
 #[test]
+fn nvidia_bundle_demos_launch_without_a_linked_store_account() {
+    let mut metadata = app("MANUAL", true, false);
+    metadata["variants"][0]["appStore"] = json!("NV_BUNDLE");
+    let game = app_to_game(&metadata).unwrap();
+    let mut account = access();
+    account["accounts"] = json!([]);
+    assert_eq!(
+        super::launch_decision(&game, "parent-app", "123", &Value::Null, &account).status,
+        LaunchStatus::Ready
+    );
+    account["definitions"]["stores"]["status"] = json!("stale");
+    assert_eq!(
+        super::launch_decision(&game, "parent-app", "123", &Value::Null, &account).status,
+        LaunchStatus::Ready
+    );
+}
+
+#[test]
 fn selected_store_link_and_subscription_requirements_use_current_account_metadata() {
     let mut game = app_to_game(&app("MANUAL", true, false)).unwrap();
     let mut account = access();

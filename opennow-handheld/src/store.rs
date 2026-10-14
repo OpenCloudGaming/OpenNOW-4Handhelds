@@ -16,11 +16,94 @@ const GRID_TOP: f32 = 16.0;
 const GRID_BOTTOM: f32 = SEPARATOR_Y;
 const MAX_QUERY: usize = 40;
 
-const KEY_ROWS: [&[&str]; 4] = [
-    &["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
-    &["a", "s", "d", "f", "g", "h", "j", "k", "l"],
-    &["z", "x", "c", "v", "b", "n", "m", "⌫"],
-    &["space", "done"],
+const CELL: f32 = 42.0;
+const CELL_GAP: f32 = 3.0;
+const KEY_COLS: usize = 13;
+const KEY_ROWS: usize = 5;
+
+/// One cell of the EmulationStation gamepad keyboard. Wide keys span columns
+/// the way that keyboard does, so a direction skips the whole key.
+struct Key {
+    row: u8,
+    col: u8,
+    w: u8,
+    h: u8,
+    text: &'static str,
+    upper: &'static str,
+    alt: &'static str,
+    alt_shift: &'static str,
+}
+
+macro_rules! k {
+    ($r:literal, $c:literal, $t:literal) => {
+        Key { row: $r, col: $c, w: 1, h: 1, text: $t, upper: $t, alt: "", alt_shift: "" }
+    };
+    ($r:literal, $c:literal, $w:literal x $h:literal, $t:literal) => {
+        Key { row: $r, col: $c, w: $w, h: $h, text: $t, upper: $t, alt: "", alt_shift: "" }
+    };
+    ($r:literal, $c:literal, $t:literal => $u:literal) => {
+        Key { row: $r, col: $c, w: 1, h: 1, text: $t, upper: $u, alt: "", alt_shift: "" }
+    };
+    ($r:literal, $c:literal, $t:literal => $u:literal, $a:literal => $as:literal) => {
+        Key { row: $r, col: $c, w: 1, h: 1, text: $t, upper: $u, alt: $a, alt_shift: $as }
+    };
+}
+
+const KEYS: &[Key] = &[
+    k!(0, 0, "1" => "!"),
+    k!(0, 1, "2" => "@"),
+    k!(0, 2, "3" => "#"),
+    k!(0, 3, "4" => "$"),
+    k!(0, 4, "5" => "%"),
+    k!(0, 5, "6" => "^"),
+    k!(0, 6, "7" => "&"),
+    k!(0, 7, "8" => "*"),
+    k!(0, 8, "9" => "("),
+    k!(0, 9, "0" => ")"),
+    k!(0, 10, "_" => "-"),
+    k!(0, 11, "+" => "="),
+    k!(0, 12, "del"),
+    k!(1, 0, "q" => "Q", "à" => "à"),
+    k!(1, 1, "w" => "W", "ä" => "ä"),
+    k!(1, 2, "e" => "E", "è" => "è"),
+    k!(1, 3, "r" => "R", "ë" => "ë"),
+    k!(1, 4, "t" => "T", "ì" => "ì"),
+    k!(1, 5, "y" => "Y", "ï" => "ï"),
+    k!(1, 6, "u" => "U", "ò" => "ò"),
+    k!(1, 7, "i" => "I", "ö" => "ö"),
+    k!(1, 8, "o" => "O", "ù" => "ù"),
+    k!(1, 9, "p" => "P", "ü" => "ü"),
+    k!(1, 10, "{" => "[", "¨" => "¨"),
+    k!(1, 11, "}" => "]", "¿" => "¿"),
+    k!(1, 12, 1 x 2, "ok"),
+    k!(2, 0, "a" => "A", "á" => "á"),
+    k!(2, 1, "s" => "S", "â" => "â"),
+    k!(2, 2, "d" => "D", "é" => "é"),
+    k!(2, 3, "f" => "F", "ê" => "ê"),
+    k!(2, 4, "g" => "G", "í" => "í"),
+    k!(2, 5, "h" => "H", "î" => "î"),
+    k!(2, 6, "j" => "J", "ó" => "ó"),
+    k!(2, 7, "k" => "K", "ô" => "ô"),
+    k!(2, 8, "l" => "L", "ú" => "ú"),
+    k!(2, 9, ";" => ":", "û" => "û"),
+    k!(2, 10, "\"" => "'", "ñ" => "ñ"),
+    k!(2, 11, "|" => "\\", "¡" => "¡"),
+    k!(3, 0, "~" => "`", "€" => "€"),
+    k!(3, 1, "z" => "Z"),
+    k!(3, 2, "x" => "X"),
+    k!(3, 3, "c" => "C"),
+    k!(3, 4, "v" => "V"),
+    k!(3, 5, "b" => "B"),
+    k!(3, 6, "n" => "N"),
+    k!(3, 7, "m" => "M"),
+    k!(3, 8, "," => "<"),
+    k!(3, 9, "." => ">"),
+    k!(3, 10, "?" => "/"),
+    k!(3, 11, 2 x 1, "alt"),
+    k!(4, 0, 2 x 1, "shift"),
+    k!(4, 2, 7 x 1, "space"),
+    k!(4, 9, 2 x 1, "reset"),
+    k!(4, 11, 2 x 1, "cancel"),
 ];
 
 pub enum Status {
@@ -45,6 +128,8 @@ pub enum Request {
     Retry,
     Play { id: String, variant_id: String },
     Add { id: String, variant_id: String },
+    ChooseStore { id: String, variant_id: String, owned: bool },
+    LoadStores { id: String },
 }
 
 enum KeyResult {
@@ -57,12 +142,18 @@ struct Keyboard {
     row: usize,
     column: usize,
     draft: String,
+    shift: bool,
+    alt: bool,
 }
 
 pub struct Store {
     index: usize,
     scroll: f32,
     menu: Option<usize>,
+    /// The open menu is the list of store variants, not Play / Add / Close.
+    picking_store: bool,
+    /// The store list is waiting for the full catalog game.
+    stores_loading: bool,
     keyboard: Option<Keyboard>,
 }
 
@@ -78,7 +169,12 @@ fn tile_origin(index: usize, scroll: f32) -> (f32, f32) {
 
 impl Store {
     pub fn new() -> Self {
-        Self { index: 0, scroll: 0.0, menu: None, keyboard: None }
+        Self { index: 0, scroll: 0.0, menu: None, picking_store: false, stores_loading: false, keyboard: None }
+    }
+
+    /// Shows or hides the spinner inside the store list.
+    pub fn note_store_load(&mut self, loading: bool) {
+        self.stores_loading = loading && self.picking_store;
     }
 
     pub fn reset(&mut self) {
@@ -122,7 +218,7 @@ impl Store {
         match action {
             Action::Back | Action::Escape => return Some(Request::Close),
             Action::Options => {
-                self.keyboard = Some(Keyboard { row: 0, column: 0, draft: view.query.to_owned() });
+                self.keyboard = Some(Keyboard { row: 1, column: 0, draft: view.query.to_owned(), shift: false, alt: false });
                 return None;
             }
             Action::Left if self.index % COLUMNS != 0 => self.index -= 1,
@@ -154,11 +250,26 @@ impl Store {
             self.menu = None;
             return None;
         };
-        let rows = menu_rows(game);
+        if self.stores_loading && self.picking_store {
+            if matches!(action, Action::Back | Action::Escape) {
+                self.stores_loading = false;
+                self.picking_store = false;
+                self.menu = Some(2);
+            }
+            return None;
+        }
+        let rows = menu_rows(game, self.picking_store);
         match action {
             Action::Up => self.menu = Some(row.saturating_sub(1)),
-            Action::Down => self.menu = Some((row + 1).min(rows.len() - 1)),
-            Action::Back | Action::Escape => self.menu = None,
+            Action::Down => self.menu = Some((row + 1).min(rows.len().saturating_sub(1))),
+            Action::Back | Action::Escape => {
+                if self.picking_store {
+                    self.picking_store = false;
+                    self.menu = Some(2);
+                } else {
+                    self.menu = None;
+                }
+            }
             Action::Confirm => {
                 let (kind, enabled) = rows.get(row).map(|item| (item.kind, item.enabled)).unwrap_or((MenuKind::Close, true));
                 if !enabled {
@@ -166,11 +277,40 @@ impl Store {
                 }
                 let id = game.id.clone();
                 let variant_id = game.variant_id.clone();
-                self.menu = None;
                 return match kind {
-                    MenuKind::Play => Some(Request::Play { id, variant_id }),
-                    MenuKind::Add => Some(Request::Add { id, variant_id }),
-                    MenuKind::Close => None,
+                    MenuKind::Play => {
+                        self.menu = None;
+                        Some(Request::Play { id, variant_id })
+                    }
+                    MenuKind::Add => {
+                        self.menu = None;
+                        Some(Request::Add { id, variant_id })
+                    }
+                    MenuKind::OpenStores => {
+                        self.picking_store = true;
+                        self.stores_loading = true;
+                        self.menu = Some(0);
+                        Some(Request::LoadStores { id })
+                    }
+                    MenuKind::Store(index) => {
+                        self.menu = None;
+                        self.picking_store = false;
+                        game.versions.get(index).map(|version| Request::ChooseStore {
+                            id,
+                            variant_id: version.id.clone(),
+                            owned: version.in_library,
+                        })
+                    }
+                    MenuKind::Back => {
+                        self.picking_store = false;
+                        self.menu = Some(2);
+                        None
+                    }
+                    MenuKind::Close => {
+                        self.menu = None;
+                        self.picking_store = false;
+                        None
+                    }
                 };
             }
             _ => {}
@@ -212,7 +352,13 @@ impl Store {
 
     fn hints(&self, view: &View) -> Vec<(&'static str, &'static str)> {
         if self.keyboard.is_some() {
-            return vec![("A", "Type"), ("B", "Close")];
+            return vec![("X", "Shift"), ("A", "Type"), ("B", "Close")];
+        }
+        if self.stores_loading {
+            return vec![("B", "Back")];
+        }
+        if self.picking_store {
+            return vec![("A", "Select"), ("B", "Back")];
         }
         if self.menu.is_some() {
             return vec![("A", "Select"), ("B", "Close")];
@@ -263,12 +409,17 @@ impl Store {
         let Some(game) = view.games.get(self.index) else {
             return;
         };
-        let rows = menu_rows(game);
-        let (x, width, row_h) = (120.0, 400.0, 52.0);
-        let height = 78.0 + rows.len() as f32 * row_h;
-        let y = (CANVAS.1 - height) / 2.0;
+        if self.stores_loading && self.picking_store {
+            draw_store_loading(painter, view.seconds);
+            return;
+        }
+        let rows = menu_rows(game, self.picking_store);
+        let (x, width, row_h) = (90.0, 460.0, 46.0);
+        let height = 72.0 + rows.len() as f32 * row_h;
+        let y = ((CANVAS.1 - height) / 2.0).max(24.0);
         theme::draw_panel(painter, x, y, width, height);
-        painter.text_fit(x + 24.0, y + 20.0, 20.0, Weight::Black, &game.title, width - 48.0, TEXT);
+        let heading = if self.picking_store { "Select store" } else { game.title.as_str() };
+        painter.text_fit(x + 24.0, y + 18.0, 20.0, Weight::Black, heading, width - 48.0, TEXT);
         let selected = self.menu.unwrap_or(0);
         for (index, item) in rows.iter().enumerate() {
             let row_y = y + 64.0 + index as f32 * row_h;
@@ -282,13 +433,23 @@ impl Store {
             } else {
                 TEXT
             };
-            painter.text(x + 32.0, row_y + 10.0, 16.0, Weight::ExtraBold, item.label, color);
+            painter.text_fit(x + 32.0, row_y + 8.0, 16.0, Weight::ExtraBold, &item.label, width - 64.0, color);
         }
     }
 }
 
+fn draw_store_loading(painter: &mut Painter, seconds: f32) {
+    let (x, y, width, height) = (90.0, 150.0, 460.0, 180.0);
+    theme::draw_panel(painter, x, y, width, height);
+    painter.text(x + 24.0, y + 18.0, 20.0, Weight::Black, "Select store", TEXT);
+    theme::draw_spinner(painter, x + width / 2.0, y + 96.0, 16.0, seconds);
+    let label = "Loading stores…";
+    let label_width = painter.measure(label, 15.0, Weight::Bold);
+    painter.text(x + (width - label_width) / 2.0, y + 132.0, 15.0, Weight::Bold, label, MUTED);
+}
+
 struct MenuItem {
-    label: &'static str,
+    label: String,
     kind: MenuKind,
     enabled: bool,
 }
@@ -297,19 +458,53 @@ struct MenuItem {
 enum MenuKind {
     Play,
     Add,
+    OpenStores,
+    Store(usize),
+    Back,
     Close,
 }
 
-fn menu_rows(game: &Game) -> Vec<MenuItem> {
+fn menu_rows(game: &Game, picking_store: bool) -> Vec<MenuItem> {
+    if picking_store {
+        let any_default = game.versions.iter().any(|version| version.selected);
+        let mut rows = game
+            .versions
+            .iter()
+            .enumerate()
+            .map(|(index, version)| {
+                let name = if version.store.is_empty() { "Store".to_owned() } else { version.store.clone() };
+                let label = if version.selected || (!any_default && version.id == game.variant_id) {
+                    format!("{name} · default")
+                } else {
+                    name
+                };
+                MenuItem { label, kind: MenuKind::Store(index), enabled: true }
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            rows.push(MenuItem { label: "Loading stores…".into(), kind: MenuKind::Back, enabled: true });
+        }
+        rows.push(MenuItem { label: "Back".into(), kind: MenuKind::Back, enabled: true });
+        return rows;
+    }
     let playable = !game.id.is_empty() && !game.variant_id.is_empty();
+    let current = game
+        .versions
+        .iter()
+        .find(|version| version.selected)
+        .map(|version| version.store.as_str())
+        .filter(|store| !store.is_empty())
+        .unwrap_or(game.store.as_str());
+    let select_label = if current.is_empty() { "Select store".into() } else { format!("Select store · {current}") };
     vec![
-        MenuItem { label: "Play", kind: MenuKind::Play, enabled: playable },
+        MenuItem { label: "Play".into(), kind: MenuKind::Play, enabled: playable },
         MenuItem {
-            label: if game.in_library { "In your library" } else { "Add to library" },
+            label: if game.in_library { "In your library".into() } else { "Add to library".into() },
             kind: MenuKind::Add,
             enabled: playable && !game.in_library,
         },
-        MenuItem { label: "Close", kind: MenuKind::Close, enabled: true },
+        MenuItem { label: select_label, kind: MenuKind::OpenStores, enabled: !game.id.is_empty() },
+        MenuItem { label: "Close".into(), kind: MenuKind::Close, enabled: true },
     ]
 }
 
@@ -340,60 +535,212 @@ fn draw_tile(painter: &mut Painter, game: &Game, artwork: &Artwork, x: f32, y: f
     painter.text_fit(x + 10.0, y + TILE - 18.0, 11.0, Weight::Bold, caption, TILE - 20.0, with_alpha(WHITE, 0.75));
 }
 
-fn draw_keyboard(painter: &mut Painter, keyboard: &Keyboard) {
-    let (x, y, width, height) = (36.0, 150.0, 568.0, 250.0);
-    theme::draw_panel(painter, x, y, width, height);
-    let shown = if keyboard.draft.is_empty() { "Type a game name".to_owned() } else { keyboard.draft.clone() };
-    let color = if keyboard.draft.is_empty() { MUTED } else { TEXT };
-    painter.text_fit(x + 24.0, y + 16.0, 18.0, Weight::Bold, &shown, width - 48.0, color);
-    let top = y + 58.0;
-    for (row_index, row) in KEY_ROWS.iter().enumerate() {
-        let key_w = 46.0;
-        let key_h = 36.0;
-        let gap = 6.0;
-        let span_of = |label: &str| if label == "space" || label == "done" { key_w * 2.0 + gap } else { key_w };
-        let row_width = row.iter().map(|label| span_of(label)).sum::<f32>() + (row.len().saturating_sub(1)) as f32 * gap;
-        let mut key_x = x + (width - row_width) / 2.0;
-        let key_y = top + row_index as f32 * (key_h + gap);
-        for (column, label) in row.iter().enumerate() {
-            let span = span_of(label);
-            let selected = keyboard.row == row_index && keyboard.column == column;
-            painter.fill(key_x, key_y, span, key_h, 8.0, if selected { FOCUS } else { BUTTON });
-            let text = match *label {
-                "space" => "space",
-                "done" => "search",
-                other => other,
-            };
-            let text_width = painter.measure(text, 15.0, Weight::ExtraBold);
-            painter.text(key_x + (span - text_width) / 2.0, key_y + 8.0, 15.0, Weight::ExtraBold, text, if selected { BACKGROUND } else { TEXT });
-            key_x += span + gap;
+fn covers(key: &Key, row: usize, col: usize) -> bool {
+    row >= key.row as usize
+        && row < key.row as usize + key.h as usize
+        && col >= key.col as usize
+        && col < key.col as usize + key.w as usize
+}
+
+fn key_at(row: usize, col: usize) -> &'static Key {
+    KEYS.iter().find(|key| covers(key, row, col)).expect("every keyboard cell is a key")
+}
+
+fn face<'a>(key: &'a Key, shift: bool, alt: bool) -> &'a str {
+    if alt {
+        let swapped = if shift { key.alt_shift } else { key.alt };
+        if !swapped.is_empty() {
+            return swapped;
         }
+    }
+    if shift && !key.upper.is_empty() {
+        key.upper
+    } else {
+        key.text
+    }
+}
+
+fn key_box(origin: (f32, f32), key: &Key) -> (f32, f32, f32, f32) {
+    let x = origin.0 + key.col as f32 * (CELL + CELL_GAP);
+    let y = origin.1 + key.row as f32 * (CELL + CELL_GAP);
+    let width = key.w as f32 * CELL + (key.w - 1) as f32 * CELL_GAP;
+    let height = key.h as f32 * CELL + (key.h - 1) as f32 * CELL_GAP;
+    (x, y, width, height)
+}
+
+fn move_cursor(row: usize, col: usize, action: Action) -> (usize, usize) {
+    let key = key_at(row, col);
+    match action {
+        Action::Left => (row, if key.col == 0 { KEY_COLS - 1 } else { key.col as usize - 1 }),
+        Action::Right => {
+            let next = key.col as usize + key.w as usize;
+            (row, if next >= KEY_COLS { 0 } else { next })
+        }
+        Action::Up if key.row > 0 => (key.row as usize - 1, col),
+        Action::Down if key.row as usize + (key.h as usize) < KEY_ROWS => (key.row as usize + key.h as usize, col),
+        _ => (row, col),
+    }
+}
+
+fn draw_keyboard(painter: &mut Painter, keyboard: &Keyboard) {
+    let grid_w = KEY_COLS as f32 * CELL + (KEY_COLS - 1) as f32 * CELL_GAP;
+    let grid_h = KEY_ROWS as f32 * CELL + (KEY_ROWS - 1) as f32 * CELL_GAP;
+    let pad_x = 14.0;
+    let width = grid_w + pad_x * 2.0;
+    let height = 14.0 + 36.0 + 10.0 + grid_h + 12.0;
+    let x = (CANVAS.0 - width) / 2.0;
+    let y = (SEPARATOR_Y - 12.0 - height).max(64.0);
+    theme::draw_panel(painter, x, y, width, height);
+
+    let field_y = y + 14.0;
+    painter.fill(x + pad_x, field_y, grid_w, 36.0, 6.0, BUTTON);
+    if keyboard.draft.is_empty() {
+        painter.text(x + pad_x + 12.0, field_y + 8.0, 16.0, Weight::Bold, "Type a game name", MUTED);
+    } else {
+        let text_x = x + pad_x + 12.0;
+        let drawn = painter.text(text_x, field_y + 8.0, 16.0, Weight::Bold, &keyboard.draft, TEXT);
+        painter.fill(text_x + drawn + 2.0, field_y + 9.0, 2.0, 18.0, 0.0, FOCUS);
+    }
+
+    let origin = (x + pad_x, field_y + 46.0);
+    let selected = key_at(keyboard.row, keyboard.column);
+    for key in KEYS {
+        let (key_x, key_y, key_w, key_h) = key_box(origin, key);
+        let focused = key.row == selected.row && key.col == selected.col;
+        let latched = (key.text == "shift" && keyboard.shift) || (key.text == "alt" && keyboard.alt);
+        let fill = if focused {
+            FOCUS
+        } else if latched {
+            rgb(0x1C6C78)
+        } else {
+            BUTTON
+        };
+        painter.fill(key_x, key_y, key_w, key_h, 4.0, fill);
+        let text = face(key, keyboard.shift, keyboard.alt);
+        let mut size = if text.chars().count() == 1 || key.h > 1 { 20.0 } else { 14.0 };
+        let limit = (key_w - 8.0).max(8.0);
+        while size > 9.0 && painter.measure(text, size, Weight::ExtraBold) > limit {
+            size -= 1.0;
+        }
+        let text_width = painter.measure(text, size, Weight::ExtraBold);
+        let text_y = key_y + (key_h - size * 1.52) / 2.0;
+        let ink = if focused { BACKGROUND } else { TEXT };
+        painter.text(key_x + (key_w - text_width) / 2.0, text_y, size, Weight::ExtraBold, text, ink);
     }
 }
 
 fn keyboard_action(keyboard: &mut Keyboard, action: Action) -> KeyResult {
-    let row = &KEY_ROWS[keyboard.row];
     match action {
-        Action::Left => keyboard.column = keyboard.column.saturating_sub(1),
-        Action::Right => keyboard.column = (keyboard.column + 1).min(row.len() - 1),
-        Action::Up | Action::Down => {
-            let going_up = matches!(action, Action::Up);
-            let next = if going_up { keyboard.row.saturating_sub(1) } else { (keyboard.row + 1).min(KEY_ROWS.len() - 1) };
-            let columns = KEY_ROWS[next].len();
-            keyboard.column = (keyboard.column * columns / row.len()).min(columns - 1);
-            keyboard.row = next;
+        Action::Left | Action::Right | Action::Up | Action::Down => {
+            let (row, column) = move_cursor(keyboard.row, keyboard.column, action);
+            keyboard.row = row;
+            keyboard.column = column;
         }
         Action::Back | Action::Escape => return KeyResult::Close,
-        Action::Confirm => match row[keyboard.column] {
-            "⌫" => {
-                keyboard.draft.pop();
-            }
-            "space" if keyboard.draft.len() < MAX_QUERY => keyboard.draft.push(' '),
-            "done" => return KeyResult::Submit(keyboard.draft.trim().to_owned()),
-            letter if keyboard.draft.len() < MAX_QUERY && letter.chars().count() == 1 => keyboard.draft.push_str(letter),
-            _ => {}
-        },
+        Action::Options => keyboard.shift = !keyboard.shift,
+        // D-pad left is also delivered as Start on the raw joystick path, so
+        // directions and Start stay in the grid. OK submits the search.
+        Action::Confirm => return press_key(keyboard),
         _ => {}
     }
     KeyResult::Stay
+}
+
+fn press_key(keyboard: &mut Keyboard) -> KeyResult {
+    let key = key_at(keyboard.row, keyboard.column);
+    match key.text {
+        "del" => {
+            keyboard.draft.pop();
+        }
+        "space" if keyboard.draft.chars().count() < MAX_QUERY => keyboard.draft.push(' '),
+        "ok" => return KeyResult::Submit(keyboard.draft.trim().to_owned()),
+        "cancel" => return KeyResult::Close,
+        "reset" => keyboard.draft.clear(),
+        "shift" => keyboard.shift = !keyboard.shift,
+        "alt" => {
+            if keyboard.shift {
+                keyboard.shift = false;
+            }
+            keyboard.alt = !keyboard.alt;
+        }
+        _ => {
+            let text = face(key, keyboard.shift, keyboard.alt);
+            if keyboard.draft.chars().count() + text.chars().count() <= MAX_QUERY {
+                keyboard.draft.push_str(text);
+            }
+        }
+    }
+    KeyResult::Stay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_covers_every_cell_once() {
+        for row in 0..KEY_ROWS {
+            for col in 0..KEY_COLS {
+                let hits = KEYS.iter().filter(|key| covers(key, row, col)).count();
+                assert_eq!(hits, 1, "cell {row},{col} covered {hits} times");
+            }
+        }
+    }
+
+    #[test]
+    fn directions_follow_the_emulationstation_grid() {
+        assert_eq!(key_at(1, 12).text, "ok");
+        let (row, col) = move_cursor(1, 11, Action::Right);
+        assert_eq!(key_at(row, col).text, "ok");
+        let (row, col) = move_cursor(1, 12, Action::Down);
+        assert_eq!((row, col), (3, 12));
+        assert_eq!(key_at(row, col).text, "alt");
+        let (row, col) = move_cursor(1, 5, Action::Down);
+        assert_eq!(key_at(row, col).text, "h");
+        let (row, col) = move_cursor(3, 5, Action::Down);
+        assert_eq!(key_at(row, col).text, "space");
+        let (row, col) = move_cursor(4, 5, Action::Up);
+        assert_eq!(key_at(row, col).text, "b");
+        let (row, col) = move_cursor(4, 2, Action::Right);
+        assert_eq!(key_at(row, col).text, "reset");
+        let (row, col) = move_cursor(4, 0, Action::Left);
+        assert_eq!(key_at(row, col).text, "cancel");
+        let (row, col) = move_cursor(0, 0, Action::Left);
+        assert_eq!(key_at(row, col).text, "del");
+        let (row, col) = move_cursor(0, 12, Action::Right);
+        assert_eq!(key_at(row, col).text, "1");
+        let (row, col) = move_cursor(2, 11, Action::Right);
+        assert_eq!(key_at(row, col).text, "ok");
+        let (row, col) = move_cursor(2, 12, Action::Left);
+        assert_eq!((row, col), (2, 11));
+        assert_eq!(key_at(row, col).text, "|");
+        let (row, col) = move_cursor(2, 12, Action::Up);
+        assert_eq!(key_at(row, col).text, "del");
+    }
+
+    #[test]
+    fn moving_left_keeps_the_keyboard_open() {
+        let mut keyboard = Keyboard { row: 1, column: 0, draft: "zelda".into(), shift: false, alt: false };
+        assert!(matches!(keyboard_action(&mut keyboard, Action::Left), KeyResult::Stay));
+        assert_eq!(keyboard.draft, "zelda");
+        assert_eq!((keyboard.row, keyboard.column), (1, 12));
+        assert!(matches!(keyboard_action(&mut keyboard, Action::Start(true)), KeyResult::Stay));
+        assert_eq!(keyboard.draft, "zelda");
+    }
+
+    #[test]
+    fn shift_and_alt_change_the_typed_character() {
+        let mut keyboard = Keyboard { row: 1, column: 0, draft: String::new(), shift: false, alt: false };
+        assert!(matches!(press_key(&mut keyboard), KeyResult::Stay));
+        assert_eq!(keyboard.draft, "q");
+        keyboard.shift = true;
+        press_key(&mut keyboard);
+        assert_eq!(keyboard.draft, "qQ");
+        keyboard.shift = false;
+        keyboard.alt = true;
+        press_key(&mut keyboard);
+        assert_eq!(keyboard.draft, "qQà");
+        keyboard.column = 12;
+        assert!(matches!(press_key(&mut keyboard), KeyResult::Submit(query) if query == "qQà"));
+    }
 }

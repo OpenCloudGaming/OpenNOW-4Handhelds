@@ -130,14 +130,19 @@ pub(super) fn account_decision(
 ) -> Option<LaunchDecision> {
     use LaunchStatus::*;
     let decide = |status, message| LaunchDecision { status, message };
+    let store =
+        crate::catalog_types::normalize_store(variant["store"].as_str().unwrap_or_default());
+    // NVIDIA hosts these versions itself. A demo on NV Bundle has no Steam or
+    // Epic account to link, so the missing store record is not a launch block.
+    if nvidia_bundle(&store) {
+        return membership_decision(game, variant, access, subscription);
+    }
     if access["definitions"]["stores"]["status"] != "success" {
         return Some(decide(
             MetadataUnconfirmed,
             "Store account requirements could not be confirmed. Refresh and try again.",
         ));
     }
-    let store =
-        crate::catalog_types::normalize_store(variant["store"].as_str().unwrap_or_default());
     let Some(account) = access["accounts"]
         .as_array()
         .and_then(|accounts| accounts.iter().find(|account| account["provider"] == store))
@@ -166,6 +171,24 @@ pub(super) fn account_decision(
             "The selected store's linking requirement could not be confirmed.",
         ));
     }
+    membership_decision(game, variant, access, subscription)
+}
+
+fn nvidia_bundle(store: &str) -> bool {
+    matches!(
+        store,
+        "NV_BUNDLE" | "NVIDIA" | "NVIDIA_BUNDLE" | "GFN" | "GEFORCE_NOW"
+    )
+}
+
+fn membership_decision(
+    game: &Value,
+    variant: &Value,
+    access: &Value,
+    subscription: &Value,
+) -> Option<LaunchDecision> {
+    use LaunchStatus::*;
+    let decide = |status, message| LaunchDecision { status, message };
     if let Some(id) = variant["subscription"].as_str().filter(|id| !id.is_empty()) {
         if !access["subscriptions"]
             .as_array()

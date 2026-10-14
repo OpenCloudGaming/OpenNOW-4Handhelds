@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TOAST_TIME: Duration = Duration::from_millis(2200);
+/// GeForce NOW's library list lags behind a remove. Wait, then look again.
+const REMOVAL_WAIT: Duration = Duration::from_millis(1500);
+const REMOVAL_ATTEMPTS: u8 = 5;
 const LIBRARY_PAGE: u64 = 100;
 /// Upper bound on games kept in memory on a 1 GB handheld.
 const LIBRARY_LIMIT: usize = 2000;
@@ -60,6 +63,16 @@ enum Pending {
     Logout,
     StorePage,
     Own(String),
+    /// Add the game being launched, then make that store version the default.
+    OwnForPlay,
+    SelectForPlay,
+    /// Add a store version chosen from the home menu, then select it.
+    OwnThenSelect(String, String),
+    LibrarySelect(String),
+    LibraryRemove(String),
+    /// A library page fetched only to see whether a removed game is still listed.
+    RemovalProbe,
+    GameDetail(String),
     Launch,
     StreamSetting,
     StreamInspect,
@@ -72,6 +85,17 @@ enum Pending {
     Regions,
     SettingsRead,
     RegionSet,
+}
+
+/// One title being removed, including the follow-up checks that it left the library.
+struct LibraryRemoval {
+    id: String,
+    variants: Vec<String>,
+    attempt: u8,
+    check_at: Option<Instant>,
+    cursor: String,
+    revision: Value,
+    context: Value,
 }
 
 struct Region {
@@ -143,6 +167,7 @@ pub struct App {
     refresh_library: bool,
     scope: Value,
     pending_add: Option<(String, String)>,
+    removal: Option<LibraryRemoval>,
     notice: Option<String>,
     stream: Option<NativeStream>,
     /// Last presented frame. The streamer only hands over a picture when a new
@@ -151,6 +176,10 @@ pub struct App {
     stream_capabilities: Option<Value>,
     cloud_session: Option<Value>,
     play: PlayPhase,
+    /// Play already tried to add this title, so a second refusal is shown.
+    play_added: bool,
+    /// Play already tried to mark the store version as the default.
+    play_selected: bool,
     play_settings_left: u8,
     play_message: String,
     launch_catalog: String,
@@ -237,12 +266,15 @@ impl App {
             refresh_library: false,
             scope: Value::Null,
             pending_add: None,
+            removal: None,
             notice: None,
             stream: None,
             stream_frame: None,
             stream_capabilities: None,
             cloud_session: None,
             play: PlayPhase::Idle,
+            play_added: false,
+            play_selected: false,
             play_settings_left: 0,
             play_message: String::new(),
             launch_catalog: String::new(),
@@ -305,6 +337,7 @@ impl App {
             _ => {}
         }
         if self.start_held && self.select_held && !matches!(self.screen, Screen::Stream) {
+            eprintln!("quit: Start and Select held");
             self.quit = true;
             return;
         }
@@ -371,6 +404,9 @@ impl App {
                             self.begin_stream(&game.id.clone(), &game.variant_id.clone(), &game.title.clone(), false);
                         }
                     }
+                    Some(Request::Remove { id, variant_id }) => self.remove_owned(&id, &variant_id),
+                    Some(Request::ChooseStore { id, variant_id, owned }) => self.choose_store(&id, &variant_id, owned),
+                    Some(Request::LoadStores { id }) => self.load_stores(&id),
                     Some(Request::RetryLibrary) => self.load_library(),
                     Some(Request::Toast(message)) => self.notify(message),
                     None => {}
@@ -615,6 +651,8 @@ impl App {
                 self.pending_add = Some((id, variant_id));
                 self.open_dialog(DialogKind::AddToLibrary);
             }
+            Some(store::Request::ChooseStore { id, variant_id, owned }) => self.choose_store(&id, &variant_id, owned),
+            Some(store::Request::LoadStores { id }) => self.load_stores(&id),
             None => {}
         }
     }
@@ -644,6 +682,7 @@ impl App {
             }
         }
         self.poll_sign_in();
+        self.poll_removal();
         self.advance_play();
         let mut keep_owned = Vec::new();
         match self.screen {
@@ -721,6 +760,23 @@ impl App {
             (Pending::StorePage, Err(error)) => self.store_failed(error),
             (Pending::Own(id), Ok(value)) => self.owned(&id, &value),
             (Pending::Own(_), Err(error)) => self.notice = Some(error.message),
+            (Pending::OwnForPlay, Ok(value)) => self.owned_for_play(&value),
+            (Pending::OwnForPlay, Err(error)) => self.fail_stream(error.message),
+            (Pending::SelectForPlay, Ok(value)) => self.selected_for_play(&value),
+            (Pending::SelectForPlay, Err(error)) => self.fail_stream(error.message),
+            (Pending::OwnThenSelect(id, variant), Ok(value)) => self.added_then_select(&id, &variant, &value),
+            (Pending::OwnThenSelect(_, _), Err(error)) => self.notice = Some(error.message),
+            (Pending::LibrarySelect(id), Ok(value)) => self.store_chosen(&id, &value),
+            (Pending::LibrarySelect(_), Err(error)) => self.notice = Some(error.message),
+            (Pending::LibraryRemove(id), Ok(value)) => self.removed(&id, &value),
+            (Pending::LibraryRemove(id), Err(error)) => self.removal_failed(&id, error.message),
+            (Pending::RemovalProbe, Ok(value)) => self.removal_probe(&value),
+            (Pending::RemovalProbe, Err(error)) => self.removal_probe_failed(error.message),
+            (Pending::GameDetail(id), Ok(value)) => self.game_detail(&id, &value),
+            (Pending::GameDetail(_), Err(error)) => {
+                self.finish_store_load();
+                self.notice = Some(error.message);
+            },
             (Pending::Launch, Ok(value)) => self.launch_checked(&value),
             (Pending::Launch, Err(error)) => self.notice = Some(error.message),
             (Pending::StreamSetting, result) => self.stream_setting_finished(result),
@@ -1013,6 +1069,294 @@ impl App {
         }
     }
 
+    fn send_ownership(&mut self, method: &str, id: &str, variant_id: &str, pending: Pending) {
+        if id.is_empty() || variant_id.is_empty() {
+            self.notice = Some("This game has no store version to update.".into());
+            return;
+        }
+        if !self.scope.is_object() {
+            self.notice = Some("Sign in again before changing your library.".into());
+            return;
+        }
+        let mut body = json!({"appId": id, "variantId": variant_id, "scope": self.scope});
+        if method == "catalog.ownership.add" {
+            body["confirmedExistingLicense"] = json!(true);
+        }
+        self.send(method, body, Duration::from_secs(60), pending);
+    }
+
+    fn load_stores(&mut self, id: &str) {
+        if self.pending.values().any(|pending| matches!(pending, Pending::GameDetail(game) if game == id)) {
+            return;
+        }
+        self.home.note_store_load(true);
+        self.store.note_store_load(true);
+        self.send("catalog.game.get", json!({"appId": id}), Duration::from_secs(45), Pending::GameDetail(id.to_owned()));
+    }
+
+    fn finish_store_load(&mut self) {
+        self.home.note_store_load(false);
+        self.store.note_store_load(false);
+    }
+
+    fn game_detail(&mut self, id: &str, value: &Value) {
+        self.finish_store_load();
+        let Some(game) = value.get("game") else {
+            return;
+        };
+        for entry in self.games.iter_mut().chain(self.store_games.iter_mut()) {
+            if entry.id == id {
+                entry.apply_detail(game);
+            }
+        }
+    }
+
+    fn choose_store(&mut self, id: &str, variant_id: &str, owned: bool) {
+        if owned {
+            self.notify("Setting the default store…");
+            self.send_ownership("catalog.ownership.select", id, variant_id, Pending::LibrarySelect(id.to_owned()));
+        } else {
+            self.notify("Adding to your library…");
+            self.send_ownership(
+                "catalog.ownership.add",
+                id,
+                variant_id,
+                Pending::OwnThenSelect(id.to_owned(), variant_id.to_owned()),
+            );
+        }
+    }
+
+    fn remove_owned(&mut self, id: &str, variant_id: &str) {
+        let mut variants = self
+            .games
+            .iter()
+            .find(|game| game.id == id)
+            .map(|game| game.versions.iter().filter(|version| version.in_library).map(|version| version.id.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !variant_id.is_empty() && !variants.iter().any(|version| version == variant_id) {
+            variants.push(variant_id.to_owned());
+        }
+        if variants.is_empty() {
+            self.notice = Some("This game has no store version to remove.".into());
+            return;
+        }
+        self.games.retain(|game| game.id != id);
+        self.store_games.iter_mut().filter(|game| game.id == id).for_each(|game| game.in_library = false);
+        self.removal = Some(LibraryRemoval {
+            id: id.to_owned(),
+            variants,
+            attempt: 0,
+            check_at: None,
+            cursor: String::new(),
+            revision: Value::Null,
+            context: Value::Null,
+        });
+        self.notify("Removing from your library…");
+        self.remove_next_variant();
+    }
+
+    fn remove_next_variant(&mut self) {
+        let Some(removal) = self.removal.as_mut() else {
+            return;
+        };
+        if let Some(variant_id) = removal.variants.pop() {
+            let id = removal.id.clone();
+            self.send_ownership("catalog.ownership.remove", &id, &variant_id, Pending::LibraryRemove(id.clone()));
+            return;
+        }
+        removal.cursor.clear();
+        removal.check_at = Some(Instant::now() + REMOVAL_WAIT);
+    }
+
+    fn owned_for_play(&mut self, value: &Value) {
+        if value["reconciliation"].as_str() == Some("confirmed") {
+            self.mark_owned(&self.launch_catalog.clone());
+            self.play_message = "Setting the default store…".into();
+            self.play_selected = true;
+            self.send_ownership(
+                "catalog.ownership.select",
+                &self.launch_catalog.clone(),
+                &self.launch_variant.clone(),
+                Pending::SelectForPlay,
+            );
+        } else {
+            let message = value["message"].as_str().unwrap_or("Could not add this game to your library.").to_owned();
+            self.fail_stream(message);
+        }
+    }
+
+    fn selected_for_play(&mut self, value: &Value) {
+        if value["reconciliation"].as_str() == Some("confirmed") {
+            self.reinspect();
+        } else {
+            let message = value["message"].as_str().unwrap_or("Could not choose the default store.").to_owned();
+            self.fail_stream(message);
+        }
+    }
+
+    fn reinspect(&mut self) {
+        if self.play != PlayPhase::Inspect {
+            return;
+        }
+        self.play_message = "Checking this game on GeForce NOW…".into();
+        self.send(
+            "catalog.launch.inspect",
+            json!({"appId": self.launch_catalog, "variantId": self.launch_variant}),
+            Duration::from_secs(45),
+            Pending::StreamInspect,
+        );
+    }
+
+    fn added_then_select(&mut self, id: &str, variant_id: &str, value: &Value) {
+        if value["reconciliation"].as_str() == Some("confirmed") {
+            self.mark_owned(id);
+            self.notify("Setting the default store…");
+            self.send_ownership("catalog.ownership.select", id, variant_id, Pending::LibrarySelect(id.to_owned()));
+        } else {
+            let message = value["message"].as_str().unwrap_or("Could not add this store version.").to_owned();
+            self.notice = Some(message);
+        }
+    }
+
+    fn store_chosen(&mut self, id: &str, value: &Value) {
+        if value["reconciliation"].as_str() == Some("confirmed") {
+            self.mark_owned(id);
+            self.refresh_library = true;
+            self.notify("Default store updated");
+            self.load_library();
+        } else {
+            let message = value["message"].as_str().unwrap_or("Could not choose the default store.").to_owned();
+            self.notice = Some(message);
+        }
+    }
+
+    fn removed(&mut self, id: &str, value: &Value) {
+        if self.removal.as_ref().is_none_or(|removal| removal.id != id) {
+            return;
+        }
+        if value["reconciliation"].as_str() != Some("confirmed") {
+            eprintln!("library: remove not confirmed yet for {id}");
+        }
+        self.remove_next_variant();
+    }
+
+    fn removal_failed(&mut self, id: &str, message: String) {
+        if self.removal.as_ref().is_none_or(|removal| removal.id != id) {
+            self.notice = Some(message);
+            return;
+        }
+        eprintln!("library: remove failed for {id}: {message}");
+        self.remove_next_variant();
+    }
+
+    fn poll_removal(&mut self) {
+        let due = self.removal.as_ref().and_then(|removal| removal.check_at).is_some_and(|at| Instant::now() >= at);
+        if !due || self.pending.values().any(|pending| matches!(pending, Pending::RemovalProbe)) {
+            return;
+        }
+        if let Some(removal) = self.removal.as_mut() {
+            removal.check_at = None;
+        }
+        self.request_removal_probe();
+    }
+
+    fn request_removal_probe(&mut self) {
+        let Some(removal) = self.removal.as_ref() else {
+            return;
+        };
+        let mut params = json!({"limit": LIBRARY_PAGE, "traversalId": format!("remove-{}-{}", removal.id, removal.attempt)});
+        if !removal.cursor.is_empty() {
+            params["cursor"] = json!(removal.cursor);
+            params["catalogRevision"] = removal.revision.clone();
+            params["catalogContext"] = removal.context.clone();
+        }
+        self.send("catalog.library.list", params, Duration::from_secs(60), Pending::RemovalProbe);
+    }
+
+    fn removal_probe(&mut self, value: &Value) {
+        let Some(id) = self.removal.as_ref().map(|removal| removal.id.clone()) else {
+            return;
+        };
+        let games = value["games"].as_array().map(Vec::as_slice).unwrap_or_default();
+        if let Some(game) = games.iter().find(|game| game["id"].as_str() == Some(id.as_str())) {
+            self.removal_still_present(game);
+            return;
+        }
+        let next = value["nextCursor"].as_str().unwrap_or_default();
+        if value["hasNextPage"].as_bool() == Some(true) && !next.is_empty() {
+            if let Some(removal) = self.removal.as_mut() {
+                removal.cursor = next.to_owned();
+                removal.revision = value["catalogRevision"].clone();
+                removal.context = value["catalogContext"].clone();
+            }
+            self.request_removal_probe();
+            return;
+        }
+        self.removal = None;
+        self.notify("Removed from your library");
+        self.load_library();
+    }
+
+    fn removal_still_present(&mut self, game: &Value) {
+        let attempt = {
+            let Some(removal) = self.removal.as_mut() else {
+                return;
+            };
+            removal.attempt += 1;
+            removal.cursor.clear();
+            removal.attempt
+        };
+        if attempt >= REMOVAL_ATTEMPTS {
+            self.removal = None;
+            self.notice = Some("This game is still in your library. Try removing it again.".into());
+            self.load_library();
+            return;
+        }
+        let variants = owned_variant_ids(game);
+        if let Some(removal) = self.removal.as_mut() {
+            removal.variants = variants.clone();
+        }
+        if variants.is_empty() {
+            if let Some(removal) = self.removal.as_mut() {
+                removal.check_at = Some(Instant::now() + REMOVAL_WAIT);
+            }
+            self.notify("Checking your library…");
+            return;
+        }
+        self.notify("Removing from your library…");
+        self.remove_next_variant();
+    }
+
+    fn removal_probe_failed(&mut self, message: String) {
+        let attempt = {
+            let Some(removal) = self.removal.as_mut() else {
+                self.notice = Some(message);
+                return;
+            };
+            removal.attempt += 1;
+            removal.attempt
+        };
+        if attempt >= REMOVAL_ATTEMPTS {
+            self.removal = None;
+            self.notice = Some(message);
+            self.load_library();
+            return;
+        }
+        if let Some(removal) = self.removal.as_mut() {
+            removal.check_at = Some(Instant::now() + REMOVAL_WAIT);
+        }
+        self.notify("Checking your library…");
+    }
+
+    fn mark_owned(&mut self, id: &str) {
+        for game in self.store_games.iter_mut().chain(self.games.iter_mut()) {
+            if game.id == id {
+                game.in_library = true;
+            }
+        }
+        self.refresh_library = true;
+    }
+
     fn submit_add(&mut self) {
         let Some((id, variant_id)) = self.pending_add.clone() else {
             return;
@@ -1032,12 +1376,7 @@ impl App {
 
     fn owned(&mut self, id: &str, value: &Value) {
         if value["reconciliation"].as_str() == Some("confirmed") {
-            for game in self.store_games.iter_mut().chain(self.games.iter_mut()) {
-                if game.id == id {
-                    game.in_library = true;
-                }
-            }
-            self.refresh_library = true;
+            self.mark_owned(id);
             self.notify("Added to your library");
         } else {
             let message = value["message"].as_str().unwrap_or("Could not confirm the library update.");
@@ -1066,6 +1405,15 @@ impl App {
     }
 
     fn act_settings(&mut self, action: Action) {
+        if self.settings_index == settings::SIGN_OUT_ROW {
+            match action {
+                Action::Up => self.settings_index = self.settings_index.saturating_sub(1),
+                Action::Confirm => self.open_dialog(DialogKind::SignOut),
+                Action::Back | Action::Escape => self.screen = Screen::Home,
+                _ => {}
+            }
+            return;
+        }
         match action {
             Action::Up => self.settings_index = self.settings_index.saturating_sub(1),
             Action::Down => self.settings_index = (self.settings_index + 1).min(settings::ROWS - 1),
@@ -1198,6 +1546,8 @@ impl App {
         self.launch_catalog = catalog_id.to_owned();
         self.launch_variant = variant_id.to_owned();
         self.launch_title = title.to_owned();
+        self.play_added = false;
+        self.play_selected = false;
         self.return_to_store = from_store;
         let profile = self.profile.clone();
         self.play = PlayPhase::Settings;
@@ -1279,6 +1629,18 @@ impl App {
 
     fn stream_inspected(&mut self, value: &Value) {
         let status = value["decision"]["status"].as_str().unwrap_or("");
+        if status == "ownership_required" && !self.play_added {
+            self.play_added = true;
+            self.play_message = "Adding to your library…".into();
+            self.send_ownership("catalog.ownership.add", &self.launch_catalog.clone(), &self.launch_variant.clone(), Pending::OwnForPlay);
+            return;
+        }
+        if status == "selection_required" && !self.play_selected {
+            self.play_selected = true;
+            self.play_message = "Setting the default store…".into();
+            self.send_ownership("catalog.ownership.select", &self.launch_catalog.clone(), &self.launch_variant.clone(), Pending::SelectForPlay);
+            return;
+        }
         if status != "ready" {
             let message = value["decision"]["message"].as_str().unwrap_or("This game can't be started.").to_owned();
             self.fail_stream(message);
@@ -1659,6 +2021,21 @@ impl App {
         self.artwork.clear(painter);
         self.core = None;
     }
+}
+
+fn owned_variant_ids(game: &Value) -> Vec<String> {
+    game["variants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|variant| {
+            let id = variant["id"].as_str().filter(|id| !id.is_empty())?;
+            let status = variant["libraryStatus"].as_str();
+            let owned = variant["inLibrary"].as_bool().unwrap_or(false)
+                || matches!(status, Some("MANUAL" | "PLATFORM_SYNC" | "IN_LIBRARY"));
+            owned.then(|| id.to_owned())
+        })
+        .collect()
 }
 
 const INSET_X: f32 = 32.0;

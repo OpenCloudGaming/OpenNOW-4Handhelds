@@ -9,8 +9,9 @@ use crate::theme::{self, *};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-pub const ROWS: usize = 7;
+pub const ROWS: usize = 8;
 pub const SERVER_ROW: usize = 6;
+pub const SIGN_OUT_ROW: usize = 7;
 
 const BITRATES: [f64; 7] = [5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0];
 const FRAME_RATES: [u64; 3] = [30, 60, 120];
@@ -188,15 +189,19 @@ pub fn load() -> Profile {
 pub fn draw(painter: &mut Painter, clock: &theme::Clock, profile: &Profile, selected: usize, server: &str) {
     theme::draw_header(painter, clock);
     painter.text(EDGE, 70.0, 22.0, Weight::Black, "Settings", TEXT);
-    let top = 102.0;
-    let height = 42.0;
+    let top = 100.0;
+    let height = 38.0;
     for row in 0..ROWS {
         let y = top + row as f32 * height;
         if row == selected {
-            painter.fill(EDGE, y, CANVAS.0 - EDGE * 2.0, 38.0, 8.0, BUTTON);
+            painter.fill(EDGE, y, CANVAS.0 - EDGE * 2.0, 34.0, 8.0, BUTTON);
         }
         let color = if row == selected { TEXT } else { MUTED };
-        painter.text(32.0, y + 9.0, 15.0, Weight::SemiBold, row_label(row), color);
+        let label_color = if row == SIGN_OUT_ROW { ERROR } else { color };
+        painter.text(32.0, y + 8.0, 15.0, Weight::SemiBold, row_label(row), label_color);
+        if row == SIGN_OUT_ROW {
+            continue;
+        }
         let value = if row == SERVER_ROW { server.to_owned() } else { profile.row_value(row) };
         let value_width = painter.measure(&value, 15.0, Weight::Bold);
         let right = CANVAS.0 - 32.0;
@@ -204,12 +209,16 @@ pub fn draw(painter: &mut Painter, clock: &theme::Clock, profile: &Profile, sele
         let available = 250.0;
         let shown = value_width.min(available);
         if row == selected {
-            painter.text(right - 12.0, y + 9.0, 15.0, Weight::Bold, ">", FOCUS);
-            painter.text(right - shown - gap - 16.0, y + 9.0, 15.0, Weight::Bold, "<", FOCUS);
+            painter.text(right - 12.0, y + 8.0, 15.0, Weight::Bold, ">", FOCUS);
+            painter.text(right - shown - gap - 16.0, y + 8.0, 15.0, Weight::Bold, "<", FOCUS);
         }
-        painter.text_fit(right - shown - gap, y + 9.0, 15.0, Weight::Bold, &value, available, if row == selected { TEXT } else { MUTED });
+        painter.text_fit(right - shown - gap, y + 8.0, 15.0, Weight::Bold, &value, available, if row == selected { TEXT } else { MUTED });
     }
-    theme::draw_footer(painter, "Server, bit rate, and picture size apply on the next game", &[("A", "Change"), ("B", "Back")]);
+    if selected == SIGN_OUT_ROW {
+        theme::draw_footer(painter, "Sign out of this GeForce NOW account", &[("A", "Sign out"), ("B", "Back")]);
+    } else {
+        theme::draw_footer(painter, "Server, bit rate, and picture size apply on the next game", &[("A", "Change"), ("B", "Back")]);
+    }
 }
 
 fn row_label(row: usize) -> &'static str {
@@ -220,7 +229,8 @@ fn row_label(row: usize) -> &'static str {
         3 => "Render",
         4 => "VSync",
         5 => "Layout",
-        _ => "Server",
+        6 => "Server",
+        _ => "Sign out",
     }
 }
 
