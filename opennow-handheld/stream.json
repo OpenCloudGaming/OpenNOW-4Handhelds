@@ -6,6 +6,6 @@
   "fps": 30,
   "maxBitrateMbps": 10,
   "renderResolution": "640x480",
-  "vsync": true,
+  "vsync": false,
   "xboxLayout": false
 }

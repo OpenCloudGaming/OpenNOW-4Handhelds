@@ -13,10 +13,10 @@ pub const ROWS: usize = 8;
 pub const SERVER_ROW: usize = 6;
 pub const SIGN_OUT_ROW: usize = 7;
 
-const BITRATES: [f64; 7] = [5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0];
+const BITRATES: [f64; 20] = [
+    5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0,
+];
 const FRAME_RATES: [u64; 3] = [30, 60, 120];
-const RESOLUTIONS: [&str; 4] = ["1024x768", "1112x834", "1280x720", "1920x1080"];
-const RENDERS: [&str; 3] = ["640x480", "1024x768", "native"];
 
 #[derive(Clone)]
 pub struct Profile {
@@ -28,6 +28,8 @@ pub struct Profile {
     pub max_bitrate_mbps: f64,
     /// Size the decoded picture is color-converted to. `native` keeps the frame.
     pub render_resolution: String,
+    /// Entitled GeForce NOW sizes, smallest first. Empty until the account is read.
+    pub resolutions: Vec<String>,
     pub vsync: bool,
     /// Off uses the Nintendo face labels printed on most handhelds.
     pub xbox_layout: bool,
@@ -38,12 +40,13 @@ impl Profile {
         Self {
             codec: "h264".into(),
             color_quality: "8bit_420".into(),
-            resolution: "1024x768".into(),
-            aspect_ratio: "4:3".into(),
+            resolution: String::new(),
+            aspect_ratio: "16:9".into(),
             fps: 30,
             max_bitrate_mbps: 10.0,
             render_resolution: "640x480".into(),
-            vsync: true,
+            resolutions: Vec::new(),
+            vsync: false,
             xbox_layout: false,
         }
     }
@@ -64,15 +67,35 @@ impl Profile {
         ]
     }
 
+    /// 640×480 and Native stay available. The account's GeForce NOW sizes are added between them.
+    fn render_choices(&self) -> Vec<String> {
+        let mut choices = vec!["640x480".to_owned()];
+        for size in &self.resolutions {
+            if !choices.iter().any(|existing| existing.eq_ignore_ascii_case(size)) {
+                choices.push(size.clone());
+            }
+        }
+        choices.push("native".to_owned());
+        choices
+    }
+
     pub fn nudge(&mut self, row: usize, delta: i32) {
         match row {
             0 => self.max_bitrate_mbps = step_f64(&BITRATES, self.max_bitrate_mbps, delta),
             1 => self.fps = step_u64(&FRAME_RATES, self.fps, delta),
             2 => {
-                self.resolution = step_str(&RESOLUTIONS, &self.resolution, delta).to_owned();
+                let choices: Vec<&str> = self.resolutions.iter().map(String::as_str).collect();
+                if choices.is_empty() {
+                    return;
+                }
+                self.resolution = step_str(&choices, &self.resolution, delta).to_owned();
                 self.aspect_ratio = aspect_for(&self.resolution);
             }
-            3 => self.render_resolution = step_str(&RENDERS, &self.render_resolution, delta).to_owned(),
+            3 => {
+                let choices = self.render_choices();
+                let choices: Vec<&str> = choices.iter().map(String::as_str).collect();
+                self.render_resolution = step_str(&choices, &self.render_resolution, delta).to_owned();
+            }
             4 => self.vsync = !self.vsync,
             5 => self.xbox_layout = !self.xbox_layout,
             _ => {}
@@ -83,7 +106,13 @@ impl Profile {
         match row {
             0 => format!("{} Mbps", bitrate_text(self.max_bitrate_mbps)),
             1 => format!("{} FPS", self.fps),
-            2 => pretty_size(&self.resolution),
+            2 => {
+                if self.resolution.is_empty() {
+                    "Loading…".into()
+                } else {
+                    pretty_size(&self.resolution)
+                }
+            }
             3 => {
                 if self.render_resolution.eq_ignore_ascii_case("native") {
                     "Native".into()
@@ -112,6 +141,20 @@ impl Profile {
         .unwrap_or_else(|_| "{}".into())
     }
 
+    pub fn apply_resolutions(&mut self, resolutions: Vec<String>) {
+        self.resolutions = resolutions;
+        if self.resolutions.iter().any(|item| item.eq_ignore_ascii_case(&self.resolution)) {
+            return;
+        }
+        let Some(lowest) = self.resolutions.first().cloned() else {
+            return;
+        };
+        eprintln!("settings: resolution {} is not on this account, using {lowest}", if self.resolution.is_empty() { "unset" } else { self.resolution.as_str() });
+        self.resolution = lowest;
+        self.aspect_ratio = aspect_for(&self.resolution);
+        self.save();
+    }
+
     pub fn save(&self) {
         let path = config_path();
         match std::fs::write(&path, self.document()) {
@@ -126,10 +169,7 @@ pub fn load() -> Profile {
     let fallback = Profile::fallback();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(_) => {
-            fallback.save();
-            return fallback;
-        }
+        Err(_) => return fallback,
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
         eprintln!("settings: {} is not JSON, using the defaults", path.display());
@@ -148,16 +188,16 @@ pub fn load() -> Profile {
         max_bitrate_mbps: value
             .get("maxBitrateMbps")
             .and_then(Value::as_f64)
-            .filter(|bitrate| bitrate.is_finite() && (0.22..=200.0).contains(bitrate))
+            .filter(|bitrate| bitrate.is_finite() && (5.0..=100.0).contains(bitrate))
+            .map(snap_bitrate)
             .unwrap_or(fallback.max_bitrate_mbps),
         render_resolution: text_or(&value, "renderResolution", &fallback.render_resolution),
+        resolutions: Vec::new(),
         vsync: value.get("vsync").and_then(Value::as_bool).unwrap_or(fallback.vsync),
         xbox_layout: value.get("xboxLayout").and_then(Value::as_bool).unwrap_or(false),
     };
     if !resolution_ok(&profile.resolution) {
-        eprintln!("settings: {} has an unusable resolution, using 1024×768", path.display());
-        profile.resolution = fallback.resolution.clone();
-        profile.aspect_ratio = fallback.aspect_ratio.clone();
+        profile.resolution.clear();
     }
     if !matches!(profile.aspect_ratio.as_str(), "16:9" | "16:10" | "21:9" | "32:9" | "4:3") {
         profile.aspect_ratio = aspect_for(&profile.resolution);
@@ -244,6 +284,29 @@ fn bitrate_json(value: f64) -> Value {
 
 fn bitrate_text(value: f64) -> String {
     if (value - value.round()).abs() < 1e-9 { format!("{}", value.round() as i64) } else { format!("{value:.2}") }
+}
+
+fn snap_bitrate(value: f64) -> f64 {
+    let stepped = (value / 5.0).round() * 5.0;
+    stepped.clamp(5.0, 100.0)
+}
+
+/// Unique entitled sizes from `account.subscription.get`, smallest first.
+pub fn resolutions_from_subscription(value: &Value) -> Vec<String> {
+    let mut sizes = Vec::new();
+    for entry in value["subscription"]["entitledResolutions"].as_array().into_iter().flatten() {
+        let width = entry["width"].as_u64().unwrap_or(0);
+        let height = entry["height"].as_u64().unwrap_or(0);
+        if width < 640 || height < 480 {
+            continue;
+        }
+        let label = format!("{width}x{height}");
+        if !sizes.iter().any(|existing: &(u64, u64, String)| existing.2.eq_ignore_ascii_case(&label)) {
+            sizes.push((width, height, label));
+        }
+    }
+    sizes.sort_by_key(|(width, height, _)| (*width * *height, *width));
+    sizes.into_iter().map(|(_, _, label)| label).collect()
 }
 
 fn pretty_size(value: &str) -> String {

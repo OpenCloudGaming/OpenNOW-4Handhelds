@@ -85,6 +85,7 @@ enum Pending {
     Regions,
     SettingsRead,
     RegionSet,
+    Subscription,
 }
 
 /// One title being removed, including the follow-up checks that it left the library.
@@ -139,10 +140,15 @@ pub struct App {
     mouse_x: f32,
     mouse_y: f32,
     mouse_down: bool,
-    /// Select (SDL buttons 4 and 12) is held, for the fallback menu chord.
+    /// Latest stick deflection in mouse mode, from -1 to 1, after the dead zone.
+    mouse_stick_x: f32,
+    mouse_stick_y: f32,
+    /// Select (SDL buttons 4 and 12) is held, for the session-menu chord.
     pad_select: bool,
-    /// X (SDL button 2) is held, for the fallback menu chord.
+    /// X is held. Nintendo layout uses button 2, Xbox layout uses button 3.
     pad_x: bool,
+    /// Select and X are both held, so the session-menu chord has already fired.
+    session_chord: bool,
     /// The connected pad has physical button 16, the FN key.
     fn_button: bool,
     toast: Option<(String, Instant)>,
@@ -241,8 +247,11 @@ impl App {
             mouse_x: CANVAS.0 / 2.0,
             mouse_y: CANVAS.1 / 2.0,
             mouse_down: false,
+            mouse_stick_x: 0.0,
+            mouse_stick_y: 0.0,
             pad_select: false,
             pad_x: false,
+            session_chord: false,
             fn_button: false,
             toast: None,
             start_held: false,
@@ -370,7 +379,7 @@ impl App {
                     match choice {
                         0 => self.enter_mouse_mode(),
                         2 => self.exit_after_session(),
-                        _ => self.open_dialog(DialogKind::EndStream),
+                        _ => self.end_stream("Ended from the handheld"),
                     }
                 }
                 Action::Back | Action::Escape => self.session_menu = false,
@@ -508,13 +517,18 @@ impl App {
         if button == 4 || button == 12 {
             self.pad_select = pressed;
         }
-        if button == 2 {
+        let x_button = if self.profile.xbox_layout { 3 } else { 2 };
+        if button == x_button {
             self.pad_x = pressed;
         }
-        if !self.fn_button && pressed && self.pad_select && self.pad_x {
-            self.toggle_session_menu();
+        if self.pad_select && self.pad_x {
+            if !self.session_chord {
+                self.session_chord = true;
+                self.toggle_session_menu();
+            }
             return;
         }
+        self.session_chord = false;
         if self.mouse_mode || self.session_menu || self.dialog.is_some() {
             return;
         }
@@ -555,10 +569,23 @@ impl App {
             self.mouse_down = false;
         }
         self.mouse_mode = false;
+        self.mouse_stick_x = 0.0;
+        self.mouse_stick_y = 0.0;
         if let Some(stream) = self.stream.as_mut() {
             stream.release_pad();
         }
     }
+
+/// Turns a stick axis into a smooth -1..1 speed. Light pressure stays slow.
+fn mouse_deflection(value: i16) -> f32 {
+    const DEADZONE: f32 = 0.16;
+    let amount = (value as f32 / 32767.0).clamp(-1.0, 1.0);
+    if amount.abs() < DEADZONE {
+        return 0.0;
+    }
+    let scaled = (amount.abs() - DEADZONE) / (1.0 - DEADZONE);
+    scaled * scaled * amount.signum()
+}
 
     fn send_mouse(&mut self) {
         let (width, height) = self.stream_frame.map(|(_, width, height)| (width, height)).unwrap_or((1024, 768));
@@ -570,22 +597,9 @@ impl App {
     }
 
     fn mouse_axis(&mut self, axis: u8, value: i16) {
-        const DEADZONE: i16 = 4_500;
-        const SPEED: f32 = 0.00025;
         match axis {
-            0 | 2 => {
-                if value.abs() >= DEADZONE {
-                    self.mouse_x = (self.mouse_x + value as f32 * SPEED).clamp(0.0, CANVAS.0 - 1.0);
-                    self.send_mouse();
-                }
-            }
-            1 | 3 => {
-                if value.abs() >= DEADZONE {
-                    // Stick up is a negative SDL value, and the screen's up is a smaller Y.
-                    self.mouse_y = (self.mouse_y + value as f32 * SPEED).clamp(0.0, CANVAS.1 - 1.0);
-                    self.send_mouse();
-                }
-            }
+            0 | 2 => self.mouse_stick_x = Self::mouse_deflection(value),
+            1 | 3 => self.mouse_stick_y = Self::mouse_deflection(value),
             5 => {
                 let press = value > 12_000;
                 let release = value < 4_000;
@@ -603,6 +617,23 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Moves the pointer from the held stick. Axis events only arrive when the
+    /// stick value changes, so the position is advanced every frame instead.
+    fn move_mouse(&mut self, elapsed: Duration) {
+        if !self.mouse_mode || (self.mouse_stick_x == 0.0 && self.mouse_stick_y == 0.0) {
+            return;
+        }
+        let dt = elapsed.as_secs_f32().min(0.05);
+        let next_x = (self.mouse_x + self.mouse_stick_x * 560.0 * dt).clamp(0.0, CANVAS.0 - 1.0);
+        let next_y = (self.mouse_y + self.mouse_stick_y * 420.0 * dt).clamp(0.0, CANVAS.1 - 1.0);
+        if next_x == self.mouse_x && next_y == self.mouse_y {
+            return;
+        }
+        self.mouse_x = next_x;
+        self.mouse_y = next_y;
+        self.send_mouse();
     }
 
     pub fn pad_axis(&mut self, axis: u8, value: i16) {
@@ -684,6 +715,7 @@ impl App {
         self.poll_sign_in();
         self.poll_removal();
         self.advance_play();
+        self.move_mouse(elapsed);
         let mut keep_owned = Vec::new();
         match self.screen {
             Screen::Home => {
@@ -818,6 +850,11 @@ impl App {
                 self.notify(error.message);
                 self.send("settings.get", json!({}), Duration::from_secs(10), Pending::SettingsRead);
             }
+            (Pending::Subscription, Ok(value)) => self.resolutions_loaded(&value),
+            (Pending::Subscription, Err(error)) => {
+                eprintln!("settings: resolutions failed: {}", error.message);
+                self.notify("Couldn't load GeForce NOW resolutions");
+            }
         }
     }
 
@@ -851,6 +888,7 @@ impl App {
         self.screen = Screen::Home;
         self.home.reset();
         self.load_library();
+        self.load_resolutions();
     }
 
     fn show_sign_in(&mut self) {
@@ -1429,6 +1467,10 @@ impl App {
             self.cycle_server(delta);
             return;
         }
+        if self.settings_index == 2 && self.profile.resolutions.is_empty() {
+            self.notify("Resolutions aren't ready yet");
+            return;
+        }
         let vsync = self.profile.vsync;
         self.profile.nudge(self.settings_index, delta);
         if self.profile.vsync != vsync {
@@ -1446,6 +1488,7 @@ impl App {
         if !self.pending.values().any(|pending| matches!(pending, Pending::SettingsRead)) {
             self.send("settings.get", json!({}), Duration::from_secs(10), Pending::SettingsRead);
         }
+        self.load_resolutions();
     }
 
     fn regions_loaded(&mut self, value: &Value) {
@@ -1473,6 +1516,24 @@ impl App {
             self.region_provider = provider.to_owned();
         }
         self.sync_server_index();
+    }
+
+    fn resolutions_loaded(&mut self, value: &Value) {
+        let resolutions = settings::resolutions_from_subscription(value);
+        if resolutions.is_empty() {
+            eprintln!("settings: GeForce NOW returned no resolutions");
+            self.notify("No GeForce NOW resolutions were returned");
+            return;
+        }
+        eprintln!("settings: {} GeForce NOW resolutions, lowest {}", resolutions.len(), resolutions[0]);
+        self.profile.apply_resolutions(resolutions);
+    }
+
+    fn load_resolutions(&mut self) {
+        if self.pending.values().any(|pending| matches!(pending, Pending::Subscription)) {
+            return;
+        }
+        self.send("account.subscription.get", json!({}), Duration::from_secs(30), Pending::Subscription);
     }
 
     fn sync_server_index(&mut self) {
@@ -1526,6 +1587,11 @@ impl App {
         }
         if !self.scope.is_object() {
             self.notice = Some("Sign in before playing.".into());
+            return;
+        }
+        if self.profile.resolution.is_empty() {
+            self.notice = Some("GeForce NOW resolutions aren't ready yet.".into());
+            self.load_resolutions();
             return;
         }
         if variant_id.is_empty() || !variant_id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -1837,6 +1903,7 @@ impl App {
         self.session_menu = false;
         self.pad_select = false;
         self.pad_x = false;
+        self.session_chord = false;
         self.stream_frame = None;
         if let Some(mut stream) = self.stream.take() {
             stream.stop_media();
@@ -1965,15 +2032,7 @@ impl App {
                     theme::draw_spinner(painter, CANVAS.0 / 2.0, 190.0, 22.0, seconds);
                     let width = painter.measure(&self.play_message, 20.0, Weight::Bold);
                     painter.text_fit(((CANVAS.0 - width) / 2.0).max(EDGE), 236.0, 20.0, Weight::Bold, &self.play_message, CANVAS.0 - EDGE * 2.0, TEXT);
-                    theme::draw_footer(
-                        painter,
-                        if self.fn_button {
-                            "FN opens the session menu"
-                        } else {
-                            "Select + X opens the session menu"
-                        },
-                        &[],
-                    );
+                    theme::draw_footer(painter, "FN or Select + X opens the session menu", &[]);
                 }
             }
         }
