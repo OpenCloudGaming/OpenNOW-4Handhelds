@@ -3,7 +3,7 @@
   "colorQuality": "8bit_420",
   "resolution": "1024x768",
   "aspectRatio": "4:3",
-  "fps": 30,
+  "fps": 60,
   "maxBitrateMbps": 10,
   "renderResolution": "640x480",
   "vsync": false,
