@@ -2924,56 +2924,12 @@ fn consume_encoded_media(
     receiver: Receiver<EncodedMediaFrame>,
     sink: MediaSink,
 ) {
-    let mut video = 0_u64;
-    let mut audio = 0_u64;
-    let mut keyframes = 0_u64;
-    let mut dropped = 0_u64;
-    let mut paused = 0_u64;
-    let origin = Instant::now();
-    let mut last_report = origin;
-    opennow_streamer_protocol::log::log_line(
-        "INFO",
-        "media-ingress",
-        "consumer started; awaiting assembled media",
-    );
     loop {
-        if last_report.elapsed() >= Duration::from_secs(10) {
-            opennow_streamer_protocol::log::log_async(
-                "INFO",
-                "media-ingress",
-                &format!(
-                    "elapsed_ms={} video={video} audio={audio} keyframes={keyframes} dropped={dropped} paused={paused}",
-                    origin.elapsed().as_millis()
-                ),
-            );
-            last_report = Instant::now();
-        }
         let frame = match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(frame) => frame,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if frame.codec.eq_ignore_ascii_case("opus") {
-            audio += 1;
-        } else {
-            video += 1;
-        }
-        if frame.keyframe {
-            keyframes += 1;
-        }
-        if video == 1 && !frame.codec.eq_ignore_ascii_case("opus") {
-            opennow_streamer_protocol::log::log_line(
-                "INFO",
-                "media-ingress",
-                &format!(
-                    "first assembled video bytes={} keyframe={} contiguous={} elapsed_ms={}",
-                    frame.payload.len(),
-                    frame.keyframe,
-                    frame.contiguous,
-                    origin.elapsed().as_millis()
-                ),
-            );
-        }
         let codec = if frame.codec.eq_ignore_ascii_case("h264") {
             MediaCodec::H264
         } else if frame.codec.eq_ignore_ascii_case("h265")
@@ -3001,7 +2957,6 @@ fn consume_encoded_media(
             ssrc: frame.ssrc,
         }) {
             PushOutcome::Unsupported => {
-                dropped += 1;
                 let _ = output.send(event(
                     "log",
                     json!({
@@ -3011,19 +2966,9 @@ fn consume_encoded_media(
                 ));
             }
             PushOutcome::Closed => break,
-            PushOutcome::DroppedOldest => dropped += 1,
-            PushOutcome::Paused => paused += 1,
-            PushOutcome::Queued => {}
+            PushOutcome::DroppedOldest | PushOutcome::Paused | PushOutcome::Queued => {}
         }
     }
-    opennow_streamer_protocol::log::log_line(
-        "INFO",
-        "media-ingress",
-        &format!(
-            "consumer stopped elapsed_ms={} video={video} audio={audio} keyframes={keyframes} dropped={dropped} paused={paused}",
-            origin.elapsed().as_millis()
-        ),
-    );
 }
 
 #[cfg(test)]

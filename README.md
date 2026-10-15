@@ -9,7 +9,7 @@ Download latest release, extract the contents into the ports folder, on the hand
 - Choose a default store for a game, or remove the game from your library.
 - Change the server, bit rate, frame rate, resolution, render, vsync to on or off, and controller layout.
 ## Shortcuts
-**FN** or **Select + X** opens the session menu.
+**FN** or **Select + X** opens the session menu. **Stats** at the bottom of that menu shows FPS and Mbps on the picture.
 
 **Start** and **Select** together quit OpenNOW while in menu, it does not apply while in a session
 

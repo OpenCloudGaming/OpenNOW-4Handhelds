@@ -330,7 +330,6 @@ fn run() -> Result<(), String> {
     let mut repeat = NavRepeat::new();
     let started = Instant::now();
     let mut last_frame = Instant::now();
-    let (mut frames, mut window_start) = (0u32, Instant::now());
 
     'running: while !app.quit {
         while let Some((event, added)) = sdl.poll() {
@@ -379,12 +378,6 @@ fn run() -> Result<(), String> {
         sdl.swap(&window);
         if !vsync {
             std::thread::sleep(Duration::from_millis(16).saturating_sub(now.elapsed()));
-        }
-
-        frames += 1;
-        if window_start.elapsed() >= Duration::from_secs(5) {
-            eprintln!("fps: {:.1}", frames as f32 / window_start.elapsed().as_secs_f32());
-            (frames, window_start) = (0, Instant::now());
         }
     }
 

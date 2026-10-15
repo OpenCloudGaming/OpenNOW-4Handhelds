@@ -16,6 +16,10 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+/// File logging is off while handheld sessions are being tested. Turning this
+/// back on restores `streamer.log`.
+const FILE_LOG_ENABLED: bool = false;
+
 /// Matches the Qt shell's rotation policy for `native-streamer.log`.
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 /// Hot-path failures (per-frame acquire/record) log the first hit and then
@@ -51,6 +55,9 @@ fn now_ms() -> u64 {
 /// than once; logging must never break streaming, so failures are returned
 /// for the caller to ignore or surface.
 pub fn set_log_file(path: &str) -> Result<(), String> {
+    if !FILE_LOG_ENABLED {
+        return Ok(());
+    }
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("log file path is empty".to_owned());
@@ -96,7 +103,19 @@ pub fn log_file_path() -> Option<String> {
         .map(|state| state.path.clone())
 }
 
+fn should_persist(level: &str, message: &str) -> bool {
+    match level {
+        "WARN" | "ERROR" => true,
+        // One line when the picture is up. Stats and connection chatter stay out of the file.
+        "INFO" => message == "session entered",
+        _ => false,
+    }
+}
+
 fn write_line(level: &str, area: &str, message: &str) {
+    if !FILE_LOG_ENABLED || !should_persist(level, message) {
+        return;
+    }
     let mut guard = match state().lock() {
         Ok(guard) => guard,
         Err(_) => return,
@@ -289,6 +308,9 @@ pub fn log_line(level: &str, area: &str, message: &str) {
 /// Periodic media/transport counters must not wait for disk I/O. The diagnostics
 /// worker has a fixed queue; under slow storage it drops traces, never media.
 pub fn log_async(level: &'static str, area: &'static str, message: &str) {
+    if !FILE_LOG_ENABLED {
+        return;
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{SyncSender, sync_channel};
     type Line = (&'static str, &'static str, String);
@@ -326,6 +348,9 @@ pub fn log_async(level: &'static str, area: &'static str, message: &str) {
 /// Low-frequency pipeline diagnostics must be visible both in standalone stderr
 /// captures and in the embedded Qt file sink. Never pass credentials or payloads.
 pub fn diagnostic(level: &'static str, area: &'static str, message: &str) {
+    if !FILE_LOG_ENABLED {
+        return;
+    }
     log_async(level, area, message);
     eprintln!("{message}");
 }
@@ -334,6 +359,9 @@ pub fn diagnostic(level: &'static str, area: &'static str, message: &str) {
 /// repeat, tagging repeats with their running count. For hot paths where
 /// the same failure recurs per frame.
 pub fn log_throttled(key: &'static str, level: &str, area: &str, message: &str) {
+    if !FILE_LOG_ENABLED {
+        return;
+    }
     let count = {
         let mut counts = throttle_counts().lock().expect("log counts poisoned");
         let entry = counts.entry(key).or_insert(0);
@@ -605,7 +633,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         set_log_file(&path).unwrap();
         for _ in 0..1100 {
-            log_line("INFO", "test", &"x".repeat(2048));
+            log_line("WARN", "test", &"x".repeat(2048));
         }
         {
             let _stage = Stage::begin("test.incomplete");
@@ -614,11 +642,8 @@ mod tests {
             let mut stage = Stage::begin("test.complete");
             stage.complete();
         }
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.len() as u64 <= MAX_LOG_BYTES);
-        assert!(Path::new(&format!("{path}.previous")).exists());
-        assert!(body.contains("test.incomplete incomplete elapsed_ms="));
-        assert!(body.contains("test.complete complete elapsed_ms="));
+        assert!(!Path::new(&path).exists());
+        assert!(!Path::new(&format!("{path}.previous")).exists());
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.previous"));
@@ -636,21 +661,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         set_log_file(&path).unwrap();
         log_async("INFO", "transport", "inbound=0 frames=0");
+        log_async("WARN", "transport", "bind failed");
         diagnostic("INFO", "transport", "NVST rx-stats inbound=0 pings=97");
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let body = std::fs::read_to_string(&path).unwrap();
-            if body.contains("inbound=0 frames=0")
-                && body.contains("INFO transport NVST rx-stats inbound=0 pings=97")
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "diagnostic worker did not write the trace"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        assert!(!Path::new(&path).exists());
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
     }
@@ -671,10 +684,11 @@ mod tests {
         let path = temp_path("lines.log");
         let _ = std::fs::remove_file(&path);
         set_log_file(&path).unwrap();
-        assert_eq!(log_file_path().as_deref(), Some(path.as_str()));
+        assert!(log_file_path().is_none());
         log_line("INFO", "engine", "hello");
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("INFO engine hello"), "body was: {body}");
+        log_line("INFO", "session", "session entered");
+        log_line("WARN", "session", "connection dropped");
+        assert!(!Path::new(&path).exists());
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
     }
@@ -689,13 +703,11 @@ mod tests {
         let _ = std::fs::remove_file(&previous);
         std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 8) as usize]).unwrap();
         set_log_file(&path).unwrap();
-        assert!(
-            std::fs::metadata(&previous).unwrap().len() > MAX_LOG_BYTES,
-            "previous log should hold the oversized body"
-        );
-        assert!(
-            std::fs::metadata(&path).unwrap().len() < 1024,
-            "fresh log should start near-empty"
+        assert!(!Path::new(&previous).exists());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_LOG_BYTES + 8,
+            "disabled logging must leave an existing file untouched"
         );
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
@@ -712,9 +724,7 @@ mod tests {
         for _ in 0..(THROTTLE_EVERY * 2 + 10) {
             log_throttled("unit-test-key", "WARN", "decode", "boom");
         }
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body.lines().count(), 3, "body was: {body}");
-        assert!(body.contains("(repeat #1200)"));
+        assert!(!Path::new(&path).exists());
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
     }

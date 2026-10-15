@@ -6398,14 +6398,8 @@ fn run_nvst_webrtc_bundle(
     let mut last_rtcp_send = Instant::now() - SRTCP_RR_INTERVAL;
     let mut last_recovery_send = Instant::now();
     let mut last_keyframe_attempt = Instant::now() - KEYFRAME_REQUEST_COOLDOWN;
-    let mut keyframe_attempts = 0_u64;
-    let mut last_keyframe_attempt_log: Option<Instant> = None;
-    let mut rtcp_reports_sent = 0_u64;
     let mut control_reports = ControlReportBatch::new(Instant::now(), max_control_report_bytes);
     let mut last_frame_pacing_send = Instant::now() - FRAME_PACING_INTERVAL;
-    let control_stats_origin = Instant::now();
-    let mut last_control_stats_log = Instant::now();
-    let mut frame_pacing_reports_sent = 0_u64;
     let mut sctp_started_at: Option<Instant> = None;
     let mut input_channels: Option<NvstInputChannels> = None;
     let mut hid_session = hid_runtime.as_ref().map(|_| {
@@ -6742,9 +6736,7 @@ fn run_nvst_webrtc_bundle(
                     // report a neutral error exactly as the unavailable ACK stage metrics do.
                     let pacing =
                         frame_pacing_report(frame.frame_number, frame_time_us, 0).encoded();
-                    if channels.send_partial_control(&mut rtc, &pacing) {
-                        frame_pacing_reports_sent = frame_pacing_reports_sent.saturating_add(1);
-                    }
+                    channels.send_partial_control(&mut rtc, &pacing);
                     last_frame_pacing_send = now;
                 }
                 let ack = frame.command(transport_origin).encoded();
@@ -6779,65 +6771,14 @@ fn run_nvst_webrtc_bundle(
             }
         }
 
-        if now.duration_since(last_control_stats_log) >= Duration::from_secs(10) {
-            opennow_streamer_protocol::log::log_async(
-                "INFO",
-                "nvst-bundle",
-                &format!(
-                    "{} local_port={local_port} peer_port={} inbound={inbound_datagrams} outbound={outbound_datagrams} pings={hole_punch_pings} dtls_ready={dtls_ready} sctp_started={sctp_started} frame_ack={} pacing={frame_pacing_reports_sent} qos={} videoBytesAssembled={} qosBweKbps={} qosUtilPercent={} qosOwdUs={} qosJitterUs={}",
-                    receiver.stats_line(control_stats_origin),
-                    bundle_peer.port(),
-                    control_reports.frame_acks_sent,
-                    control_reports.qos_reports_sent,
-                    feedback.completed_frame_bytes.load(Ordering::Acquire),
-                    control_reports.last_qos_report.bandwidth.estimate_kbps,
-                    control_reports
-                        .last_qos_report
-                        .bandwidth
-                        .utilization_percent,
-                    control_reports.last_qos_report.bandwidth.queue_delay_us,
-                    control_reports.last_qos_report.bandwidth.jitter_us,
-                ),
-            );
-            eprintln!(
-                "NVST control-stats elapsed={:.1}s frameAck={} lastAck={:?} pacing={frame_pacing_reports_sent} qos={} assembledBytesAtLastQos={} qosBweKbps={} qosUtilPercent={} qosOwdUs={} qosJitterUs={}",
-                now.saturating_duration_since(control_stats_origin)
-                    .as_secs_f64(),
-                control_reports.frame_acks_sent,
-                control_reports.last_ack_frame,
-                control_reports.qos_reports_sent,
-                control_reports.last_qos_report.bytes_received,
-                control_reports.last_qos_report.bandwidth.estimate_kbps,
-                control_reports
-                    .last_qos_report
-                    .bandwidth
-                    .utilization_percent,
-                control_reports.last_qos_report.bandwidth.queue_delay_us,
-                control_reports.last_qos_report.bandwidth.jitter_us,
-            );
-            eprintln!(
-                "NVST frame-stage-timings {}",
-                feedback.frame_stage_timings().log_line()
-            );
-            last_control_stats_log = now;
-        }
-
         if upstream_allowed
             && uses_rtcp_video_feedback(mjolnir, rtcp_channel_open)
             && now.duration_since(last_rtcp_send) >= SRTCP_RR_INTERVAL
             && let Some(report_block) = feedback.report_snapshot(true)
         {
             let report = build_rtcp_receiver_report(rtcp_sender_ssrc, report_block);
-            let admitted =
-                input_channels.is_some_and(|channels| channels.send_rtcp(&mut rtc, &report));
-            if admitted {
-                rtcp_reports_sent += 1;
-                if rtcp_reports_sent == 1 || rtcp_reports_sent % 10 == 0 {
-                    eprintln!(
-                        "NVST rtcp1 RR sent={rtcp_reports_sent} mediaSsrc={} highestSeq={}",
-                        report_block.media_ssrc, report_block.highest_sequence,
-                    );
-                }
+            if let Some(channels) = input_channels.as_ref() {
+                channels.send_rtcp(&mut rtc, &report);
             }
             last_rtcp_send = now;
         }
@@ -6873,33 +6814,16 @@ fn run_nvst_webrtc_bundle(
             input_state.control_is_open(),
         );
         if upstream_allowed && (try_pli || try_idr) {
-            let mut pli_queued = false;
             if try_pli && let Some((media_ssrc, _)) = feedback.stream_snapshot() {
                 let pli = build_rtcp_pli(rtcp_sender_ssrc, media_ssrc);
-                pli_queued =
-                    input_channels.is_some_and(|channels| channels.send_rtcp(&mut rtc, &pli));
+                if let Some(channels) = input_channels.as_ref() {
+                    channels.send_rtcp(&mut rtc, &pli);
+                }
             }
-            let idr_queued = try_idr
-                && input_channels.is_some_and(|channels| {
-                    channels.send_control(&mut rtc, &idr_request().encoded())
-                });
+            if try_idr && let Some(channels) = input_channels.as_ref() {
+                channels.send_control(&mut rtc, &idr_request().encoded());
+            }
             last_keyframe_attempt = now;
-            keyframe_attempts = keyframe_attempts.saturating_add(1);
-            if last_keyframe_attempt_log
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10))
-            {
-                opennow_streamer_protocol::log::log_async(
-                    "INFO",
-                    "nvst-keyframe",
-                    &format!(
-                        "attempt={keyframe_attempts} pli_queued={pli_queued} idr_queued={idr_queued} stream_known={} awaiting_assembled_keyframe=true",
-                        feedback.stream_snapshot().is_some()
-                    ),
-                );
-                last_keyframe_attempt_log = Some(now);
-            }
-        } else if !feedback.keyframe_needed.load(Ordering::Acquire) {
-            last_keyframe_attempt_log = None;
         }
 
         let mut microphone_queue = microphone.lock().unwrap_or_else(|error| error.into_inner());
@@ -7402,9 +7326,7 @@ fn run_nvst_udp_receiver(
     let mut invalid_stun = 0_u64;
     let mut non_stun = 0_u64;
     let mut wrong_source = 0_u64;
-    let mut receiver_reports_sent = 0_u64;
     let stats_origin = Instant::now();
-    let mut last_stats_log = Instant::now();
     let mut reported_port_unreachable = false;
     loop {
         loop {
@@ -7589,25 +7511,7 @@ fn run_nvst_udp_receiver(
                     forward_optional(&event_sender, receiver.stop());
                     return;
                 }
-            } else {
-                receiver_reports_sent += 1;
             }
-        }
-        if now.duration_since(last_stats_log) >= Duration::from_secs(10) {
-            last_stats_log = now;
-            opennow_streamer_protocol::log::log_async(
-                "INFO",
-                "nvst-video",
-                &format!(
-                    "{} local_port={local_port} peer_port={} inbound={inbound_datagrams} pings={pings_sent} rr={receiver_reports_sent} stun_ok={handled_stun} stun_invalid={invalid_stun} wrong_source={wrong_source}",
-                    receiver.stats_line(stats_origin),
-                    receiver.config.video_peer.port()
-                ),
-            );
-            eprintln!(
-                "NVST rx-stats {} inbound={inbound_datagrams} pings={pings_sent} rr={receiver_reports_sent}",
-                receiver.stats_line(stats_origin),
-            );
         }
         let timeout = receiver.poll_timeout(now);
         if timeout.is_some() {

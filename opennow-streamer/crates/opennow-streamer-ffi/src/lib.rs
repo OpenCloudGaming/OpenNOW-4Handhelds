@@ -565,20 +565,15 @@ fn spawn_dispatcher(
     thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            let mut last_telemetry = std::time::Instant::now();
             while let Ok(value) = receiver.recv() {
                 let kind = value["type"].as_str().unwrap_or("");
-                if should_log_event(kind, &mut last_telemetry, std::time::Instant::now()) {
-                    log::log_line(
-                        match (kind, value["level"].as_str()) {
-                            ("error", _) | (_, Some("error")) => "ERROR",
-                            (_, Some("warn")) => "WARN",
-                            (_, Some("debug")) => "DEBUG",
-                            _ => "INFO",
-                        },
-                        "native-to-qt",
-                        &log::message_summary(&value),
-                    );
+                let level = match (kind, value["level"].as_str()) {
+                    ("error", _) | (_, Some("error")) => "ERROR",
+                    (_, Some("warn")) => "WARN",
+                    _ => "",
+                };
+                if level == "WARN" || level == "ERROR" {
+                    log::log_line(level, "native-to-qt", &log::message_summary(&value));
                 }
                 callback.invoke(&value);
             }
@@ -586,6 +581,7 @@ fn spawn_dispatcher(
         .map_err(|_| OpenNowStreamerStatus::Closed)
 }
 
+#[cfg(test)]
 fn should_log_event(
     kind: &str,
     last_telemetry: &mut std::time::Instant,
@@ -1407,14 +1403,7 @@ pub unsafe extern "C" fn opennow_streamer_acquire_latest_frame(
         };
         let frame_info = token.info();
         if !FIRST_FRAME_LOGGED.swap(true, Ordering::Relaxed) {
-            log::log_line(
-                "INFO",
-                "present",
-                &format!(
-                    "first frame acquired ({}x{} seq={})",
-                    frame_info.width, frame_info.height, frame_info.sequence,
-                ),
-            );
+            log::log_line("INFO", "session", "session entered");
         }
         unsafe {
             info.write(OpenNowStreamerFrameInfo {

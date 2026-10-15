@@ -133,7 +133,7 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Session menu drawn over the live stream. The picture stays up.
     session_menu: bool,
-    /// 0 is Mouse, 1 is End session, 2 exits OpenNOW after the session stops.
+    /// 0 ends the session, 1 exits OpenNOW after the session stops, 2 is mouse mode, 3 toggles stats.
     session_menu_index: u8,
     /// Sticks move a pointer and the right trigger clicks.
     mouse_mode: bool,
@@ -149,6 +149,9 @@ pub struct App {
     pad_x: bool,
     /// Select and X are both held, so the session-menu chord has already fired.
     session_chord: bool,
+    show_stats: bool,
+    stream_fps: Option<f64>,
+    stream_mbps: Option<f64>,
     /// The connected pad has physical button 16, the FN key.
     fn_button: bool,
     toast: Option<(String, Instant)>,
@@ -198,6 +201,7 @@ pub struct App {
     next_poll: Option<Instant>,
     profile: Profile,
     settings_index: usize,
+    playtime: Option<settings::Playtime>,
     servers: Vec<Region>,
     /// 0 is Automatic. Later entries match `servers`.
     server_index: usize,
@@ -252,6 +256,9 @@ impl App {
             pad_select: false,
             pad_x: false,
             session_chord: false,
+            show_stats: false,
+            stream_fps: None,
+            stream_mbps: None,
             fn_button: false,
             toast: None,
             start_held: false,
@@ -296,6 +303,7 @@ impl App {
             next_poll: None,
             profile: settings::load(),
             settings_index: 0,
+            playtime: None,
             servers: Vec::new(),
             server_index: 0,
             region_url: String::new(),
@@ -368,8 +376,8 @@ impl App {
         }
         if self.session_menu {
             match action {
-                Action::Up => self.session_menu_index = if self.session_menu_index == 0 { 2 } else { self.session_menu_index - 1 },
-                Action::Down => self.session_menu_index = (self.session_menu_index + 1) % 3,
+                Action::Up => self.session_menu_index = if self.session_menu_index == 0 { 3 } else { self.session_menu_index - 1 },
+                Action::Down => self.session_menu_index = (self.session_menu_index + 1) % 4,
                 Action::Confirm => {
                     let choice = self.session_menu_index;
                     self.session_menu = false;
@@ -377,9 +385,10 @@ impl App {
                         stream.release_pad();
                     }
                     match choice {
-                        0 => self.enter_mouse_mode(),
-                        2 => self.exit_after_session(),
-                        _ => self.end_stream("Ended from the handheld"),
+                        0 => self.end_stream("Ended from the handheld"),
+                        1 => self.exit_after_session(),
+                        2 => self.enter_mouse_mode(),
+                        _ => self.show_stats = !self.show_stats,
                     }
                 }
                 Action::Back | Action::Escape => self.session_menu = false,
@@ -893,6 +902,7 @@ fn mouse_deflection(value: i16) -> f32 {
 
     fn show_sign_in(&mut self) {
         self.account.clear();
+        self.playtime = None;
         self.scope = Value::Null;
         self.games.clear();
         self.store_games.clear();
@@ -1519,6 +1529,7 @@ fn mouse_deflection(value: i16) -> f32 {
     }
 
     fn resolutions_loaded(&mut self, value: &Value) {
+        self.playtime = settings::playtime_from_subscription(value);
         let resolutions = settings::resolutions_from_subscription(value);
         if resolutions.is_empty() {
             eprintln!("settings: GeForce NOW returned no resolutions");
@@ -1615,6 +1626,8 @@ fn mouse_deflection(value: i16) -> f32 {
         self.play_added = false;
         self.play_selected = false;
         self.return_to_store = from_store;
+        self.stream_fps = None;
+        self.stream_mbps = None;
         let profile = self.profile.clone();
         self.play = PlayPhase::Settings;
         self.play_message = format!("Preparing {title} at {}…", profile.label());
@@ -1634,6 +1647,10 @@ fn mouse_deflection(value: i16) -> f32 {
                 let text = stream::message_text(&message).unwrap_or_else(|| "The stream failed.".into());
                 self.fail_stream(text);
                 return;
+            }
+            if message["type"].as_str() == Some("telemetry") {
+                self.stream_fps = message["framesPerSecond"].as_f64();
+                self.stream_mbps = message["bitrateMbps"].as_f64();
             }
             if message["type"].as_str() == Some("ready") && message["capabilities"].is_object() {
                 self.stream_capabilities = Some(message["capabilities"].clone());
@@ -1874,13 +1891,20 @@ fn mouse_deflection(value: i16) -> f32 {
             self.notice = Some(message);
             return;
         }
+        // The cloud seat is still theirs. Stopping it here is why the next Play
+        // says the session must be ended, while a fresh launch can resume it.
+        let keep_seat = matches!(self.play, PlayPhase::Live | PlayPhase::Attach);
         eprintln!("stream: {message}");
         self.leave_mouse_mode();
         self.queue_position = None;
         let session = self.cloud_session.clone();
         self.play = PlayPhase::Idle;
         self.play_message.clear();
-        self.notice = Some(message);
+        self.notice = Some(if keep_seat {
+            "The connection dropped. Start the game again to resume this session.".into()
+        } else {
+            message
+        });
         if let Some(stream) = self.stream.as_mut() {
             stream.stop_media();
         }
@@ -1888,6 +1912,12 @@ fn mouse_deflection(value: i16) -> f32 {
         self.session_menu = false;
         self.pad_select = false;
         self.pad_x = false;
+        self.session_chord = false;
+        if keep_seat {
+            self.cloud_session = None;
+            self.finish_stream_screen();
+            return;
+        }
         if let Some(session) = session {
             self.play = PlayPhase::Stop;
             self.request_session_stop(&session);
@@ -2003,7 +2033,7 @@ fn mouse_deflection(value: i16) -> f32 {
             }
             Screen::Settings => {
                 let server = self.server_label();
-                settings::draw(painter, &self.clock, &self.profile, self.settings_index, &server);
+                settings::draw(painter, &self.clock, &self.profile, self.settings_index, &server, self.playtime);
             }
             Screen::Store => {
                 let view = store::View {
@@ -2039,8 +2069,11 @@ fn mouse_deflection(value: i16) -> f32 {
         if self.session_menu {
             theme::draw_session_menu(painter, self.session_menu_index as usize);
         }
+        if self.show_stats && matches!(self.screen, Screen::Stream) {
+            draw_stream_stats(painter, self.stream_fps, self.stream_mbps);
+        }
         if self.mouse_mode {
-            painter.text(18.0, 14.0, 14.0, Weight::Bold, "Mouse    sticks move    RT click    FN gamepad", TEXT);
+            painter.text(18.0, 14.0, 14.0, Weight::Bold, "Mouse mode    sticks move    RT click    FN gamepad", TEXT);
             let x = self.mouse_x - 7.0;
             let y = self.mouse_y - 7.0;
             painter.fill(x, y, 14.0, 14.0, 7.0, BLACK);
@@ -2098,6 +2131,15 @@ fn owned_variant_ids(game: &Value) -> Vec<String> {
 }
 
 const INSET_X: f32 = 32.0;
+
+fn draw_stream_stats(painter: &mut Painter, fps: Option<f64>, mbps: Option<f64>) {
+    let fps = fps.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
+    let mbps = mbps.map(|value| format!("{value:.1}")).unwrap_or_else(|| "--".into());
+    let text = format!("FPS: {fps}    MBPS: {mbps}");
+    let width = painter.measure(&text, 14.0, Weight::Bold) + 20.0;
+    painter.fill(12.0, 12.0, width, 26.0, 8.0, crate::gl::with_alpha(PANEL, 0.88));
+    painter.text(22.0, 17.0, 14.0, Weight::Bold, &text, TEXT);
+}
 
 fn draw_notice(painter: &mut Painter, message: &str) {
     let (x, y, width, height) = (70.0, 110.0, 500.0, 230.0);

@@ -9,8 +9,9 @@ use ffi::*;
 
 use super::VideoDecoder;
 use crate::{
-    ChromaLocation, ColorMatrix, ColorRange, ColorTransfer, DecodedVideoFrame, EncodedVideoFrame,
-    Error, FramePlane, PixelFormat, Result, StreamFormat, Subsystem, VideoCodec,
+    ChromaLocation, ColorMatrix, ColorRange, ColorTransfer, DecodedVideoFrame, DmaBufFrame,
+    DmaBufLayer, DmaBufObject, DmaBufPlane, EncodedVideoFrame, Error, FramePlane, PixelFormat,
+    Result, StreamFormat, Subsystem, VideoCodec,
 };
 
 type FnMppCreate = unsafe extern "C" fn(*mut MppCtx, *mut *const MppApi) -> i32;
@@ -46,6 +47,10 @@ type FnMppBufferGetSizeCaller = unsafe extern "C" fn(MppBuffer, *const i8) -> us
 type FnMppBufferReadCaller =
     unsafe extern "C" fn(MppBuffer, usize, *mut c_void, usize, *const i8) -> i32;
 type FnMppBufferSync = unsafe extern "C" fn(MppBuffer, i32, *const i8) -> i32;
+type FnMppBufferIncRef = unsafe extern "C" fn(MppBuffer) -> i32;
+type FnMppBufferPut = unsafe extern "C" fn(MppBuffer) -> i32;
+type FnMppBufferIncRefCaller = unsafe extern "C" fn(MppBuffer, *const i8) -> i32;
+type FnMppBufferPutCaller = unsafe extern "C" fn(MppBuffer, *const i8) -> i32;
 type MppBufferGroup = *mut c_void;
 type FnMppBufferGroupGet =
     unsafe extern "C" fn(*mut MppBufferGroup, u32, u32, *const i8, *const i8) -> i32;
@@ -87,6 +92,10 @@ pub struct MppLibrary {
     pub mpp_buffer_read_caller: Option<FnMppBufferReadCaller>,
     pub mpp_buffer_sync_begin: Option<FnMppBufferSync>,
     pub mpp_buffer_sync_end: Option<FnMppBufferSync>,
+    pub mpp_buffer_inc_ref: Option<FnMppBufferIncRef>,
+    pub mpp_buffer_put: Option<FnMppBufferPut>,
+    pub mpp_buffer_inc_ref_caller: Option<FnMppBufferIncRefCaller>,
+    pub mpp_buffer_put_caller: Option<FnMppBufferPutCaller>,
     pub mpp_buffer_group_get: FnMppBufferGroupGet,
     pub mpp_buffer_group_limit_config: FnMppBufferGroupLimit,
     pub mpp_buffer_group_clear: FnMppBufferGroupClear,
@@ -229,6 +238,16 @@ impl MppLibrary {
                 .get(b"mpp_buffer_sync_end_f\0")
                 .ok()
                 .map(|symbol| *symbol);
+            let mpp_buffer_inc_ref = lib.get(b"mpp_buffer_inc_ref\0").ok().map(|symbol| *symbol);
+            let mpp_buffer_put = lib.get(b"mpp_buffer_put\0").ok().map(|symbol| *symbol);
+            let mpp_buffer_inc_ref_caller = lib
+                .get(b"mpp_buffer_inc_ref_with_caller\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let mpp_buffer_put_caller = lib
+                .get(b"mpp_buffer_put_with_caller\0")
+                .ok()
+                .map(|symbol| *symbol);
             let mpp_buffer_group_get = *lib
                 .get(b"mpp_buffer_group_get\0")
                 .map_err(|e| format!("missing mpp_buffer_group_get: {e}"))?;
@@ -283,6 +302,10 @@ impl MppLibrary {
                 mpp_buffer_read_caller,
                 mpp_buffer_sync_begin,
                 mpp_buffer_sync_end,
+                mpp_buffer_inc_ref,
+                mpp_buffer_put,
+                mpp_buffer_inc_ref_caller,
+                mpp_buffer_put_caller,
                 mpp_buffer_group_get,
                 mpp_buffer_group_limit_config,
                 mpp_buffer_group_clear,
@@ -531,9 +554,10 @@ impl MppDecoder {
         Ok(())
     }
 
-    /// Copies the newest picture out and returns every MPP buffer before doing
+    /// Takes the newest picture and returns every other MPP buffer before doing
     /// any other work. GreenOvercast drains this way: the VPU pool is small,
-    /// and a buffer that is still checked out stops the decoder.
+    /// and a buffer that is still checked out stops the decoder. The picture
+    /// the GPU is reading keeps one extra reference.
     fn release_ready_frames(&mut self) -> Result<Option<ReleasedPicture>> {
         let mut latest = None;
         for _ in 0..32 {
@@ -581,8 +605,8 @@ impl MppDecoder {
                 let ver_stride = unsafe { (self.lib.mpp_frame_get_ver_stride)(mpp_frame) } as usize;
                 let buf_size = unsafe { (self.lib.mpp_frame_get_buf_size)(mpp_frame) };
                 let pts = unsafe { (self.lib.mpp_frame_get_pts)(mpp_frame) };
-                copy_nv12(
-                    self.lib.as_ref(),
+                export_dmabuf(
+                    Arc::clone(&self.lib),
                     buffer,
                     width,
                     height,
@@ -591,6 +615,18 @@ impl MppDecoder {
                     buf_size,
                     pts,
                 )
+                .or_else(|| {
+                    copy_nv12(
+                        self.lib.as_ref(),
+                        buffer,
+                        width,
+                        height,
+                        hor_stride,
+                        ver_stride,
+                        buf_size,
+                        pts,
+                    )
+                })
             };
             unsafe { (self.lib.mpp_frame_deinit)(&mut mpp_frame) };
             match copied {
@@ -615,12 +651,42 @@ impl MppDecoder {
     fn present(
         self_format: StreamFormat,
         picture: ReleasedPicture,
-        render_limit: Option<(usize, usize)>,
+        _render_limit: Option<(usize, usize)>,
     ) -> Option<DecodedVideoFrame> {
-        let ReleasedPicture { nv12, width, height, hor_stride, ver_stride, pts } = picture;
-        let (out_width, out_height) = panel_size(width, height, render_limit);
-        let rgba = rgba_for_panel(&nv12, width, height, hor_stride, ver_stride, out_width, out_height)?;
-        static LOGGED_PANEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let ReleasedPicture { backing, width, height, hor_stride, ver_stride, pts } = picture;
+        if width < 2 || height < 2 || hor_stride < width || ver_stride < height || height % 2 != 0
+        {
+            return None;
+        }
+        let (planes, dmabuf, shared) = match backing {
+            PictureBacking::Exported(dmabuf) => (Vec::new(), Some(dmabuf), true),
+            PictureBacking::Copied(nv12) => {
+                let y_bytes = hor_stride.saturating_mul(height);
+                let uv_offset = hor_stride.saturating_mul(ver_stride);
+                let uv_bytes = hor_stride.saturating_mul(height / 2);
+                if nv12.len() < uv_offset.saturating_add(uv_bytes) || y_bytes > nv12.len() {
+                    return None;
+                }
+                (
+                    vec![
+                        FramePlane {
+                            data: Arc::<[u8]>::from(nv12[..y_bytes].to_vec()),
+                            stride: hor_stride,
+                            rows: height,
+                        },
+                        FramePlane {
+                            data: Arc::<[u8]>::from(nv12[uv_offset..uv_offset + uv_bytes].to_vec()),
+                            stride: hor_stride,
+                            rows: height / 2,
+                        },
+                    ],
+                    None,
+                    false,
+                )
+            }
+        };
+        static LOGGED_PANEL: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if LOGGED_PANEL
             .compare_exchange(
                 false,
@@ -630,25 +696,29 @@ impl MppDecoder {
             )
             .is_ok()
         {
-            eprintln!("stream: showing {out_width}x{out_height} from {width}x{height}");
+            if shared {
+                eprintln!(
+                    "stream: MPP {width}x{height} stays in the decoder buffer; the GPU reads it directly"
+                );
+            } else {
+                eprintln!(
+                    "stream: MPP {width}x{height} was copied because the decoder buffer could not be shared with the GPU"
+                );
+            }
         }
         Some(DecodedVideoFrame {
             format: StreamFormat {
-                width: out_width as u32,
-                height: out_height as u32,
-                pixel_format: PixelFormat::Rgba8,
-                color_range: ColorRange::Full,
-                color_matrix: ColorMatrix::Bt601,
+                width: width as u32,
+                height: height as u32,
+                pixel_format: PixelFormat::Nv12,
+                color_range: ColorRange::Limited,
+                color_matrix: ColorMatrix::Bt709,
                 color_transfer: ColorTransfer::Sdr,
                 color_primaries: self_format.color_primaries,
-                chroma_location: ChromaLocation::Center,
+                chroma_location: ChromaLocation::Left,
             },
-            planes: vec![FramePlane {
-                data: Arc::<[u8]>::from(rgba),
-                stride: out_width * 4,
-                rows: out_height,
-            }],
-            dmabuf: None,
+            planes,
+            dmabuf,
             vulkan: None,
             timestamp_us: if pts > 0 { pts as u64 } else { 0 },
         })
@@ -745,8 +815,13 @@ impl VideoDecoder for MppDecoder {
     }
 }
 
+enum PictureBacking {
+    Copied(Vec<u8>),
+    Exported(Arc<DmaBufFrame>),
+}
+
 struct ReleasedPicture {
-    nv12: Vec<u8>,
+    backing: PictureBacking,
     width: usize,
     height: usize,
     hor_stride: usize,
@@ -754,22 +829,26 @@ struct ReleasedPicture {
     pts: i64,
 }
 
-/// Fits a frame into the render box from `stream.json`. `None` keeps the frame.
-fn panel_size(width: usize, height: usize, limit: Option<(usize, usize)>) -> (usize, usize) {
-    let Some((panel_width, panel_height)) = limit else {
-        return (width.max(2) & !1, height.max(2) & !1);
-    };
-    let panel_width = panel_width.max(2) & !1;
-    let panel_height = panel_height.max(2) & !1;
-    if width <= panel_width && height <= panel_height {
-        return (width.max(2) & !1, height.max(2) & !1);
-    }
-    if width.saturating_mul(panel_height) >= height.saturating_mul(panel_width) {
-        let out_height = (height.saturating_mul(panel_width) / width).max(2) & !1;
-        (panel_width, out_height.max(2))
-    } else {
-        let out_width = (width.saturating_mul(panel_height) / height).max(2) & !1;
-        (out_width.max(2), panel_height)
+/// Keeps one MPP buffer alive until the GPU has finished sampling its dma-buf.
+struct HeldMppBuffer {
+    lib: Arc<MppLibrary>,
+    buffer: usize,
+    fd: i32,
+}
+
+unsafe impl Send for HeldMppBuffer {}
+unsafe impl Sync for HeldMppBuffer {}
+
+impl Drop for HeldMppBuffer {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+        let buffer = self.buffer as MppBuffer;
+        let caller = b"opennow\0".as_ptr().cast();
+        if let Some(put) = self.lib.mpp_buffer_put_caller {
+            unsafe { put(buffer, caller) };
+        } else if let Some(put) = self.lib.mpp_buffer_put {
+            unsafe { put(buffer) };
+        }
     }
 }
 
@@ -836,7 +915,109 @@ fn copy_nv12(
     if let Some(sync) = lib.mpp_buffer_sync_end {
         unsafe { sync(buffer, 1, caller) };
     }
-    Some(ReleasedPicture { nv12, width, height, hor_stride, ver_stride, pts })
+    Some(ReleasedPicture {
+        backing: PictureBacking::Copied(nv12),
+        width,
+        height,
+        hor_stride,
+        ver_stride,
+        pts,
+    })
+}
+
+fn export_dmabuf(
+    lib: Arc<MppLibrary>,
+    buffer: MppBuffer,
+    width: usize,
+    height: usize,
+    hor_stride: usize,
+    ver_stride: usize,
+    buf_size: usize,
+    pts: i64,
+) -> Option<ReleasedPicture> {
+    if width < 2 || height < 2 || height % 2 != 0 || hor_stride < width || ver_stride < height {
+        return None;
+    }
+    if lib.mpp_buffer_put_caller.is_none() && lib.mpp_buffer_put.is_none() {
+        return None;
+    }
+    let uv_offset = hor_stride.checked_mul(ver_stride)?;
+    let needed = uv_offset.checked_add(hor_stride.checked_mul(height / 2)?)?;
+    if needed == 0 {
+        return None;
+    }
+    let fd = buffer_fd(lib.as_ref(), buffer);
+    if fd < 0 {
+        return None;
+    }
+    let shared = unsafe { libc::dup(fd) };
+    if shared < 0 {
+        return None;
+    }
+    if !retain_buffer(lib.as_ref(), buffer) {
+        unsafe { libc::close(shared) };
+        return None;
+    }
+    let reported = buffer_size(lib.as_ref(), buffer, buf_size);
+    let size = reported.max(needed);
+    let owner = HeldMppBuffer { lib, buffer: buffer as usize, fd: shared };
+    let dmabuf = Arc::new(DmaBufFrame::new(
+        vec![DmaBufObject {
+            fd: shared,
+            size,
+            format_modifier: 0x00ff_ffff_ffff_ffff,
+        }],
+        vec![DmaBufLayer {
+            format: u32::from_le_bytes(*b"NV12"),
+            planes: vec![
+                DmaBufPlane { object_index: 0, offset: 0, pitch: hor_stride },
+                DmaBufPlane { object_index: 0, offset: uv_offset, pitch: hor_stride },
+            ],
+        }],
+        Arc::new(owner),
+    ));
+    Some(ReleasedPicture {
+        backing: PictureBacking::Exported(dmabuf),
+        width,
+        height,
+        hor_stride,
+        ver_stride,
+        pts,
+    })
+}
+
+fn retain_buffer(lib: &MppLibrary, buffer: MppBuffer) -> bool {
+    let caller = b"opennow\0".as_ptr().cast();
+    if let Some(inc) = lib.mpp_buffer_inc_ref_caller {
+        return unsafe { inc(buffer, caller) } == MPP_OK;
+    }
+    if let Some(inc) = lib.mpp_buffer_inc_ref {
+        return unsafe { inc(buffer) } == MPP_OK;
+    }
+    false
+}
+
+fn buffer_fd(lib: &MppLibrary, buffer: MppBuffer) -> i32 {
+    let caller = b"opennow\0".as_ptr().cast();
+    if let Some(get_fd) = lib.mpp_buffer_get_fd_caller {
+        return unsafe { get_fd(buffer, caller) };
+    }
+    if let Some(get_fd) = lib.mpp_buffer_get_fd {
+        return unsafe { get_fd(buffer) };
+    }
+    -1
+}
+
+fn buffer_size(lib: &MppLibrary, buffer: MppBuffer, fallback: usize) -> usize {
+    let caller = b"opennow\0".as_ptr().cast();
+    let size = if let Some(get_size) = lib.mpp_buffer_get_size_caller {
+        unsafe { get_size(buffer, caller) }
+    } else if let Some(get_size) = lib.mpp_buffer_get_size {
+        unsafe { get_size(buffer) }
+    } else {
+        0
+    };
+    if size == 0 { fallback.max(1) } else { size }
 }
 
 fn map_nv12(
@@ -888,45 +1069,6 @@ fn map_nv12(
         return None;
     }
     Some((mapped.cast(), size, Some(mapped)))
-}
-
-fn rgba_for_panel(
-    nv12: &[u8],
-    width: usize,
-    height: usize,
-    hor_stride: usize,
-    ver_stride: usize,
-    out_width: usize,
-    out_height: usize,
-) -> Option<Vec<u8>> {
-    if width < 2 || height < 2 || hor_stride < width || ver_stride < height || out_width < 2 || out_height < 2 {
-        return None;
-    }
-    let uv_offset = hor_stride.saturating_mul(ver_stride);
-    if nv12.len() < uv_offset.saturating_add(hor_stride.saturating_mul(height / 2)) {
-        return None;
-    }
-    let mut rgba = vec![0_u8; out_width * out_height * 4];
-    for row in 0..out_height {
-        let src_y = row * height / out_height;
-        let chroma_row = src_y / 2;
-        for col in 0..out_width {
-            let src_x = col * width / out_width;
-            let y = i32::from(nv12[src_y * hor_stride + src_x]);
-            let chroma = uv_offset + chroma_row * hor_stride + (src_x & !1);
-            let u = i32::from(nv12[chroma]) - 128;
-            let v = i32::from(nv12[chroma + 1]) - 128;
-            let r = (y + ((1436 * v) >> 10)).clamp(0, 255) as u8;
-            let g = (y - ((352 * u) >> 10) - ((731 * v) >> 10)).clamp(0, 255) as u8;
-            let b = (y + ((1815 * u) >> 10)).clamp(0, 255) as u8;
-            let index = (row * out_width + col) * 4;
-            rgba[index] = r;
-            rgba[index + 1] = g;
-            rgba[index + 2] = b;
-            rgba[index + 3] = 255;
-        }
-    }
-    Some(rgba)
 }
 
 impl Drop for MppDecoder {

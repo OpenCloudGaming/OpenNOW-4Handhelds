@@ -4,12 +4,14 @@
 //! NV12 or P010 (CPU planes or a DMA-BUF) into one RGBA texture per QRhi slot.
 //! The texture name is returned to Qt; this presenter keeps owning it.
 //!
-//! OpenGL ES 3 keeps the zero-copy DMA-BUF import. OpenGL ES 2, which is the
-//! whole GPU on Mali-450-class chips, samples linear NV12 through luminance
-//! textures. A tiled DMA-BUF still needs ES 3.
+//! OpenGL ES 3 imports a decoder DMA-BUF and reads it on the GPU. NV12 chroma is
+//! sampled as individual bytes, because Mali returns only the red channel of an
+//! RG texture. OpenGL ES 2, which is the whole GPU on Mali-450-class chips,
+//! samples linear NV12 through luminance textures. A tiled DMA-BUF still needs ES 3.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libloading::Library;
 
@@ -54,6 +56,7 @@ const GL_RGBA: u32 = 0x1908;
 const GL_VERSION: u32 = 0x1F02;
 const GL_ARRAY_BUFFER: u32 = 0x8892;
 const GL_STATIC_DRAW: u32 = 0x88E4;
+const GL_NEAREST: i32 = 0x2600;
 const GL_LINEAR: i32 = 0x2601;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
@@ -104,6 +107,9 @@ uniform uint color_matrix;
 uniform uint full_range;
 uniform uint sample_bits;
 uniform float chroma_offset_x;
+uniform float chroma_bytes;
+uniform float luma_width;
+uniform float chroma_pitch;
 uniform uint copy_rgba;
 in vec2 texture_coordinates;
 out vec4 output_color;
@@ -114,7 +120,15 @@ void main() {
         return;
     }
     float y = texture(luma_texture, source).r;
-    vec2 uv = texture(chroma_texture, source + vec2(chroma_offset_x, 0.0)).rg;
+    vec2 uv;
+    if (chroma_bytes > 0.5) {
+        float pair = floor(source.x * luma_width * 0.5);
+        float pitch = max(chroma_pitch, 1.0);
+        uv.x = texture(chroma_texture, vec2((pair * 2.0 + 0.5) / pitch, source.y)).r;
+        uv.y = texture(chroma_texture, vec2((pair * 2.0 + 1.5) / pitch, source.y)).r;
+    } else {
+        uv = texture(chroma_texture, source + vec2(chroma_offset_x, 0.0)).rg;
+    }
     bool ten_bit = sample_bits != 8u;
     if (sample_bits == 16u) {
         y *= 65535.0 / 65472.0;
@@ -162,6 +176,9 @@ uniform float color_matrix;
 uniform float full_range;
 uniform float sample_bits;
 uniform float chroma_offset_x;
+uniform float chroma_bytes;
+uniform float luma_width;
+uniform float chroma_pitch;
 uniform float copy_rgba;
 void main() {
     vec2 source = interpolated_coordinates * texture_scale;
@@ -170,8 +187,16 @@ void main() {
         return;
     }
     float y = texture2D(luma_texture, source).r;
-    vec4 chroma = texture2D(chroma_texture, source + vec2(chroma_offset_x, 0.0));
-    vec2 uv = vec2(chroma.r, chroma.a);
+    vec2 uv;
+    if (chroma_bytes > 0.5) {
+        float pair = floor(source.x * luma_width * 0.5);
+        float pitch = max(chroma_pitch, 1.0);
+        uv.x = texture2D(chroma_texture, vec2((pair * 2.0 + 0.5) / pitch, source.y)).r;
+        uv.y = texture2D(chroma_texture, vec2((pair * 2.0 + 1.5) / pitch, source.y)).r;
+    } else {
+        vec4 chroma = texture2D(chroma_texture, source + vec2(chroma_offset_x, 0.0));
+        uv = vec2(chroma.r, chroma.a);
+    }
     bool ten_bit = sample_bits > 8.5;
     if (sample_bits > 15.5) {
         y *= 65535.0 / 65472.0;
@@ -222,6 +247,7 @@ type CheckStatus = unsafe extern "C" fn(u32) -> u32;
 type Viewport = unsafe extern "C" fn(i32, i32, i32, i32);
 type UseProgram = unsafe extern "C" fn(u32);
 type DrawArrays = unsafe extern "C" fn(u32, i32, i32);
+type Finish = unsafe extern "C" fn();
 type CreateShader = unsafe extern "C" fn(u32) -> u32;
 type ShaderSource = unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32);
 type ShaderIv = unsafe extern "C" fn(u32, u32, *mut i32);
@@ -271,6 +297,7 @@ struct Gl {
     viewport: Viewport,
     use_program: UseProgram,
     draw_arrays: DrawArrays,
+    finish: Option<Finish>,
     create_shader: CreateShader,
     shader_source: ShaderSource,
     get_shaderiv: ShaderIv,
@@ -316,8 +343,20 @@ struct Program {
     full_range: i32,
     sample_bits: i32,
     chroma_offset_x: i32,
+    chroma_bytes: i32,
+    luma_width: i32,
+    chroma_pitch: i32,
     copy_rgba: i32,
     vertex_buffer: u32,
+}
+
+struct PlaneSample {
+    scale_y: f32,
+    sample_bits: u32,
+    chroma_offset_x: f32,
+    byte_chroma: bool,
+    luma_width: f32,
+    chroma_pitch: f32,
 }
 
 struct Slot {
@@ -367,6 +406,7 @@ impl Gl {
             viewport: load_symbol(&gles, b"glViewport\0")?,
             use_program: load_symbol(&gles, b"glUseProgram\0")?,
             draw_arrays: load_symbol(&gles, b"glDrawArrays\0")?,
+            finish: load_symbol(&gles, b"glFinish\0").ok(),
             create_shader: load_symbol(&gles, b"glCreateShader\0")?,
             shader_source: load_symbol(&gles, b"glShaderSource\0")?,
             get_shaderiv: load_symbol(&gles, b"glGetShaderiv\0")?,
@@ -522,12 +562,26 @@ impl GlesPresenter {
             frame.format.pixel_format,
             PixelFormat::Rgba8 | PixelFormat::Bgra8
         );
-        let (scale_y, sample_bits, chroma_offset_x) = if copy_rgba {
-            self.upload_packed(slot_index, frame)?;
-            (1.0, 8, 0.0)
+        let sample = if copy_rgba {
+            self.upload_packed(slot_index, frame)?
         } else if frame.dmabuf.is_some() {
             if self.gles3 {
-                self.import_dmabuf(slot_index, frame)?
+                match self.import_dmabuf(slot_index, frame) {
+                    Ok(sample) => sample,
+                    Err(error) => {
+                        static LOGGED_IMPORT: AtomicBool = AtomicBool::new(false);
+                        if LOGGED_IMPORT
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            eprintln!(
+                                "stream: GPU import of the decoder picture failed ({error}); copying it instead"
+                            );
+                        }
+                        let (luma, chroma) = map_linear_nv12(frame)?;
+                        self.upload_nv12_planes(slot_index, frame, &luma, &chroma)?
+                    }
+                }
             } else {
                 let (luma, chroma) = map_linear_nv12(frame)?;
                 self.upload_nv12_planes(slot_index, frame, &luma, &chroma)?
@@ -548,7 +602,7 @@ impl GlesPresenter {
         } else {
             self.upload_cpu(slot_index, frame)?
         };
-        self.draw(slot_index, frame, scale_y, sample_bits, chroma_offset_x, copy_rgba)?;
+        self.draw(slot_index, frame, &sample, copy_rgba)?;
         self.generation = self.generation.wrapping_add(1);
         let resources = self.slots[slot_index].as_ref().expect("slot created");
         Ok(RecordedGpuFrame {
@@ -671,7 +725,7 @@ impl GlesPresenter {
         &mut self,
         index: usize,
         frame: &DecodedVideoFrame,
-    ) -> Result<(f32, u32, f32)> {
+    ) -> Result<PlaneSample> {
         let dmabuf = frame.dmabuf.as_ref().expect("dma-buf frame");
         let (luma, chroma) = yuv_planes(dmabuf, frame.format.pixel_format)?;
         let coded_height =
@@ -690,13 +744,36 @@ impl GlesPresenter {
             frame.format.width,
             coded_height,
         )?;
-        let chroma_image = self.create_image(
-            dmabuf,
-            &chroma,
-            if p010 { DRM_FORMAT_GR1616 } else { DRM_FORMAT_GR88 },
-            frame.format.width / 2,
-            (coded_height / 2).max(1),
-        )?;
+        let chroma_rows = (coded_height / 2).max(1);
+        let (chroma_image, byte_chroma) = if p010 {
+            match self.create_image(
+                dmabuf,
+                &chroma,
+                DRM_FORMAT_GR1616,
+                frame.format.width / 2,
+                chroma_rows,
+            ) {
+                Ok(image) => (image, false),
+                Err(error) => {
+                    self.destroy_one_image(luma_image);
+                    return Err(error);
+                }
+            }
+        } else {
+            match self.create_image(
+                dmabuf,
+                &chroma,
+                DRM_FORMAT_R8,
+                u32::try_from(chroma.pitch).unwrap_or(u32::MAX),
+                chroma_rows,
+            ) {
+                Ok(image) => (image, true),
+                Err(error) => {
+                    self.destroy_one_image(luma_image);
+                    return Err(error);
+                }
+            }
+        };
         let (luma_texture, chroma_texture) = {
             let slot = self.slots[index].as_ref().expect("slot created");
             (slot.luma, slot.chroma)
@@ -710,7 +787,15 @@ impl GlesPresenter {
         }
         self.bind_image(luma_texture, luma_image as usize)?;
         self.bind_image(chroma_texture, chroma_image as usize)?;
-        Ok(conversion_inputs(frame, coded_height))
+        if byte_chroma {
+            self.nearest(chroma_texture);
+        }
+        let mut sample = conversion_inputs(frame, coded_height);
+        sample.byte_chroma = byte_chroma;
+        if byte_chroma {
+            sample.chroma_pitch = chroma.pitch as f32;
+        }
+        Ok(sample)
     }
 
     fn create_image(
@@ -812,7 +897,7 @@ impl GlesPresenter {
         &mut self,
         index: usize,
         frame: &DecodedVideoFrame,
-    ) -> Result<(f32, u32, f32)> {
+    ) -> Result<PlaneSample> {
         match frame.format.pixel_format {
             PixelFormat::Nv12 | PixelFormat::P010 => {
                 if frame.planes.len() != 2 {
@@ -857,7 +942,7 @@ impl GlesPresenter {
         frame: &DecodedVideoFrame,
         luma: &FramePlane,
         chroma: &FramePlane,
-    ) -> Result<(f32, u32, f32)> {
+    ) -> Result<PlaneSample> {
         let p010 = frame.format.pixel_format == PixelFormat::P010;
         if p010 && !self.norm16 {
             return Err(Error::unavailable(
@@ -890,26 +975,23 @@ impl GlesPresenter {
             luma_bytes,
             luma.data.as_ref(),
         )?;
-        if self.gles3 && !p010 {
-            // Mali samples GL_RG8 as red only. An RGBA texture keeps U in red and V in green.
-            let expanded = expand_nv12_chroma_rgba(
-                chroma.data.as_ref(),
-                frame.format.width as usize / 2,
-                chroma.rows,
-                chroma.stride,
-            );
-            let row_bytes = frame.format.width as usize / 2 * 4;
+        let byte_chroma = self.gles3 && !p010;
+        if byte_chroma {
+            let pitch = u32::try_from(chroma.stride).map_err(|_| {
+                Error::InvalidFormat("chroma stride does not fit a GPU texture".to_owned())
+            })?;
             self.upload_plane(
                 chroma_texture,
-                GL_RGBA8,
-                GL_RGBA,
+                GL_R8,
+                GL_RED,
                 GL_UNSIGNED_BYTE,
-                frame.format.width / 2,
+                pitch,
                 chroma.rows as u32,
-                row_bytes,
-                4,
-                &expanded,
+                chroma.stride,
+                1,
+                chroma.data.as_ref(),
             )?;
+            self.nearest(chroma_texture);
         } else {
             let (chroma_internal, chroma_format, chroma_bytes) = if p010 {
                 (GL_RG16, GL_RG, 4)
@@ -929,14 +1011,19 @@ impl GlesPresenter {
             )?;
         }
         let coded = u32::try_from(luma.rows).unwrap_or(frame.format.height);
-        Ok(conversion_inputs(frame, coded.max(1)))
+        let mut sample = conversion_inputs(frame, coded.max(1));
+        sample.byte_chroma = byte_chroma;
+        if byte_chroma {
+            sample.chroma_pitch = chroma.stride as f32;
+        }
+        Ok(sample)
     }
 
     fn upload_packed(
         &mut self,
         index: usize,
         frame: &DecodedVideoFrame,
-    ) -> Result<(f32, u32, f32)> {
+    ) -> Result<PlaneSample> {
         if frame.planes.len() != 1 {
             return Err(Error::InvalidFormat(
                 "packed RGB frames require one plane".to_owned(),
@@ -982,7 +1069,14 @@ impl GlesPresenter {
             4,
             pixels,
         )?;
-        Ok((1.0, 8, 0.0))
+        Ok(PlaneSample {
+            scale_y: 1.0,
+            sample_bits: 8,
+            chroma_offset_x: 0.0,
+            byte_chroma: false,
+            luma_width: 1.0,
+            chroma_pitch: 1.0,
+        })
     }
 
     fn upload_plane(
@@ -1047,13 +1141,19 @@ impl GlesPresenter {
         self.gl.check("upload a video plane to OpenGL ES")
     }
 
+    fn nearest(&self, texture: u32) {
+        unsafe {
+            (self.gl.bind_texture)(GL_TEXTURE_2D, texture);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+    }
+
     fn draw(
         &self,
         index: usize,
         frame: &DecodedVideoFrame,
-        scale_y: f32,
-        sample_bits: u32,
-        chroma_offset_x: f32,
+        sample: &PlaneSample,
         copy_rgba: bool,
     ) -> Result<()> {
         let (framebuffer, luma_texture, chroma_texture) = {
@@ -1076,14 +1176,14 @@ impl GlesPresenter {
             (self.gl.active_texture)(GL_TEXTURE0 + 1);
             (self.gl.bind_texture)(GL_TEXTURE_2D, chroma_texture);
             (self.gl.uniform_1i)(self.program.chroma, 1);
-            (self.gl.uniform_2f)(self.program.texture_scale, 1.0, scale_y);
+            (self.gl.uniform_2f)(self.program.texture_scale, 1.0, sample.scale_y);
             if let Some(uniform_1ui) = self.gles3.then_some(self.gl.uniform_1ui).flatten() {
                 uniform_1ui(self.program.color_matrix, matrix);
                 uniform_1ui(
                     self.program.full_range,
                     u32::from(frame.format.color_range == ColorRange::Full),
                 );
-                uniform_1ui(self.program.sample_bits, sample_bits);
+                uniform_1ui(self.program.sample_bits, sample.sample_bits);
                 uniform_1ui(self.program.copy_rgba, u32::from(copy_rgba));
             } else {
                 (self.gl.bind_buffer)(GL_ARRAY_BUFFER, self.program.vertex_buffer);
@@ -1107,19 +1207,45 @@ impl GlesPresenter {
                         0.0
                     },
                 );
-                (self.gl.uniform_1f)(self.program.sample_bits, sample_bits as f32);
+                (self.gl.uniform_1f)(self.program.sample_bits, sample.sample_bits as f32);
                 (self.gl.uniform_1f)(
                     self.program.copy_rgba,
                     if copy_rgba { 1.0 } else { 0.0 },
                 );
             }
-            (self.gl.uniform_1f)(self.program.chroma_offset_x, chroma_offset_x);
+            (self.gl.uniform_1f)(self.program.chroma_offset_x, sample.chroma_offset_x);
+            (self.gl.uniform_1f)(
+                self.program.chroma_bytes,
+                if sample.byte_chroma { 1.0 } else { 0.0 },
+            );
+            (self.gl.uniform_1f)(self.program.luma_width, sample.luma_width);
+            (self.gl.uniform_1f)(self.program.chroma_pitch, sample.chroma_pitch);
             (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
             (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
             (self.gl.active_texture)(GL_TEXTURE0);
             (self.gl.use_program)(0);
         }
         self.gl.check("draw the OpenGL ES video frame")
+    }
+
+    fn finish_gpu(&self) {
+        if let Some(finish) = self.gl.finish {
+            unsafe { finish() };
+        }
+    }
+
+    fn destroy_one_image(&self, image: *mut c_void) {
+        if image.is_null() {
+            return;
+        }
+        let Some(destroy) = self.gl.destroy_image else {
+            return;
+        };
+        let display = unsafe { (self.gl.get_current_display)() };
+        if display.is_null() {
+            return;
+        }
+        unsafe { destroy(display, image) };
     }
 
     fn destroy_images_at(&mut self, index: usize) {
@@ -1132,6 +1258,10 @@ impl GlesPresenter {
             slot.chroma_image = 0;
             images
         };
+        if luma_image == 0 && chroma_image == 0 {
+            return;
+        }
+        self.finish_gpu();
         let Some(destroy) = self.gl.destroy_image else {
             return;
         };
@@ -1147,6 +1277,10 @@ impl GlesPresenter {
     }
 
     fn destroy_images(&self, slot: &mut Slot) {
+        let pending = slot.luma_image != 0 || slot.chroma_image != 0;
+        if pending {
+            self.finish_gpu();
+        }
         let Some(destroy) = self.gl.destroy_image else {
             slot.luma_image = 0;
             slot.chroma_image = 0;
@@ -1226,7 +1360,7 @@ fn output_format(
     }
 }
 
-fn conversion_inputs(frame: &DecodedVideoFrame, coded_height: u32) -> (f32, u32, f32) {
+fn conversion_inputs(frame: &DecodedVideoFrame, coded_height: u32) -> PlaneSample {
     let scale_y = frame.format.height as f32 / coded_height as f32;
     let sample_bits = if frame.format.pixel_format == PixelFormat::P010 {
         10
@@ -1240,7 +1374,14 @@ fn conversion_inputs(frame: &DecodedVideoFrame, coded_height: u32) -> (f32, u32,
     } else {
         0.0
     };
-    (scale_y, sample_bits, chroma_offset_x)
+    PlaneSample {
+        scale_y,
+        sample_bits,
+        chroma_offset_x,
+        byte_chroma: false,
+        luma_width: frame.format.width as f32,
+        chroma_pitch: 1.0,
+    }
 }
 
 fn yuv_planes(frame: &DmaBufFrame, pixel_format: PixelFormat) -> Result<(DmaBufPlane, DmaBufPlane)> {
@@ -1406,26 +1547,6 @@ fn dma_buf_sync(fd: i32, flags: u64) {
     }
 }
 
-fn expand_nv12_chroma_rgba(data: &[u8], pairs: usize, rows: usize, stride: usize) -> Vec<u8> {
-    let mut expanded = vec![0_u8; pairs.saturating_mul(rows).saturating_mul(4)];
-    if pairs == 0 || rows == 0 || stride < pairs.saturating_mul(2) {
-        return expanded;
-    }
-    for row in 0..rows {
-        for col in 0..pairs {
-            let source = row * stride + col * 2;
-            let target = (row * pairs + col) * 4;
-            if source + 1 >= data.len() || target + 3 >= expanded.len() {
-                break;
-            }
-            expanded[target] = data[source];
-            expanded[target + 1] = data[source + 1];
-            expanded[target + 3] = 255;
-        }
-    }
-    expanded
-}
-
 fn pack_rows(data: &[u8], stride: usize, row_bytes: usize, rows: usize) -> Result<Vec<u8>> {
     if row_bytes == 0 || stride < row_bytes {
         return Err(Error::InvalidFormat(
@@ -1557,6 +1678,9 @@ fn link_program(gl: &Gl, gles3: bool) -> Result<Program> {
         full_range: location(b"full_range\0"),
         sample_bits: location(b"sample_bits\0"),
         chroma_offset_x: location(b"chroma_offset_x\0"),
+        chroma_bytes: location(b"chroma_bytes\0"),
+        luma_width: location(b"luma_width\0"),
+        chroma_pitch: location(b"chroma_pitch\0"),
         copy_rgba: location(b"copy_rgba\0"),
         vertex_buffer,
     };
@@ -1568,6 +1692,9 @@ fn link_program(gl: &Gl, gles3: bool) -> Result<Program> {
         program.full_range,
         program.sample_bits,
         program.chroma_offset_x,
+        program.chroma_bytes,
+        program.luma_width,
+        program.chroma_pitch,
         program.copy_rgba,
     ]
     .contains(&-1)

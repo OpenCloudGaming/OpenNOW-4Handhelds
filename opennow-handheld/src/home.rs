@@ -174,7 +174,7 @@ impl Home {
                 if self.shelf_index < games {
                     return Some(Request::Play);
                 }
-                return Some(Request::Toast("The store isn't connected yet"));
+                return Some(Request::OpenStore);
             }
             (Action::Options | Action::Select(true), Focus::Shelf) if self.shelf_index < games => {
                 self.menu = Some(LibraryMenu::Main(0));
@@ -500,11 +500,14 @@ fn draw_game_tile(painter: &mut Painter, game: &Game, artwork: &Artwork, x: f32)
             painter.text(x + (TILE - initial_width) / 2.0, y + 18.0, 96.0, Weight::Black, &initial, with_alpha(WHITE, 0.14));
         }
     }
-    painter.gradient(x, y, TILE, TILE, 5.0, y, with_alpha(BLACK, 0.35), with_alpha(BLACK, 0.0));
     painter.gradient(x, y, TILE, TILE, 5.0, y + TILE * 0.4, with_alpha(BLACK, 0.0), with_alpha(BLACK, 0.7));
-    painter.text(x + 12.0, y + 11.0, 11.0, Weight::ExtraBold, &game.store, with_alpha(WHITE, 0.8));
-    painter.text_fit(x + 12.0, y + TILE - 42.0, 16.0, Weight::Black, &game.title, TILE - 24.0, WHITE);
-    painter.text_fit(x + 12.0, y + TILE - 22.0, 12.0, Weight::Bold, &game.status, TILE - 24.0, with_alpha(WHITE, 0.7));
+    let bottom = y + TILE - 28.0;
+    if game.status.is_empty() {
+        painter.text_fit(x + 12.0, bottom, 13.0, Weight::ExtraBold, &game.store, TILE - 24.0, WHITE);
+    } else {
+        painter.text_fit(x + 12.0, bottom - 18.0, 12.0, Weight::Bold, &game.status, TILE - 24.0, with_alpha(WHITE, 0.85));
+        painter.text_fit(x + 12.0, bottom, 13.0, Weight::ExtraBold, &game.store, TILE - 24.0, WHITE);
+    }
 }
 
 fn draw_message_tile(painter: &mut Painter, x: f32, title: &str, detail: Option<&str>) {

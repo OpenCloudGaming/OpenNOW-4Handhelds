@@ -19,8 +19,8 @@ pub const fn rgb(hex: u32) -> Color {
 pub const BACKGROUND: Color = rgb(0x17191C);
 pub const TEXT: Color = rgb(0xF2F4F6);
 pub const MUTED: Color = rgb(0x9AA0A6);
-pub const TITLE: Color = rgb(0x67D8F0);
-pub const FOCUS: Color = rgb(0x2EC4D6);
+pub const TITLE: Color = rgb(0x76EF36);
+pub const FOCUS: Color = rgb(0x76EF36);
 pub const DOCK_FACE: Color = rgb(0xF4F4F5);
 pub const SEPARATOR: Color = rgb(0x3A3E46);
 pub const ADD_TILE: Color = rgb(0x2A2D33);
@@ -42,7 +42,7 @@ pub struct Clock {
 
 pub fn draw_header(painter: &mut Painter, clock: &Clock) {
     painter.image(Image::Logo, EDGE, 22.0, 52.0, 30.0, WHITE);
-    let name_width = painter.text(EDGE + 62.0, 24.0, 21.0, Weight::Black, "OpenNOW", TEXT);
+    let name_width = painter.text(EDGE + 62.0, 28.0, 16.0, Weight::Black, "OpenNOW-4Handhelds", TEXT);
     painter.text(EDGE + 62.0 + name_width + 8.0, 31.0, 13.0, Weight::Bold, "v0.1.0", MUTED);
 
     let mut right = CANVAS.0 - EDGE;
@@ -133,7 +133,7 @@ pub fn draw_confirm(painter: &mut Painter, title: &str, body: &str, confirm: &st
 }
 
 pub fn draw_session_menu(painter: &mut Painter, selected: usize) {
-    let rows = ["Mouse", "End session", "Exit OpenNOW"];
+    let rows = ["End session", "Exit OpenNOW", "Mouse mode", "Stats"];
     let (x, width, row_h) = (130.0, 380.0, 56.0);
     let height = 70.0 + rows.len() as f32 * row_h;
     let y = (CANVAS.1 - height) / 2.0;

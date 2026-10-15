@@ -226,39 +226,117 @@ pub fn load() -> Profile {
     profile
 }
 
-pub fn draw(painter: &mut Painter, clock: &theme::Clock, profile: &Profile, selected: usize, server: &str) {
+#[derive(Clone, Copy)]
+pub struct Playtime {
+    pub remaining: f64,
+    pub total: f64,
+    pub unlimited: bool,
+}
+
+pub fn playtime_from_subscription(value: &Value) -> Option<Playtime> {
+    let subscription = value.get("subscription").filter(|item| item.is_object())?;
+    Some(Playtime {
+        remaining: subscription["remainingHours"].as_f64().unwrap_or(0.0).max(0.0),
+        total: subscription["totalHours"].as_f64().unwrap_or(0.0).max(0.0),
+        unlimited: subscription["isUnlimited"].as_bool().unwrap_or(false),
+    })
+}
+
+pub fn draw(
+    painter: &mut Painter,
+    clock: &theme::Clock,
+    profile: &Profile,
+    selected: usize,
+    server: &str,
+    playtime: Option<Playtime>,
+) {
     theme::draw_header(painter, clock);
-    painter.text(EDGE, 70.0, 22.0, Weight::Black, "Settings", TEXT);
-    let top = 100.0;
-    let height = 38.0;
-    for row in 0..ROWS {
-        let y = top + row as f32 * height;
+    painter.text(EDGE, 68.0, 20.0, Weight::Black, "Settings", TEXT);
+    let list_top = draw_playtime(painter, playtime);
+    let row_height = 46.0;
+    let row_fill = 42.0;
+    let text_size = 17.0;
+    let list_height = SEPARATOR_Y - list_top;
+    let visible = (list_height / row_height).floor().max(1.0) as usize;
+    let start = list_start(selected, visible);
+    painter.clip(0.0, list_top, CANVAS.0, list_height);
+    for row in start..(start + visible).min(ROWS) {
+        let y = list_top + (row - start) as f32 * row_height;
         if row == selected {
-            painter.fill(EDGE, y, CANVAS.0 - EDGE * 2.0, 34.0, 8.0, BUTTON);
+            painter.fill(EDGE, y, CANVAS.0 - EDGE * 2.0, row_fill, 8.0, BUTTON);
         }
         let color = if row == selected { TEXT } else { MUTED };
         let label_color = if row == SIGN_OUT_ROW { ERROR } else { color };
-        painter.text(32.0, y + 8.0, 15.0, Weight::SemiBold, row_label(row), label_color);
+        painter.text(32.0, y + 11.0, text_size, Weight::SemiBold, row_label(row), label_color);
         if row == SIGN_OUT_ROW {
             continue;
         }
         let value = if row == SERVER_ROW { server.to_owned() } else { profile.row_value(row) };
-        let value_width = painter.measure(&value, 15.0, Weight::Bold);
+        let value_width = painter.measure(&value, text_size, Weight::Bold);
         let right = CANVAS.0 - 32.0;
         let gap = if row == selected { 18.0 } else { 0.0 };
         let available = 250.0;
         let shown = value_width.min(available);
         if row == selected {
-            painter.text(right - 12.0, y + 8.0, 15.0, Weight::Bold, ">", FOCUS);
-            painter.text(right - shown - gap - 16.0, y + 8.0, 15.0, Weight::Bold, "<", FOCUS);
+            painter.text(right - 12.0, y + 11.0, text_size, Weight::Bold, ">", FOCUS);
+            painter.text(right - shown - gap - 16.0, y + 11.0, text_size, Weight::Bold, "<", FOCUS);
         }
-        painter.text_fit(right - shown - gap, y + 8.0, 15.0, Weight::Bold, &value, available, if row == selected { TEXT } else { MUTED });
+        painter.text_fit(
+            right - shown - gap,
+            y + 11.0,
+            text_size,
+            Weight::Bold,
+            &value,
+            available,
+            if row == selected { TEXT } else { MUTED },
+        );
     }
+    painter.clear_clip();
     if selected == SIGN_OUT_ROW {
         theme::draw_footer(painter, "Sign out of this GeForce NOW account", &[("A", "Sign out"), ("B", "Back")]);
     } else {
         theme::draw_footer(painter, "Server, bit rate, and picture size apply on the next game", &[("A", "Change"), ("B", "Back")]);
     }
+}
+
+fn draw_playtime(painter: &mut Painter, playtime: Option<Playtime>) -> f32 {
+    let y = 96.0;
+    let bar_y = y + 20.0;
+    let width = CANVAS.0 - EDGE * 2.0;
+    let (left, right) = match playtime {
+        Some(playtime) if playtime.unlimited => ("Unlimited".into(), String::new()),
+        Some(playtime) => (format!("{} playtime left", hours_label(playtime.remaining)), hours_label(playtime.total)),
+        None => ("Loading playtime…".into(), String::new()),
+    };
+    painter.text(EDGE, y, 14.0, Weight::Bold, &left, TEXT);
+    if !right.is_empty() {
+        let right_width = painter.measure(&right, 14.0, Weight::Bold);
+        painter.text(EDGE + width - right_width, y, 14.0, Weight::Bold, &right, MUTED);
+    }
+    painter.fill(EDGE, bar_y, width, 6.0, 3.0, SEPARATOR);
+    let fraction = match playtime {
+        Some(playtime) if playtime.unlimited => 1.0,
+        Some(playtime) if playtime.total > 0.0 => (playtime.remaining / playtime.total).clamp(0.0, 1.0),
+        _ => 0.0,
+    };
+    if fraction > 0.0 {
+        painter.fill(EDGE, bar_y, (width * fraction as f32).max(6.0), 6.0, 3.0, FOCUS);
+    }
+    bar_y + 16.0
+}
+
+fn hours_label(hours: f64) -> String {
+    let minutes = (hours * 60.0).round().max(0.0) as u64;
+    let whole = minutes / 60;
+    let rest = minutes % 60;
+    if rest == 0 { format!("{whole}h") } else { format!("{whole}h {rest}m") }
+}
+
+fn list_start(selected: usize, visible: usize) -> usize {
+    if ROWS <= visible {
+        return 0;
+    }
+    selected.saturating_sub(visible / 2).min(ROWS - visible)
 }
 
 fn row_label(row: usize) -> &'static str {

@@ -70,7 +70,7 @@ impl Game {
         let in_library = variant.and_then(|variant| variant["inLibrary"].as_bool()).unwrap_or(false);
         let store = variant.and_then(|variant| variant["store"].as_str()).map(store_label).unwrap_or_default();
         let status = match variant.and_then(|variant| variant["gfnStatus"].as_str()) {
-            Some("AVAILABLE") | None => "Ready to play".to_owned(),
+            Some("AVAILABLE") | None => "".to_owned(),
             Some(other) => sentence_case(other),
         };
         let artwork = ["keyArtUrl", "imageUrl", "heroImageUrl"]
