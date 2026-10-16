@@ -16,9 +16,8 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// File logging is off while handheld sessions are being tested. Turning this
-/// back on restores `streamer.log`.
-const FILE_LOG_ENABLED: bool = false;
+/// Keep the bounded streamer file log available for diagnostics.
+const FILE_LOG_ENABLED: bool = true;
 
 /// Matches the Qt shell's rotation policy for `native-streamer.log`.
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -642,8 +641,8 @@ mod tests {
             let mut stage = Stage::begin("test.complete");
             stage.complete();
         }
-        assert!(!Path::new(&path).exists());
-        assert!(!Path::new(&format!("{path}.previous")).exists());
+        assert!(Path::new(&path).exists());
+        assert!(Path::new(&format!("{path}.previous")).exists());
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.previous"));
@@ -663,7 +662,7 @@ mod tests {
         log_async("INFO", "transport", "inbound=0 frames=0");
         log_async("WARN", "transport", "bind failed");
         diagnostic("INFO", "transport", "NVST rx-stats inbound=0 pings=97");
-        assert!(!Path::new(&path).exists());
+        assert!(Path::new(&path).exists());
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
     }
@@ -684,11 +683,14 @@ mod tests {
         let path = temp_path("lines.log");
         let _ = std::fs::remove_file(&path);
         set_log_file(&path).unwrap();
-        assert!(log_file_path().is_none());
+        assert_eq!(log_file_path().as_deref(), Some(path.as_str()));
         log_line("INFO", "engine", "hello");
         log_line("INFO", "session", "session entered");
         log_line("WARN", "session", "connection dropped");
-        assert!(!Path::new(&path).exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("session entered"));
+        assert!(text.contains("connection dropped"));
+        assert!(!text.contains("hello"));
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
     }
@@ -703,12 +705,8 @@ mod tests {
         let _ = std::fs::remove_file(&previous);
         std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 8) as usize]).unwrap();
         set_log_file(&path).unwrap();
-        assert!(!Path::new(&previous).exists());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            MAX_LOG_BYTES + 8,
-            "disabled logging must leave an existing file untouched"
-        );
+        assert!(Path::new(&previous).exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         reset_for_tests();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&previous);

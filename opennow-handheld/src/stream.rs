@@ -339,7 +339,7 @@ impl NativeStream {
         unsafe { (self.api.submit_mouse_absolute)(self.handle, x, y, width, height) };
     }
 
-    /// Button 1 is the left mouse button.
+    /// Buttons follow SDL numbering: 1 is left, 2 is middle, and 3 is right.
     pub fn mouse_button(&mut self, button: u8, pressed: bool) {
         if self.handle.is_null() {
             return;

@@ -181,6 +181,16 @@ impl Store {
         *self = Self::new();
     }
 
+    /// Repeats deletion only while the delete key remains selected.
+    pub fn repeat_delete(&mut self) {
+        let Some(keyboard) = self.keyboard.as_mut() else {
+            return;
+        };
+        if key_at(keyboard.row, keyboard.column).text == "del" {
+            keyboard.draft.pop();
+        }
+    }
+
     /// Tile indices whose art should be loaded, nearest the selection first.
     pub fn art_order(&self, count: usize) -> Vec<usize> {
         if count == 0 {

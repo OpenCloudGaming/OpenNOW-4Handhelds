@@ -2866,17 +2866,10 @@ fn send_pending_nack(
     } else {
         channels.send_rtcp(rtc, &build_rtcp_nack(sender_ssrc, media_ssrc, first, last))
     };
-    if admitted {
-        let format = if mjolnir {
-            "private-v2"
-        } else {
-            "rtcp-generic"
-        };
-        eprintln!(
-            "NVST NACK sent format={format} channel={} mediaSsrc={media_ssrc} missing={first}..={last}",
-            channels.label(channel),
-        );
-    } else {
+    if !admitted {
+        // Successful NACKs are routine recovery traffic and can arrive many
+        // times per second on lossy links. Keep them out of the persistent log;
+        // timeout and recovery transitions remain visible.
         feedback.mark_nack_send_failed(first, last);
     }
 }
@@ -7032,13 +7025,6 @@ fn run_nvst_webrtc_bundle(
                                 input_state.channel_data(channels, data.id, &data.data)
                         {
                             pending_input_version = Some(version);
-                        } else if Some(data.id) == rtcp_channel {
-                            eprintln!(
-                                "NVST rtcp1 inbound: id={:?} binary={} bytes={}",
-                                data.id,
-                                data.binary,
-                                data.data.len(),
-                            );
                         }
                     }
                     Event::ChannelClose(id) => {

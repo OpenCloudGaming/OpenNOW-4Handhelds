@@ -38,12 +38,13 @@ struct NavRepeat {
     hat: [bool; 4],
     stick_x: i8,
     stick_y: i8,
+    confirm: bool,
     next: Instant,
 }
 
 impl NavRepeat {
     fn new() -> Self {
-        Self { dpad: [false; 4], hat: [false; 4], stick_x: 0, stick_y: 0, next: Instant::now() }
+        Self { dpad: [false; 4], hat: [false; 4], stick_x: 0, stick_y: 0, confirm: false, next: Instant::now() }
     }
 
     fn set_button(&mut self, index: usize, held: bool) {
@@ -82,10 +83,21 @@ impl NavRepeat {
         }
     }
 
-    fn tick(&mut self, now: Instant) -> [Option<Action>; 4] {
+    fn set_confirm(&mut self, held: bool) {
+        if self.confirm == held {
+            return;
+        }
+        let idle = !self.any();
+        self.confirm = held;
+        if held && idle {
+            self.next = Instant::now() + REPEAT_DELAY;
+        }
+    }
+
+    fn tick(&mut self, now: Instant) -> ([Option<Action>; 4], bool) {
         let mut actions = [None; 4];
         if !self.any() || now < self.next {
-            return actions;
+            return (actions, false);
         }
         self.next = now + REPEAT_RATE;
         let dirs = [Action::Up, Action::Down, Action::Left, Action::Right];
@@ -96,11 +108,11 @@ impl NavRepeat {
                 count += 1;
             }
         }
-        actions
+        (actions, self.confirm)
     }
 
     fn any(&self) -> bool {
-        (0..4).any(|index| self.held(index))
+        self.confirm || (0..4).any(|index| self.held(index))
     }
 
     fn held(&self, index: usize) -> bool {
@@ -236,6 +248,10 @@ fn translate(event: Event, stick: &mut Stick, repeat: &mut NavRepeat, status: &m
             key_action(symbol)
         }
         Event::ControllerButton { button, pressed } => {
+            let confirm_button = if xbox_layout { 0 } else { 1 };
+            if button == confirm_button {
+                repeat.set_confirm(pressed);
+            }
             if let Some(index) = direction_index(button, false) {
                 repeat.set_button(index, pressed);
             }
@@ -245,6 +261,10 @@ fn translate(event: Event, stick: &mut Stick, repeat: &mut NavRepeat, status: &m
             controller_action(button, pressed, xbox_layout)
         }
         Event::JoyButton { which, button, pressed } => {
+            let confirm_button = if xbox_layout { 0 } else { 1 };
+            if button == confirm_button {
+                repeat.set_confirm(pressed);
+            }
             if let Some(index) = direction_index(button, true) {
                 repeat.set_button(index, pressed);
             }
@@ -277,7 +297,6 @@ fn translate(event: Event, stick: &mut Stick, repeat: &mut NavRepeat, status: &m
 }
 
 fn record(status: &mut Status, input: String) {
-    eprintln!("input: {input}");
     status.last_input = input;
 }
 
@@ -335,10 +354,6 @@ fn run() -> Result<(), String> {
         while let Some((event, added)) = sdl.poll() {
             if let Some(index) = added {
                 let (description, fn_button) = sdl.open_device(index);
-                eprintln!("input: {description}");
-                if fn_button {
-                    eprintln!("input: FN is button 16");
-                }
                 app.note_fn_button(fn_button);
                 status.devices.push(description);
             }
@@ -356,8 +371,12 @@ fn run() -> Result<(), String> {
             }
         }
         if app.repeats_navigation() {
-            for action in repeat.tick(Instant::now()).into_iter().flatten() {
+            let (actions, repeat_confirm) = repeat.tick(Instant::now());
+            for action in actions.into_iter().flatten() {
                 app.act(action, &status);
+            }
+            if repeat_confirm {
+                app.repeat_keyboard_delete();
             }
         }
         if options.limit.is_some_and(|limit| started.elapsed() >= limit) {

@@ -135,11 +135,12 @@ pub struct App {
     session_menu: bool,
     /// 0 ends the session, 1 exits OpenNOW after the session stops, 2 is mouse mode, 3 toggles stats.
     session_menu_index: u8,
-    /// Sticks move a pointer and the right trigger clicks.
+    /// Sticks move a pointer; Steam Deck style maps R2 to left click and L2 to right click.
     mouse_mode: bool,
     mouse_x: f32,
     mouse_y: f32,
-    mouse_down: bool,
+    mouse_left_down: bool,
+    mouse_right_down: bool,
     /// Latest stick deflection in mouse mode, from -1 to 1, after the dead zone.
     mouse_stick_x: f32,
     mouse_stick_y: f32,
@@ -152,6 +153,7 @@ pub struct App {
     show_stats: bool,
     stream_fps: Option<f64>,
     stream_mbps: Option<f64>,
+    stream_ping_ms: Option<f64>,
     /// The connected pad has physical button 16, the FN key.
     fn_button: bool,
     toast: Option<(String, Instant)>,
@@ -250,7 +252,8 @@ impl App {
             mouse_mode: false,
             mouse_x: CANVAS.0 / 2.0,
             mouse_y: CANVAS.1 / 2.0,
-            mouse_down: false,
+            mouse_left_down: false,
+            mouse_right_down: false,
             mouse_stick_x: 0.0,
             mouse_stick_y: 0.0,
             pad_select: false,
@@ -259,6 +262,7 @@ impl App {
             show_stats: false,
             stream_fps: None,
             stream_mbps: None,
+            stream_ping_ms: None,
             fn_button: false,
             toast: None,
             start_held: false,
@@ -561,7 +565,8 @@ impl App {
 
     fn enter_mouse_mode(&mut self) {
         self.mouse_mode = true;
-        self.mouse_down = false;
+        self.mouse_left_down = false;
+        self.mouse_right_down = false;
         self.mouse_x = CANVAS.0 / 2.0;
         self.mouse_y = CANVAS.1 / 2.0;
         if let Some(stream) = self.stream.as_mut() {
@@ -571,12 +576,16 @@ impl App {
     }
 
     fn leave_mouse_mode(&mut self) {
-        if self.mouse_down {
-            if let Some(stream) = self.stream.as_mut() {
+        if let Some(stream) = self.stream.as_mut() {
+            if self.mouse_left_down {
                 stream.mouse_button(1, false);
             }
-            self.mouse_down = false;
+            if self.mouse_right_down {
+                stream.mouse_button(3, false);
+            }
         }
+        self.mouse_left_down = false;
+        self.mouse_right_down = false;
         self.mouse_mode = false;
         self.mouse_stick_x = 0.0;
         self.mouse_stick_y = 0.0;
@@ -609,18 +618,25 @@ fn mouse_deflection(value: i16) -> f32 {
         match axis {
             0 | 2 => self.mouse_stick_x = Self::mouse_deflection(value),
             1 | 3 => self.mouse_stick_y = Self::mouse_deflection(value),
-            5 => {
+            4 | 5 => {
                 let press = value > 12_000;
                 let release = value < 4_000;
-                if press && !self.mouse_down {
-                    self.mouse_down = true;
+                let (is_down, button) = if axis == 4 {
+                    (&mut self.mouse_right_down, 3)
+                } else {
+                    (&mut self.mouse_left_down, 1)
+                };
+                let next = if press {
+                    Some(true)
+                } else if release {
+                    Some(false)
+                } else {
+                    None
+                };
+                if let Some(next) = next.filter(|next| *next != *is_down) {
+                    *is_down = next;
                     if let Some(stream) = self.stream.as_mut() {
-                        stream.mouse_button(1, true);
-                    }
-                } else if release && self.mouse_down {
-                    self.mouse_down = false;
-                    if let Some(stream) = self.stream.as_mut() {
-                        stream.mouse_button(1, false);
+                        stream.mouse_button(button, next);
                     }
                 }
             }
@@ -658,6 +674,12 @@ fn mouse_deflection(value: i16) -> f32 {
         }
         if let Some(stream) = self.stream.as_mut() {
             stream.axis(axis, value);
+        }
+    }
+
+    pub fn repeat_keyboard_delete(&mut self) {
+        if matches!(self.screen, Screen::Store) {
+            self.store.repeat_delete();
         }
     }
 
@@ -1628,6 +1650,7 @@ fn mouse_deflection(value: i16) -> f32 {
         self.return_to_store = from_store;
         self.stream_fps = None;
         self.stream_mbps = None;
+        self.stream_ping_ms = None;
         let profile = self.profile.clone();
         self.play = PlayPhase::Settings;
         self.play_message = format!("Preparing {title} at {}…", profile.label());
@@ -1651,6 +1674,7 @@ fn mouse_deflection(value: i16) -> f32 {
             if message["type"].as_str() == Some("telemetry") {
                 self.stream_fps = message["framesPerSecond"].as_f64();
                 self.stream_mbps = message["bitrateMbps"].as_f64();
+                self.stream_ping_ms = message["pingMs"].as_f64();
             }
             if message["type"].as_str() == Some("ready") && message["capabilities"].is_object() {
                 self.stream_capabilities = Some(message["capabilities"].clone());
@@ -1759,7 +1783,10 @@ fn mouse_deflection(value: i16) -> f32 {
     }
 
     fn session_create_failed(&mut self, error: CoreError) {
-        if error.code == "session_conflict" && self.play == PlayPhase::Create {
+        let active_session = error.code == "session_conflict"
+            || (error.code == "session_update_busy"
+                && error.message == "End the active session before starting another game");
+        if active_session && self.play == PlayPhase::Create {
             eprintln!("stream: a GeForce NOW session is already running; claiming it");
             self.play = PlayPhase::Claim;
             self.play_message = "A game is already running. Resuming it…".into();
@@ -2070,14 +2097,14 @@ fn mouse_deflection(value: i16) -> f32 {
             theme::draw_session_menu(painter, self.session_menu_index as usize);
         }
         if self.show_stats && matches!(self.screen, Screen::Stream) {
-            draw_stream_stats(painter, self.stream_fps, self.stream_mbps);
+            draw_stream_stats(painter, self.stream_fps, self.stream_mbps, self.stream_ping_ms);
         }
         if self.mouse_mode {
-            painter.text(18.0, 14.0, 14.0, Weight::Bold, "Mouse mode    sticks move    RT click    FN gamepad", TEXT);
             let x = self.mouse_x - 7.0;
             let y = self.mouse_y - 7.0;
             painter.fill(x, y, 14.0, 14.0, 7.0, BLACK);
-            painter.fill(x + 3.0, y + 3.0, 8.0, 8.0, 4.0, if self.mouse_down { FOCUS } else { TEXT });
+            let button_down = self.mouse_left_down || self.mouse_right_down;
+            painter.fill(x + 3.0, y + 3.0, 8.0, 8.0, 4.0, if button_down { FOCUS } else { TEXT });
         }
         if let Some(message) = &self.notice {
             draw_notice(painter, message);
@@ -2132,10 +2159,11 @@ fn owned_variant_ids(game: &Value) -> Vec<String> {
 
 const INSET_X: f32 = 32.0;
 
-fn draw_stream_stats(painter: &mut Painter, fps: Option<f64>, mbps: Option<f64>) {
+fn draw_stream_stats(painter: &mut Painter, fps: Option<f64>, mbps: Option<f64>, ping_ms: Option<f64>) {
     let fps = fps.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
     let mbps = mbps.map(|value| format!("{value:.1}")).unwrap_or_else(|| "--".into());
-    let text = format!("FPS: {fps}    MBPS: {mbps}");
+    let ping_ms = ping_ms.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
+    let text = format!("FPS: {fps}    MBPS: {mbps}    PING: {ping_ms} ms");
     let width = painter.measure(&text, 14.0, Weight::Bold) + 20.0;
     painter.fill(12.0, 12.0, width, 26.0, 8.0, crate::gl::with_alpha(PANEL, 0.88));
     painter.text(22.0, 17.0, 14.0, Weight::Bold, &text, TEXT);

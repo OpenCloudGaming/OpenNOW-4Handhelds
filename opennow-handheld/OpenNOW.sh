@@ -4,6 +4,7 @@
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here/opennow" || exit 1
 chmod +x ./opennow-handheld
+
 # RK3326 exposes the H.264 decoder as /dev/vpu_service, owned by root.
 # MPP cannot open it until the port user can read and write the node.
 if [ -e /dev/vpu_service ] && [ ! -w /dev/vpu_service ]; then
