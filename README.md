@@ -1,6 +1,17 @@
 # OpenNOW-4Handhelds
 Port of the open source GeForce NOW custom client [OpenNOW](https://github.com/OpenCloudGaming/OpenNOW) for devices such as the R36S and other RK3326 devices.
 > At the moment support is only for [dArkOS](https://github.com/christianhaitian/dArkOS) and other versions of it, tests have been done on a clone R36S 1GB of ram running [dArkOS4Clone](https://github.com/lcdyk0517/arkos4clone), more to come.
+
+## Screenshots
+
+| Menu | Store |
+| :---: | :---: |
+| [![Menu screenshot](./screenshots/screenmenu.png)](https://github.com/OpenCloudGaming/OpenNOW-4Handhelds/blob/main/screenshots/screenmenu.png "screenmenu.png") | [![Store screenshot](./screenshots/screenstore.png)](https://github.com/OpenCloudGaming/OpenNOW-4Handhelds/blob/main/screenshots/screenstore.png "screenstore.png") |
+
+| Fortnite | Tomb Raider |
+| :---: | :---: |
+| ![Fortnite screenshot](./screenshots/screenfortnite.png) | ![Tomb Raider screenshot](./screenshots/screentombraider.png) |
+
 ## How to install it
 Download latest release, extract the contents into the ports folder, on the handheld run OpenNOW, enjoy !
 ## What you can do
@@ -8,6 +19,7 @@ Download latest release, extract the contents into the ports folder, on the hand
 - Browse the store section and add games to your library.
 - Choose a default store for a game, or remove the game from your library.
 - Change the server, bit rate, frame rate, resolution, render, vsync to on or off, and controller layout.
+
 ## Shortcuts
 **FN** or **Select + X** opens the session menu. **Stats** at the bottom of that menu shows FPS and Mbps on the picture.
 
