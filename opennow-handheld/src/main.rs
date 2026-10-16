@@ -349,6 +349,8 @@ fn run() -> Result<(), String> {
     let mut repeat = NavRepeat::new();
     let started = Instant::now();
     let mut last_frame = Instant::now();
+    let frame_interval = Duration::from_nanos(16_666_667);
+    let mut next_frame_deadline = Instant::now();
 
     'running: while !app.quit {
         while let Some((event, added)) = sdl.poll() {
@@ -396,7 +398,14 @@ fn run() -> Result<(), String> {
         app.release_picture();
         sdl.swap(&window);
         if !vsync {
-            std::thread::sleep(Duration::from_millis(16).saturating_sub(now.elapsed()));
+            next_frame_deadline += frame_interval;
+            let pacing_now = Instant::now();
+            if next_frame_deadline <= pacing_now {
+                next_frame_deadline = pacing_now;
+            }
+            std::thread::sleep(next_frame_deadline.saturating_duration_since(Instant::now()));
+        } else {
+            next_frame_deadline = Instant::now();
         }
     }
 

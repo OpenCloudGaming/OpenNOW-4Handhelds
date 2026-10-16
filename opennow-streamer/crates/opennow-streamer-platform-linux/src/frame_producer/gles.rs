@@ -32,6 +32,7 @@ const DRM_FORMAT_GR88: u32 = u32::from_le_bytes(*b"GR88");
 
 const EGL_NONE: i32 = 0x3038;
 const EGL_SUCCESS: i32 = 0x3000;
+const EGL_EXTENSIONS: i32 = 0x3055;
 const EGL_WIDTH: i32 = 0x3057;
 const EGL_HEIGHT: i32 = 0x3056;
 const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
@@ -39,13 +40,31 @@ const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
 const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
 const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+const EGL_DMA_BUF_PLANE1_FD_EXT: i32 = 0x3275;
+const EGL_DMA_BUF_PLANE1_OFFSET_EXT: i32 = 0x3276;
+const EGL_DMA_BUF_PLANE1_PITCH_EXT: i32 = 0x3277;
 const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+const EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT: i32 = 0x3445;
+const EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT: i32 = 0x3446;
+const EGL_YUV_COLOR_SPACE_HINT_EXT: i32 = 0x327B;
+const EGL_SAMPLE_RANGE_HINT_EXT: i32 = 0x327C;
+const EGL_YUV_CHROMA_HORIZONTAL_SITING_HINT_EXT: i32 = 0x327D;
+const EGL_YUV_CHROMA_VERTICAL_SITING_HINT_EXT: i32 = 0x327E;
+const EGL_ITU_REC709_EXT: i32 = 0x3280;
+const EGL_YUV_NARROW_RANGE_EXT: i32 = 0x3283;
+const EGL_YUV_CHROMA_SITING_0_EXT: i32 = 0x3284;
+const EGL_YUV_CHROMA_SITING_0_5_EXT: i32 = 0x3285;
 
 const GL_TRIANGLES: u32 = 0x0004;
+const GL_SYNC_GPU_COMMANDS_COMPLETE: u32 = 0x9117;
+const GL_SYNC_FLUSH_COMMANDS_BIT: u32 = 0x0000_0001;
+const GL_ALREADY_SIGNALED: u32 = 0x911A;
+const GL_CONDITION_SATISFIED: u32 = 0x911C;
 const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 const GL_UNPACK_ROW_LENGTH: u32 = 0x0CF2;
 const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_UNSIGNED_SHORT: u32 = 0x1403;
 const GL_FLOAT: u32 = 0x1406;
@@ -156,6 +175,17 @@ void main() {
 }
 "#;
 
+const EXTERNAL_FRAGMENT_SHADER: &str = r#"#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES video_texture;
+in vec2 texture_coordinates;
+out vec4 output_color;
+void main() {
+    output_color = texture(video_texture, texture_coordinates);
+}
+"#;
+
 const ES2_VERTEX_SHADER: &str = r#"#version 100
 attribute vec2 position;
 attribute vec2 texture_coordinates;
@@ -248,6 +278,9 @@ type Viewport = unsafe extern "C" fn(i32, i32, i32, i32);
 type UseProgram = unsafe extern "C" fn(u32);
 type DrawArrays = unsafe extern "C" fn(u32, i32, i32);
 type Finish = unsafe extern "C" fn();
+type FenceSync = unsafe extern "C" fn(u32, u32) -> *mut c_void;
+type ClientWaitSync = unsafe extern "C" fn(*mut c_void, u32, u64) -> u32;
+type DeleteSync = unsafe extern "C" fn(*mut c_void);
 type CreateShader = unsafe extern "C" fn(u32) -> u32;
 type ShaderSource = unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32);
 type ShaderIv = unsafe extern "C" fn(u32, u32, *mut i32);
@@ -269,13 +302,10 @@ type GetStringi = unsafe extern "C" fn(u32, u32) -> *const u8;
 type EglProc = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type EglDisplayFn = unsafe extern "C" fn() -> *mut c_void;
 type EglErrorFn = unsafe extern "C" fn() -> i32;
-type EglCreateImage = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    u32,
-    *mut c_void,
-    *const i32,
-) -> *mut c_void;
+type EglQueryString = unsafe extern "C" fn(*mut c_void, i32) -> *const c_char;
+type EglQueryDmaBufFormats = unsafe extern "C" fn(*mut c_void, i32, *mut i32, *mut i32) -> u32;
+type EglCreateImage =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut c_void, *const i32) -> *mut c_void;
 type EglDestroyImage = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
 type ImageTarget = unsafe extern "C" fn(u32, *mut c_void);
 
@@ -298,6 +328,9 @@ struct Gl {
     use_program: UseProgram,
     draw_arrays: DrawArrays,
     finish: Option<Finish>,
+    fence_sync: Option<FenceSync>,
+    client_wait_sync: Option<ClientWaitSync>,
+    delete_sync: Option<DeleteSync>,
     create_shader: CreateShader,
     shader_source: ShaderSource,
     get_shaderiv: ShaderIv,
@@ -329,6 +362,8 @@ struct Gl {
     get_current_display: EglDisplayFn,
     get_current_context: EglDisplayFn,
     get_egl_error: EglErrorFn,
+    query_string: EglQueryString,
+    query_dmabuf_formats: Option<EglQueryDmaBufFormats>,
     create_image: Option<EglCreateImage>,
     destroy_image: Option<EglDestroyImage>,
     image_target: Option<ImageTarget>,
@@ -350,6 +385,11 @@ struct Program {
     vertex_buffer: u32,
 }
 
+struct ExternalProgram {
+    name: u32,
+    texture: i32,
+}
+
 struct PlaneSample {
     scale_y: f32,
     sample_bits: u32,
@@ -366,19 +406,28 @@ struct Slot {
     chroma: u32,
     luma_image: usize,
     chroma_image: usize,
+    external_texture: u32,
+    external_image: usize,
     width: u32,
     height: u32,
     format: GpuTextureFormat,
     retained: Option<DecodedVideoFrame>,
+    /// GL fence signalled when the last draw into this slot finished.
+    fence: usize,
 }
 
 pub(super) struct GlesPresenter {
     gl: Gl,
     program: Program,
+    external_program: Option<ExternalProgram>,
     slots: Vec<Option<Slot>>,
     generation: u64,
     norm16: bool,
     gles3: bool,
+    /// Cleared once the per-plane DMA-BUF import has failed, so later frames go
+    /// straight to the external-texture path instead of retrying it every frame.
+    plane_import: bool,
+    render_limit: Option<(u32, u32)>,
     destroyed: bool,
 }
 
@@ -390,6 +439,7 @@ impl Gl {
         let create_image = proc_symbol(&get_proc, b"eglCreateImageKHR\0");
         let destroy_image = proc_symbol(&get_proc, b"eglDestroyImageKHR\0");
         let image_target = proc_symbol(&get_proc, b"glEGLImageTargetTexture2DOES\0");
+        let query_dmabuf_formats = proc_symbol(&get_proc, b"eglQueryDmaBufFormatsEXT\0");
         Ok(Self {
             gen_textures: load_symbol(&gles, b"glGenTextures\0")?,
             delete_textures: load_symbol(&gles, b"glDeleteTextures\0")?,
@@ -407,6 +457,9 @@ impl Gl {
             use_program: load_symbol(&gles, b"glUseProgram\0")?,
             draw_arrays: load_symbol(&gles, b"glDrawArrays\0")?,
             finish: load_symbol(&gles, b"glFinish\0").ok(),
+            fence_sync: load_symbol(&gles, b"glFenceSync\0").ok(),
+            client_wait_sync: load_symbol(&gles, b"glClientWaitSync\0").ok(),
+            delete_sync: load_symbol(&gles, b"glDeleteSync\0").ok(),
             create_shader: load_symbol(&gles, b"glCreateShader\0")?,
             shader_source: load_symbol(&gles, b"glShaderSource\0")?,
             get_shaderiv: load_symbol(&gles, b"glGetShaderiv\0")?,
@@ -438,6 +491,8 @@ impl Gl {
             get_current_display: load_symbol(&egl, b"eglGetCurrentDisplay\0")?,
             get_current_context: load_symbol(&egl, b"eglGetCurrentContext\0")?,
             get_egl_error: load_symbol(&egl, b"eglGetError\0")?,
+            query_string: load_symbol(&egl, b"eglQueryString\0")?,
+            query_dmabuf_formats,
             create_image,
             destroy_image,
             image_target,
@@ -497,6 +552,34 @@ impl Gl {
             .any(|extension| extension == name.as_bytes())
     }
 
+    fn has_egl_extension(&self, display: *mut c_void, name: &str) -> bool {
+        let value = unsafe { (self.query_string)(display, EGL_EXTENSIONS) };
+        if value.is_null() {
+            return false;
+        }
+        let text = unsafe { CStr::from_ptr(value) };
+        text.to_bytes()
+            .split(|byte| *byte == b' ')
+            .any(|extension| extension == name.as_bytes())
+    }
+
+    fn supports_dmabuf_format(&self, display: *mut c_void, format: u32) -> Option<bool> {
+        let query = self.query_dmabuf_formats?;
+        let mut count = 0;
+        if unsafe { query(display, 0, std::ptr::null_mut(), &mut count) } == 0 || count <= 0 {
+            unsafe { (self.get_egl_error)() };
+            return None;
+        }
+        let mut formats = vec![0_i32; count as usize];
+        let mut returned = 0;
+        if unsafe { query(display, count, formats.as_mut_ptr(), &mut returned) } == 0 {
+            unsafe { (self.get_egl_error)() };
+            return None;
+        }
+        formats.truncate(returned.clamp(0, count) as usize);
+        Some(formats.iter().any(|candidate| *candidate as u32 == format))
+    }
+
     fn context_is_gles3(&self) -> bool {
         if self.tex_storage.is_none() || self.uniform_1ui.is_none() {
             return false;
@@ -506,7 +589,9 @@ impl Gl {
             return false;
         }
         let text = unsafe { CStr::from_ptr(value.cast()) };
-        text.to_bytes().windows(11).any(|window| window == b"OpenGL ES 3")
+        text.to_bytes()
+            .windows(11)
+            .any(|window| window == b"OpenGL ES 3")
     }
 }
 
@@ -519,17 +604,54 @@ impl GlesPresenter {
                 "Qt must make the EGL context current before the first video frame",
             ));
         }
+        let display = unsafe { (gl.get_current_display)() };
+        let external_yuv = gl.has_extension("GL_OES_EGL_image_external_essl3");
+        let external_program = if external_yuv && gl.context_is_gles3() {
+            match link_external_program(&gl) {
+                Ok(program) => Some(program),
+                Err(error) => {
+                    eprintln!("stream: external-YUV shader unavailable ({error})");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !display.is_null() {
+            let import = gl.has_egl_extension(display, "EGL_EXT_image_dma_buf_import");
+            let modifiers = gl.has_egl_extension(display, "EGL_EXT_image_dma_buf_import_modifiers");
+            let r8 = import
+                .then(|| gl.supports_dmabuf_format(display, DRM_FORMAT_R8))
+                .flatten();
+            let nv12 = import
+                .then(|| gl.supports_dmabuf_format(display, DRM_FORMAT_NV12))
+                .flatten();
+            eprintln!(
+                "stream: EGL DMA-BUF import={import} modifiers={modifiers} R8={r8:?} NV12={nv12:?}; external-YUV-extension={}",
+                external_yuv
+            );
+        }
         gl.clear_error();
         let gles3 = gl.context_is_gles3();
         let program = link_program(&gl, gles3)?;
         let norm16 = gles3 && gl.has_extension("GL_EXT_texture_norm16");
+        let render_limit = render_limit_from_config();
+        match render_limit {
+            Some((width, height)) => {
+                eprintln!("stream: GLES output render limit {width}x{height}")
+            }
+            None => eprintln!("stream: GLES output render limit native"),
+        }
         Ok(Self {
             gl,
             program,
+            external_program,
             slots: (0..slot_count).map(|_| None).collect(),
             generation: 0,
             norm16,
             gles3,
+            plane_import: true,
+            render_limit,
             destroyed: false,
         })
     }
@@ -548,14 +670,19 @@ impl GlesPresenter {
         frame.validate()?;
         let color_space = LinuxTextureColorSpace::from_format(frame.format)?;
         let texture_format = output_format(frame, color_space)?;
+        let (render_width, render_height) = render_extent(
+            frame.format.width,
+            frame.format.height,
+            self.render_limit,
+        );
         let slot_index = usize::try_from(slot)
             .ok()
             .filter(|index| *index < self.slots.len())
             .ok_or_else(|| Error::InvalidFormat(format!("invalid QRhi frame slot {slot}")))?;
         self.ensure_slot(
             slot_index,
-            frame.format.width,
-            frame.format.height,
+            render_width,
+            render_height,
             texture_format,
         )?;
         let copy_rgba = matches!(
@@ -566,21 +693,49 @@ impl GlesPresenter {
             self.upload_packed(slot_index, frame)?
         } else if frame.dmabuf.is_some() {
             if self.gles3 {
-                match self.import_dmabuf(slot_index, frame) {
+                let planes = if self.plane_import {
+                    self.import_dmabuf(slot_index, frame)
+                } else {
+                    Err(Error::unavailable(
+                        Subsystem::OpenGlEs,
+                        "per-plane DMA-BUF import already failed",
+                    ))
+                };
+                match planes {
                     Ok(sample) => sample,
-                    Err(error) => {
-                        static LOGGED_IMPORT: AtomicBool = AtomicBool::new(false);
-                        if LOGGED_IMPORT
-                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            eprintln!(
-                                "stream: GPU import of the decoder picture failed ({error}); copying it instead"
-                            );
+                    Err(plane_error) => match self.import_external_nv12(slot_index, frame) {
+                        Ok(()) => {
+                            self.plane_import = false;
+                            self.draw_external(slot_index)?;
+                            self.fence_slot(slot_index);
+                            self.generation = self.generation.wrapping_add(1);
+                            let resources = self.slots[slot_index].as_ref().expect("slot created");
+                            return Ok(RecordedGpuFrame {
+                                slot,
+                                generation: self.generation,
+                                image: u64::from(resources.output),
+                                image_view: 0,
+                                texture_format,
+                                width: render_width,
+                                height: render_height,
+                                timestamp_us: frame.timestamp_us,
+                                color_space,
+                            });
                         }
-                        let (luma, chroma) = map_linear_nv12(frame)?;
-                        self.upload_nv12_planes(slot_index, frame, &luma, &chroma)?
-                    }
+                        Err(external_error) => {
+                            static LOGGED_IMPORT: AtomicBool = AtomicBool::new(false);
+                            if LOGGED_IMPORT
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                eprintln!(
+                                    "stream: GPU imports failed (plane: {plane_error}; external NV12: {external_error}); copying it instead"
+                                );
+                            }
+                            let (luma, chroma) = map_linear_nv12(frame)?;
+                            self.upload_nv12_planes(slot_index, frame, &luma, &chroma)?
+                        }
+                    },
                 }
             } else {
                 let (luma, chroma) = map_linear_nv12(frame)?;
@@ -603,6 +758,7 @@ impl GlesPresenter {
             self.upload_cpu(slot_index, frame)?
         };
         self.draw(slot_index, frame, &sample, copy_rgba)?;
+        self.fence_slot(slot_index);
         self.generation = self.generation.wrapping_add(1);
         let resources = self.slots[slot_index].as_ref().expect("slot created");
         Ok(RecordedGpuFrame {
@@ -611,8 +767,8 @@ impl GlesPresenter {
             image: u64::from(resources.output),
             image_view: 0,
             texture_format,
-            width: frame.format.width,
-            height: frame.format.height,
+            width: render_width,
+            height: render_height,
             timestamp_us: frame.timestamp_us,
             color_space,
         })
@@ -650,10 +806,27 @@ impl GlesPresenter {
         let mut framebuffer = 0;
         let mut luma = 0;
         let mut chroma = 0;
+        let mut external_texture = 0;
         unsafe {
             (self.gl.gen_textures)(1, &mut output);
             (self.gl.gen_textures)(1, &mut luma);
             (self.gl.gen_textures)(1, &mut chroma);
+            if self.external_program.is_some() {
+                (self.gl.gen_textures)(1, &mut external_texture);
+                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, external_texture);
+                (self.gl.tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                (self.gl.tex_parameteri)(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                (self.gl.tex_parameteri)(
+                    GL_TEXTURE_EXTERNAL_OES,
+                    GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE,
+                );
+                (self.gl.tex_parameteri)(
+                    GL_TEXTURE_EXTERNAL_OES,
+                    GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE,
+                );
+            }
             (self.gl.gen_framebuffers)(1, &mut framebuffer);
             (self.gl.bind_texture)(GL_TEXTURE_2D, output);
             if let Some(tex_storage) = self.gles3.then_some(self.gl.tex_storage).flatten() {
@@ -695,10 +868,13 @@ impl GlesPresenter {
                 chroma,
                 luma_image: 0,
                 chroma_image: 0,
+                external_texture,
+                external_image: 0,
                 width,
                 height,
                 format,
                 retained: None,
+                fence: 0,
             });
             created?;
             return Err(Error::unavailable(
@@ -713,19 +889,18 @@ impl GlesPresenter {
             chroma,
             luma_image: 0,
             chroma_image: 0,
+            external_texture,
+            external_image: 0,
             width,
             height,
             format,
             retained: None,
+            fence: 0,
         });
         Ok(())
     }
 
-    fn import_dmabuf(
-        &mut self,
-        index: usize,
-        frame: &DecodedVideoFrame,
-    ) -> Result<PlaneSample> {
+    fn import_dmabuf(&mut self, index: usize, frame: &DecodedVideoFrame) -> Result<PlaneSample> {
         let dmabuf = frame.dmabuf.as_ref().expect("dma-buf frame");
         let (luma, chroma) = yuv_planes(dmabuf, frame.format.pixel_format)?;
         let coded_height =
@@ -798,6 +973,172 @@ impl GlesPresenter {
         Ok(sample)
     }
 
+    /// Imports the complete semi-planar NV12 image as EGL defines it. Several
+    /// embedded EGL drivers reject the R8 plane views used by the regular path
+    /// while supporting NV12 through GL_OES_EGL_image_external_essl3.
+    fn import_external_nv12(&mut self, index: usize, frame: &DecodedVideoFrame) -> Result<()> {
+        self.external_program.as_ref().ok_or_else(|| {
+            Error::unavailable(Subsystem::OpenGlEs, "external-YUV sampling is unavailable")
+        })?;
+        if frame.format.pixel_format != PixelFormat::Nv12 {
+            return Err(Error::unavailable(
+                Subsystem::OpenGlEs,
+                "external-YUV fallback currently supports NV12 only",
+            ));
+        }
+        let dmabuf = frame.dmabuf.as_ref().expect("DMA-BUF frame");
+        let (luma, chroma) = yuv_planes(dmabuf, PixelFormat::Nv12)?;
+        if luma.object_index != chroma.object_index {
+            return Err(Error::unavailable(
+                Subsystem::OpenGlEs,
+                "external NV12 import requires both planes in one DMA-BUF",
+            ));
+        }
+        let object = dmabuf
+            .objects
+            .get(luma.object_index)
+            .ok_or_else(|| Error::InvalidFormat("DMA-BUF plane object is missing".to_owned()))?;
+        let create = self.gl.create_image.ok_or_else(|| {
+            Error::unavailable(Subsystem::OpenGlEs, "eglCreateImageKHR is unavailable")
+        })?;
+        let display = unsafe { (self.gl.get_current_display)() };
+        if display.is_null() {
+            return Err(Error::unavailable(
+                Subsystem::OpenGlEs,
+                "EGL display is unavailable",
+            ));
+        }
+        let mut attrs = vec![
+            EGL_WIDTH,
+            frame.format.width as i32,
+            EGL_HEIGHT,
+            frame.format.height as i32,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            DRM_FORMAT_NV12 as i32,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            object.fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            i32::try_from(luma.offset).unwrap_or(i32::MAX),
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            i32::try_from(luma.pitch).unwrap_or(i32::MAX),
+            EGL_DMA_BUF_PLANE1_FD_EXT,
+            object.fd,
+            EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+            i32::try_from(chroma.offset).unwrap_or(i32::MAX),
+            EGL_DMA_BUF_PLANE1_PITCH_EXT,
+            i32::try_from(chroma.pitch).unwrap_or(i32::MAX),
+            EGL_YUV_COLOR_SPACE_HINT_EXT,
+            EGL_ITU_REC709_EXT,
+            EGL_SAMPLE_RANGE_HINT_EXT,
+            EGL_YUV_NARROW_RANGE_EXT,
+            EGL_YUV_CHROMA_HORIZONTAL_SITING_HINT_EXT,
+            EGL_YUV_CHROMA_SITING_0_EXT,
+            EGL_YUV_CHROMA_VERTICAL_SITING_HINT_EXT,
+            EGL_YUV_CHROMA_SITING_0_5_EXT,
+        ];
+        if object.format_modifier != DRM_FORMAT_MOD_INVALID
+            && self
+                .gl
+                .has_egl_extension(display, "EGL_EXT_image_dma_buf_import_modifiers")
+        {
+            attrs.extend([
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                object.format_modifier as u32 as i32,
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                (object.format_modifier >> 32) as u32 as i32,
+                EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+                object.format_modifier as u32 as i32,
+                EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+                (object.format_modifier >> 32) as u32 as i32,
+            ]);
+        }
+        attrs.push(EGL_NONE);
+        self.gl.clear_error();
+        let image = unsafe {
+            create(
+                display,
+                std::ptr::null_mut(),
+                EGL_LINUX_DMA_BUF_EXT,
+                std::ptr::null_mut(),
+                attrs.as_ptr(),
+            )
+        };
+        if image.is_null() {
+            let error = unsafe { (self.gl.get_egl_error)() };
+            return Err(Error::backend(
+                Subsystem::OpenGlEs,
+                format!("full NV12 eglCreateImageKHR failed ({error:#x})"),
+            ));
+        }
+        self.destroy_images_at(index);
+        let texture = self.slots[index]
+            .as_ref()
+            .expect("slot created")
+            .external_texture;
+        if texture == 0 {
+            unsafe {
+                if let Some(destroy) = self.gl.destroy_image {
+                    destroy(display, image);
+                }
+            }
+            return Err(Error::unavailable(
+                Subsystem::OpenGlEs,
+                "external texture object was not created",
+            ));
+        }
+        let target = self.gl.image_target.ok_or_else(|| {
+            Error::unavailable(
+                Subsystem::OpenGlEs,
+                "glEGLImageTargetTexture2DOES is unavailable",
+            )
+        })?;
+        unsafe {
+            (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, texture);
+            target(GL_TEXTURE_EXTERNAL_OES, image);
+        }
+        if let Err(error) = self
+            .gl
+            .check("bind full NV12 DMA-BUF as an external texture")
+        {
+            if let Some(destroy) = self.gl.destroy_image {
+                unsafe { destroy(display, image) };
+            }
+            return Err(error);
+        }
+        let slot = self.slots[index].as_mut().expect("slot created");
+        slot.external_image = image as usize;
+        slot.retained = Some(frame.clone());
+        static LOGGED_EXTERNAL: AtomicBool = AtomicBool::new(false);
+        if LOGGED_EXTERNAL
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            eprintln!("stream: imported decoder NV12 through an external EGL texture");
+        }
+        Ok(())
+    }
+
+    fn draw_external(&self, index: usize) -> Result<()> {
+        let program = self
+            .external_program
+            .as_ref()
+            .expect("external shader created");
+        let slot = self.slots[index].as_ref().expect("slot created");
+        self.gl.clear_error();
+        unsafe {
+            (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, slot.framebuffer);
+            (self.gl.viewport)(0, 0, slot.width as i32, slot.height as i32);
+            (self.gl.use_program)(program.name);
+            (self.gl.active_texture)(GL_TEXTURE0);
+            (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, slot.external_texture);
+            (self.gl.uniform_1i)(program.texture, 0);
+            (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
+            (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.use_program)(0);
+        }
+        self.gl.check("draw external NV12 video frame")
+    }
+
     fn create_image(
         &self,
         frame: &DmaBufFrame,
@@ -812,9 +1153,17 @@ impl GlesPresenter {
                 "eglCreateImageKHR is not available for DMA-BUF import",
             )
         })?;
-        let object = frame.objects.get(plane.object_index).ok_or_else(|| {
-            Error::InvalidFormat("DMA-BUF plane object is missing".to_owned())
-        })?;
+        let object = frame
+            .objects
+            .get(plane.object_index)
+            .ok_or_else(|| Error::InvalidFormat("DMA-BUF plane object is missing".to_owned()))?;
+        let display = unsafe { (self.gl.get_current_display)() };
+        if display.is_null() {
+            return Err(Error::unavailable(
+                Subsystem::OpenGlEs,
+                "EGL has no current display for DMA-BUF import",
+            ));
+        }
         let mut attribs = vec![
             EGL_WIDTH,
             width as i32,
@@ -829,7 +1178,11 @@ impl GlesPresenter {
             EGL_DMA_BUF_PLANE0_PITCH_EXT,
             i32::try_from(plane.pitch).unwrap_or(i32::MAX),
         ];
-        if object.format_modifier != DRM_FORMAT_MOD_INVALID {
+        if object.format_modifier != DRM_FORMAT_MOD_INVALID
+            && self
+                .gl
+                .has_egl_extension(display, "EGL_EXT_image_dma_buf_import_modifiers")
+        {
             attribs.extend([
                 EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
                 object.format_modifier as u32 as i32,
@@ -838,13 +1191,6 @@ impl GlesPresenter {
             ]);
         }
         attribs.push(EGL_NONE);
-        let display = unsafe { (self.gl.get_current_display)() };
-        if display.is_null() {
-            return Err(Error::unavailable(
-                Subsystem::OpenGlEs,
-                "EGL has no current display for DMA-BUF import",
-            ));
-        }
         let image = unsafe {
             create(
                 display,
@@ -893,11 +1239,7 @@ impl GlesPresenter {
         self.gl.check("bind the DMA-BUF as an OpenGL ES texture")
     }
 
-    fn upload_cpu(
-        &mut self,
-        index: usize,
-        frame: &DecodedVideoFrame,
-    ) -> Result<PlaneSample> {
+    fn upload_cpu(&mut self, index: usize, frame: &DecodedVideoFrame) -> Result<PlaneSample> {
         match frame.format.pixel_format {
             PixelFormat::Nv12 | PixelFormat::P010 => {
                 if frame.planes.len() != 2 {
@@ -968,7 +1310,11 @@ impl GlesPresenter {
             luma_texture,
             luma_internal,
             luma_format,
-            if p010 { GL_UNSIGNED_SHORT } else { GL_UNSIGNED_BYTE },
+            if p010 {
+                GL_UNSIGNED_SHORT
+            } else {
+                GL_UNSIGNED_BYTE
+            },
             frame.format.width,
             luma.rows as u32,
             luma.stride,
@@ -1002,7 +1348,11 @@ impl GlesPresenter {
                 chroma_texture,
                 chroma_internal,
                 chroma_format,
-                if p010 { GL_UNSIGNED_SHORT } else { GL_UNSIGNED_BYTE },
+                if p010 {
+                    GL_UNSIGNED_SHORT
+                } else {
+                    GL_UNSIGNED_BYTE
+                },
                 frame.format.width / 2,
                 chroma.rows as u32,
                 chroma.stride,
@@ -1019,11 +1369,7 @@ impl GlesPresenter {
         Ok(sample)
     }
 
-    fn upload_packed(
-        &mut self,
-        index: usize,
-        frame: &DecodedVideoFrame,
-    ) -> Result<PlaneSample> {
+    fn upload_packed(&mut self, index: usize, frame: &DecodedVideoFrame) -> Result<PlaneSample> {
         if frame.planes.len() != 1 {
             return Err(Error::InvalidFormat(
                 "packed RGB frames require one plane".to_owned(),
@@ -1156,9 +1502,15 @@ impl GlesPresenter {
         sample: &PlaneSample,
         copy_rgba: bool,
     ) -> Result<()> {
-        let (framebuffer, luma_texture, chroma_texture) = {
+        let (framebuffer, luma_texture, chroma_texture, output_width, output_height) = {
             let slot = self.slots[index].as_ref().expect("slot created");
-            (slot.framebuffer, slot.luma, slot.chroma)
+            (
+                slot.framebuffer,
+                slot.luma,
+                slot.chroma,
+                slot.width,
+                slot.height,
+            )
         };
         let matrix = match frame.format.color_matrix {
             ColorMatrix::Bt601 => 0,
@@ -1168,7 +1520,7 @@ impl GlesPresenter {
         self.gl.clear_error();
         unsafe {
             (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, framebuffer);
-            (self.gl.viewport)(0, 0, frame.format.width as i32, frame.format.height as i32);
+            (self.gl.viewport)(0, 0, output_width as i32, output_height as i32);
             (self.gl.use_program)(self.program.name);
             (self.gl.active_texture)(GL_TEXTURE0);
             (self.gl.bind_texture)(GL_TEXTURE_2D, luma_texture);
@@ -1190,14 +1542,7 @@ impl GlesPresenter {
                 (self.gl.enable_attrib)(0);
                 (self.gl.attrib_pointer)(0, 2, GL_FLOAT, 0, 16, std::ptr::null());
                 (self.gl.enable_attrib)(1);
-                (self.gl.attrib_pointer)(
-                    1,
-                    2,
-                    GL_FLOAT,
-                    0,
-                    16,
-                    std::ptr::without_provenance(8),
-                );
+                (self.gl.attrib_pointer)(1, 2, GL_FLOAT, 0, 16, std::ptr::without_provenance(8));
                 (self.gl.uniform_1f)(self.program.color_matrix, matrix as f32);
                 (self.gl.uniform_1f)(
                     self.program.full_range,
@@ -1208,10 +1553,7 @@ impl GlesPresenter {
                     },
                 );
                 (self.gl.uniform_1f)(self.program.sample_bits, sample.sample_bits as f32);
-                (self.gl.uniform_1f)(
-                    self.program.copy_rgba,
-                    if copy_rgba { 1.0 } else { 0.0 },
-                );
+                (self.gl.uniform_1f)(self.program.copy_rgba, if copy_rgba { 1.0 } else { 0.0 });
             }
             (self.gl.uniform_1f)(self.program.chroma_offset_x, sample.chroma_offset_x);
             (self.gl.uniform_1f)(
@@ -1234,6 +1576,55 @@ impl GlesPresenter {
         }
     }
 
+    /// Marks the end of the draw that just sampled this slot's images.
+    fn fence_slot(&mut self, index: usize) {
+        let (Some(create), Some(delete), Some(_)) = (
+            self.gl.fence_sync,
+            self.gl.delete_sync,
+            self.gl.client_wait_sync,
+        ) else {
+            return;
+        };
+        let Some(slot) = self.slots[index].as_mut() else {
+            return;
+        };
+        if slot.fence != 0 {
+            unsafe { delete(slot.fence as *mut c_void) };
+        }
+        slot.fence = unsafe { create(GL_SYNC_GPU_COMMANDS_COMPLETE, 0) } as usize;
+    }
+
+    fn delete_fence(&self, fence: usize) {
+        if fence == 0 {
+            return;
+        }
+        if let Some(delete) = self.gl.delete_sync {
+            unsafe { delete(fence as *mut c_void) };
+        }
+    }
+
+    /// Waits only for the draw that used the images about to be released
+    /// (normally several frames old, so already finished). Without a usable
+    /// fence it falls back to draining the whole GPU with glFinish.
+    fn wait_fence_or_finish(&self, fence: usize) {
+        if fence != 0 {
+            if let (Some(wait), Some(delete)) = (self.gl.client_wait_sync, self.gl.delete_sync) {
+                let status = unsafe {
+                    wait(
+                        fence as *mut c_void,
+                        GL_SYNC_FLUSH_COMMANDS_BIT,
+                        50_000_000,
+                    )
+                };
+                unsafe { delete(fence as *mut c_void) };
+                if status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED {
+                    return;
+                }
+            }
+        }
+        self.finish_gpu();
+    }
+
     fn destroy_one_image(&self, image: *mut c_void) {
         if image.is_null() {
             return;
@@ -1249,19 +1640,23 @@ impl GlesPresenter {
     }
 
     fn destroy_images_at(&mut self, index: usize) {
-        let (luma_image, chroma_image) = {
+        let (luma_image, chroma_image, external_image, retained, fence) = {
             let Some(slot) = self.slots[index].as_mut() else {
                 return;
             };
-            let images = (slot.luma_image, slot.chroma_image);
+            let images = (slot.luma_image, slot.chroma_image, slot.external_image);
             slot.luma_image = 0;
             slot.chroma_image = 0;
-            images
+            slot.external_image = 0;
+            // Keep the decoder buffer alive until the GPU is done with it.
+            (images.0, images.1, images.2, slot.retained.take(), std::mem::take(&mut slot.fence))
         };
-        if luma_image == 0 && chroma_image == 0 {
+        if luma_image == 0 && chroma_image == 0 && external_image == 0 {
+            self.delete_fence(fence);
             return;
         }
-        self.finish_gpu();
+        self.wait_fence_or_finish(fence);
+        drop(retained);
         let Some(destroy) = self.gl.destroy_image else {
             return;
         };
@@ -1269,7 +1664,7 @@ impl GlesPresenter {
         if display.is_null() {
             return;
         }
-        for image in [luma_image, chroma_image] {
+        for image in [luma_image, chroma_image, external_image] {
             if image != 0 {
                 unsafe { destroy(display, image as *mut c_void) };
             }
@@ -1277,18 +1672,19 @@ impl GlesPresenter {
     }
 
     fn destroy_images(&self, slot: &mut Slot) {
-        let pending = slot.luma_image != 0 || slot.chroma_image != 0;
+        let pending = slot.luma_image != 0 || slot.chroma_image != 0 || slot.external_image != 0;
         if pending {
             self.finish_gpu();
         }
         let Some(destroy) = self.gl.destroy_image else {
             slot.luma_image = 0;
             slot.chroma_image = 0;
+            slot.external_image = 0;
             return;
         };
         let display = unsafe { (self.gl.get_current_display)() };
         if !display.is_null() {
-            for image in [slot.luma_image, slot.chroma_image] {
+            for image in [slot.luma_image, slot.chroma_image, slot.external_image] {
                 if image != 0 {
                     unsafe { destroy(display, image as *mut c_void) };
                 }
@@ -1296,10 +1692,12 @@ impl GlesPresenter {
         }
         slot.luma_image = 0;
         slot.chroma_image = 0;
+        slot.external_image = 0;
     }
 
     fn destroy_slot(&self, mut slot: Slot) {
         self.destroy_images(&mut slot);
+        self.delete_fence(std::mem::take(&mut slot.fence));
         if !self.gl.context_is_current() {
             return;
         }
@@ -1312,6 +1710,9 @@ impl GlesPresenter {
             }
             if slot.chroma != 0 {
                 (self.gl.delete_textures)(1, &slot.chroma);
+            }
+            if slot.external_texture != 0 {
+                (self.gl.delete_textures)(1, &slot.external_texture);
             }
             if slot.framebuffer != 0 {
                 (self.gl.delete_framebuffers)(1, &slot.framebuffer);
@@ -1329,6 +1730,9 @@ impl GlesPresenter {
                 unsafe { (self.gl.delete_buffers)(1, &self.program.vertex_buffer) };
             }
             unsafe { (self.gl.delete_program)(self.program.name) };
+            if let Some(program) = &self.external_program {
+                unsafe { (self.gl.delete_program)(program.name) };
+            }
         }
         let slots: Vec<_> = self.slots.drain(..).flatten().collect();
         for slot in slots {
@@ -1341,6 +1745,54 @@ impl Drop for GlesPresenter {
     fn drop(&mut self) {
         self.destroy();
     }
+}
+
+fn render_limit_from_config() -> Option<(u32, u32)> {
+    // This limit sizes the GLES output texture only. It does not change the
+    // negotiated stream FPS, encoded resolution, or decoder input workload.
+    const DEFAULT: (u32, u32) = (640, 480);
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("stream.json")));
+    let Some(path) = path else {
+        return Some(DEFAULT);
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Some(DEFAULT);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Some(DEFAULT);
+    };
+    let Some(resolution) = value.get("renderResolution").and_then(|value| value.as_str()) else {
+        return Some(DEFAULT);
+    };
+    if resolution.eq_ignore_ascii_case("native") {
+        return None;
+    }
+    let Some((width, height)) = resolution.split_once('x') else {
+        return Some(DEFAULT);
+    };
+    match (width.parse::<u32>(), height.parse::<u32>()) {
+        (Ok(width), Ok(height)) if width >= 2 && height >= 2 => {
+            Some((width & !1, height & !1))
+        }
+        _ => Some(DEFAULT),
+    }
+}
+
+fn render_extent(width: u32, height: u32, limit: Option<(u32, u32)>) -> (u32, u32) {
+    let Some((max_width, max_height)) = limit else {
+        return (width, height);
+    };
+    if width <= max_width && height <= max_height {
+        return (width, height);
+    }
+    let scale = (max_width as f64 / width as f64)
+        .min(max_height as f64 / height as f64)
+        .min(1.0);
+    let output_width = ((width as f64 * scale).floor() as u32 & !1).max(2);
+    let output_height = ((height as f64 * scale).floor() as u32 & !1).max(2);
+    (output_width, output_height)
 }
 
 fn output_format(
@@ -1384,7 +1836,10 @@ fn conversion_inputs(frame: &DecodedVideoFrame, coded_height: u32) -> PlaneSampl
     }
 }
 
-fn yuv_planes(frame: &DmaBufFrame, pixel_format: PixelFormat) -> Result<(DmaBufPlane, DmaBufPlane)> {
+fn yuv_planes(
+    frame: &DmaBufFrame,
+    pixel_format: PixelFormat,
+) -> Result<(DmaBufPlane, DmaBufPlane)> {
     if !matches!(pixel_format, PixelFormat::Nv12 | PixelFormat::P010) {
         return Err(Error::unavailable(
             Subsystem::OpenGlEs,
@@ -1393,13 +1848,23 @@ fn yuv_planes(frame: &DmaBufFrame, pixel_format: PixelFormat) -> Result<(DmaBufP
     }
     let p010 = pixel_format == PixelFormat::P010;
     let (luma, chroma) = if frame.layers.len() == 1
-        && frame.layers[0].format == if p010 { DRM_FORMAT_P010 } else { DRM_FORMAT_NV12 }
+        && frame.layers[0].format
+            == if p010 {
+                DRM_FORMAT_P010
+            } else {
+                DRM_FORMAT_NV12
+            }
         && frame.layers[0].planes.len() >= 2
     {
         (frame.layers[0].planes[0], frame.layers[0].planes[1])
     } else if frame.layers.len() >= 2
         && frame.layers[0].format == if p010 { DRM_FORMAT_R16 } else { DRM_FORMAT_R8 }
-        && frame.layers[1].format == if p010 { DRM_FORMAT_GR1616 } else { DRM_FORMAT_GR88 }
+        && frame.layers[1].format
+            == if p010 {
+                DRM_FORMAT_GR1616
+            } else {
+                DRM_FORMAT_GR88
+            }
         && !frame.layers[0].planes.is_empty()
         && !frame.layers[1].planes.is_empty()
     {
@@ -1608,7 +2073,11 @@ fn link_program(gl: &Gl, gles3: bool) -> Result<Program> {
     let vertex = compile_shader(
         gl,
         GL_VERTEX_SHADER,
-        if gles3 { VERTEX_SHADER } else { ES2_VERTEX_SHADER },
+        if gles3 {
+            VERTEX_SHADER
+        } else {
+            ES2_VERTEX_SHADER
+        },
     )?;
     let fragment = compile_shader(
         gl,
@@ -1711,6 +2180,44 @@ fn link_program(gl: &Gl, gles3: bool) -> Result<Program> {
     Ok(program)
 }
 
+fn link_external_program(gl: &Gl) -> Result<ExternalProgram> {
+    let vertex = compile_shader(gl, GL_VERTEX_SHADER, VERTEX_SHADER)?;
+    let fragment = match compile_shader(gl, GL_FRAGMENT_SHADER, EXTERNAL_FRAGMENT_SHADER) {
+        Ok(shader) => shader,
+        Err(error) => {
+            unsafe { (gl.delete_shader)(vertex) };
+            return Err(error);
+        }
+    };
+    let name = unsafe { (gl.create_program)() };
+    unsafe {
+        (gl.attach_shader)(name, vertex);
+        (gl.attach_shader)(name, fragment);
+        (gl.link_program)(name);
+        (gl.delete_shader)(vertex);
+        (gl.delete_shader)(fragment);
+    }
+    let mut linked = 0;
+    unsafe { (gl.get_programiv)(name, GL_LINK_STATUS, &mut linked) };
+    if linked != 1 {
+        let log = program_log(gl, name);
+        unsafe { (gl.delete_program)(name) };
+        return Err(Error::backend(
+            Subsystem::OpenGlEs,
+            format!("external-YUV shader link failed: {log}"),
+        ));
+    }
+    let texture = unsafe { (gl.get_uniform)(name, b"video_texture\0".as_ptr().cast()) };
+    if texture < 0 {
+        unsafe { (gl.delete_program)(name) };
+        return Err(Error::backend(
+            Subsystem::OpenGlEs,
+            "external-YUV shader is missing its texture uniform",
+        ));
+    }
+    Ok(ExternalProgram { name, texture })
+}
+
 fn compile_shader(gl: &Gl, kind: u32, source: &str) -> Result<u32> {
     let shader = unsafe { (gl.create_shader)(kind) };
     let text = source.as_ptr().cast();
@@ -1753,7 +2260,9 @@ fn shader_log(gl: &Gl, shader: u32) -> String {
             bytes.as_mut_ptr().cast(),
         );
     }
-    String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_owned()
+    String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\0')
+        .to_owned()
 }
 
 fn program_log(gl: &Gl, program: u32) -> String {
@@ -1771,7 +2280,9 @@ fn program_log(gl: &Gl, program: u32) -> String {
             bytes.as_mut_ptr().cast(),
         );
     }
-    String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_owned()
+    String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\0')
+        .to_owned()
 }
 
 fn open_library(names: &[&str]) -> Result<Library> {
@@ -1810,5 +2321,7 @@ fn proc_symbol<T>(get_proc: &EglProc, name: &[u8]) -> Option<T> {
 }
 
 fn symbol_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name).trim_end_matches('\0').to_owned()
+    String::from_utf8_lossy(name)
+        .trim_end_matches('\0')
+        .to_owned()
 }

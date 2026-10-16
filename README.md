@@ -23,7 +23,27 @@ Download the release ZIP, extract it into the `ports` folder, then launch OpenNO
 ## Shortcuts
 **FN** or **Select + X** opens the session menu. **Stats** at the bottom of that menu shows FPS and Mbps on the picture.
 
+Choose **Mouse mode** from the session menu to control the pointer with the sticks. **R2** is left click and **L2** is right click. Press **FN** to leave mouse mode.
+
 **Start** and **Select** together quit OpenNOW while in menu, it does not apply while in a session
+
+## Controls
+
+| Button | Library / menus | In game |
+| :--- | :--- | :--- |
+| D-pad / Left Stick | Navigate; hold to repeat | D-pad / Left Stick |
+| A | Select, play, or type the selected key | A |
+| B | Back or cancel | B |
+| X | Open the context menu or search keyboard, depending on the screen | X |
+| Y | — | Y |
+| L1 / R1 | — | L1 / R1 |
+| L2 / R2 | — | L2 / R2; in Mouse mode, R2 is left click and L2 is right click |
+| Start | — | Start |
+| Select | Open the selected game's menu | Select |
+| L3 / R3 | — | L3 / R3 |
+| Start + Select | Hold to quit OpenNOW | Passed to the game |
+
+The Xbox / Nintendo layout setting controls how face buttons are mapped in game.
 
 ## Build from source
 The scripts build the R36S port only. Both produce `builds/r36s/dist`.

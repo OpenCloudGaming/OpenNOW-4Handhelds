@@ -15,6 +15,22 @@ pub(crate) struct VideoPacket {
 pub(crate) struct VideoPush {
     pub dropped: usize,
     pub request_keyframe: bool,
+    pub chain_break: Option<VideoChainBreak>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VideoChainBreak {
+    TransportDiscontinuity,
+    QueueOverflow,
+}
+
+impl VideoChainBreak {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportDiscontinuity => "incoming frame marked discontinuous",
+            Self::QueueOverflow => "local compressed-video queue reached capacity",
+        }
+    }
 }
 
 struct State {
@@ -62,6 +78,13 @@ impl VideoQueue {
             return Err(());
         }
         let mut dropped = 0;
+        let chain_break = if !state.waiting_for_keyframe && !frame.contiguous {
+            Some(VideoChainBreak::TransportDiscontinuity)
+        } else if !state.waiting_for_keyframe && state.frames.len() == self.capacity {
+            Some(VideoChainBreak::QueueOverflow)
+        } else {
+            None
+        };
         if !state.waiting_for_keyframe && (!frame.contiguous || state.frames.len() == self.capacity)
         {
             if frame.contiguous
@@ -73,6 +96,7 @@ impl VideoQueue {
                 return Ok(VideoPush {
                     dropped: 1,
                     request_keyframe: true,
+                    chain_break,
                 });
             }
             dropped += Self::invalidate_locked(&mut state);
@@ -83,6 +107,7 @@ impl VideoQueue {
             return Ok(VideoPush {
                 dropped: dropped + 1,
                 request_keyframe,
+                chain_break,
             });
         }
         if state.waiting_for_keyframe && !state.frames.is_empty() {
@@ -103,6 +128,7 @@ impl VideoQueue {
         Ok(VideoPush {
             dropped,
             request_keyframe: false,
+            chain_break: None,
         })
     }
 

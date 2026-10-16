@@ -460,6 +460,7 @@ impl MppDecoder {
         let width = unsafe { (self.lib.mpp_frame_get_width)(frame) };
         let height = unsafe { (self.lib.mpp_frame_get_height)(frame) };
         let buffer_size = unsafe { (self.lib.mpp_frame_get_buf_size)(frame) };
+        let output_format = unsafe { (self.lib.mpp_frame_get_fmt)(frame) };
         if width == 0 || height == 0 || buffer_size == 0 {
             return Err(Error::backend(
                 Subsystem::V4l2,
@@ -549,7 +550,7 @@ impl MppDecoder {
             self.pending_format_change = Some(self.format);
         }
         eprintln!(
-            "stream: MPP output NV12 {width}x{height}, buffer {buffer_size} bytes"
+            "stream: MPP output fmt={output_format:#010x} NV12 {width}x{height}, buffer {buffer_size} bytes"
         );
         Ok(())
     }
@@ -604,10 +605,12 @@ impl MppDecoder {
                 let hor_stride = unsafe { (self.lib.mpp_frame_get_hor_stride)(mpp_frame) } as usize;
                 let ver_stride = unsafe { (self.lib.mpp_frame_get_ver_stride)(mpp_frame) } as usize;
                 let buf_size = unsafe { (self.lib.mpp_frame_get_buf_size)(mpp_frame) };
+                let mpp_format = unsafe { (self.lib.mpp_frame_get_fmt)(mpp_frame) };
                 let pts = unsafe { (self.lib.mpp_frame_get_pts)(mpp_frame) };
                 export_dmabuf(
                     Arc::clone(&self.lib),
                     buffer,
+                    mpp_format,
                     width,
                     height,
                     hor_stride,
@@ -928,6 +931,7 @@ fn copy_nv12(
 fn export_dmabuf(
     lib: Arc<MppLibrary>,
     buffer: MppBuffer,
+    mpp_format: u32,
     width: usize,
     height: usize,
     hor_stride: usize,
@@ -960,12 +964,23 @@ fn export_dmabuf(
     }
     let reported = buffer_size(lib.as_ref(), buffer, buf_size);
     let size = reported.max(needed);
+    let layout_flags = mpp_format & (MPP_FRAME_FBC_MASK | MPP_FRAME_TILE_FLAG);
+    let format_modifier = if mpp_format & MPP_FRAME_FMT_MASK == MPP_FMT_YUV420SP
+        && layout_flags == 0
+    {
+        // MPP reports the storage layout in MppFrameFormat's FBC/tile flags.
+        // Only declare linear when the frame is raster NV12; EGL drivers often
+        // reject an implicit modifier for Rockchip's DRM buffer pool.
+        0
+    } else {
+        0x00ff_ffff_ffff_ffff
+    };
     let owner = HeldMppBuffer { lib, buffer: buffer as usize, fd: shared };
     let dmabuf = Arc::new(DmaBufFrame::new(
         vec![DmaBufObject {
             fd: shared,
             size,
-            format_modifier: 0x00ff_ffff_ffff_ffff,
+            format_modifier,
         }],
         vec![DmaBufLayer {
             format: u32::from_le_bytes(*b"NV12"),

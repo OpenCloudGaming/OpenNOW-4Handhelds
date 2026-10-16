@@ -52,6 +52,9 @@ pub const MPP_FRAME_LIMIT: i32 = 24;
 
 // MppFrameFormat
 pub const MPP_FMT_YUV420SP: u32 = 0; // NV12
+pub const MPP_FRAME_FMT_MASK: u32 = 0x000f_ffff;
+pub const MPP_FRAME_FBC_MASK: u32 = 0x00f0_0000;
+pub const MPP_FRAME_TILE_FLAG: u32 = 0x0200_0000;
 pub const MPP_FMT_YUV420SP_10BIT: u32 = 1; // P010
 pub const MPP_FMT_YUV422SP: u32 = 2;
 pub const MPP_FMT_YUV420P: u32 = 4; // I420

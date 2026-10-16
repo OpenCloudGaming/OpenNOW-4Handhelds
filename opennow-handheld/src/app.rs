@@ -151,6 +151,10 @@ pub struct App {
     /// Select and X are both held, so the session-menu chord has already fired.
     session_chord: bool,
     show_stats: bool,
+    /// Frames handed to the handheld renderer per second (distinct from network ingest FPS).
+    stream_display_fps: Option<f64>,
+    stream_display_window: Instant,
+    stream_display_frames: u64,
     stream_fps: Option<f64>,
     stream_mbps: Option<f64>,
     stream_ping_ms: Option<f64>,
@@ -260,6 +264,9 @@ impl App {
             pad_x: false,
             session_chord: false,
             show_stats: false,
+            stream_display_fps: None,
+            stream_display_window: Instant::now(),
+            stream_display_frames: 0,
             stream_fps: None,
             stream_mbps: None,
             stream_ping_ms: None,
@@ -1650,6 +1657,9 @@ fn mouse_deflection(value: i16) -> f32 {
         self.play_selected = false;
         self.return_to_store = from_store;
         self.stream_fps = None;
+        self.stream_display_fps = None;
+        self.stream_display_window = Instant::now();
+        self.stream_display_frames = 0;
         self.stream_mbps = None;
         self.stream_ping_ms = None;
         let profile = self.profile.clone();
@@ -2081,6 +2091,13 @@ fn mouse_deflection(value: i16) -> f32 {
                 } else if !covered {
                     if let Some(picture) = self.stream.as_mut().and_then(NativeStream::picture) {
                         self.stream_frame = Some((picture.texture, picture.width, picture.height));
+                        self.stream_display_frames = self.stream_display_frames.saturating_add(1);
+                        let elapsed = self.stream_display_window.elapsed();
+                        if elapsed >= Duration::from_secs(1) {
+                            self.stream_display_fps = Some(self.stream_display_frames as f64 / elapsed.as_secs_f64());
+                            self.stream_display_frames = 0;
+                            self.stream_display_window = Instant::now();
+                        }
                     }
                 }
                 if let Some((texture, width, height)) = self.stream_frame {
@@ -2098,7 +2115,7 @@ fn mouse_deflection(value: i16) -> f32 {
             theme::draw_session_menu(painter, self.session_menu_index as usize);
         }
         if self.show_stats && matches!(self.screen, Screen::Stream) {
-            draw_stream_stats(painter, self.stream_fps, self.stream_mbps, self.stream_ping_ms);
+            draw_stream_stats(painter, self.stream_fps, self.stream_display_fps, self.stream_mbps, self.stream_ping_ms);
         }
         if self.mouse_mode {
             let x = self.mouse_x - 7.0;
@@ -2160,11 +2177,12 @@ fn owned_variant_ids(game: &Value) -> Vec<String> {
 
 const INSET_X: f32 = 32.0;
 
-fn draw_stream_stats(painter: &mut Painter, fps: Option<f64>, mbps: Option<f64>, ping_ms: Option<f64>) {
-    let fps = fps.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
+fn draw_stream_stats(painter: &mut Painter, incoming_fps: Option<f64>, displayed_fps: Option<f64>, mbps: Option<f64>, ping_ms: Option<f64>) {
+    let incoming_fps = incoming_fps.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
+    let displayed_fps = displayed_fps.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
     let mbps = mbps.map(|value| format!("{value:.1}")).unwrap_or_else(|| "--".into());
     let ping_ms = ping_ms.map(|value| format!("{value:.0}")).unwrap_or_else(|| "--".into());
-    let text = format!("FPS: {fps}    MBPS: {mbps}    PING: {ping_ms} ms");
+    let text = format!("IN: {incoming_fps}    DRAW: {displayed_fps}    MBPS: {mbps}    PING: {ping_ms} ms");
     let width = painter.measure(&text, 14.0, Weight::Bold) + 20.0;
     painter.fill(12.0, 12.0, width, 26.0, 8.0, crate::gl::with_alpha(PANEL, 0.88));
     painter.text(22.0, 17.0, 14.0, Weight::Bold, &text, TEXT);

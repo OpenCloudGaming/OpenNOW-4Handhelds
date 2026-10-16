@@ -812,14 +812,20 @@ impl MediaSink {
             return PushOutcome::Closed;
         };
         if result.request_keyframe {
+            let reason = result
+                .chain_break
+                .map(crate::video_queue::VideoChainBreak::as_str)
+                .unwrap_or("waiting for a fresh keyframe");
             opennow_streamer_protocol::log::log_async(
                 "WARN",
                 "video-reference",
-                "compressed chain invalidated; waiting for a fresh keyframe",
+                &format!(
+                    "compressed chain invalidated ({reason}); waiting for a fresh keyframe"
+                ),
             );
             let _ = self.shared.feedback.send(MediaFeedback::RequestKeyframe {
                 mid,
-                reason: "compressed video discontinuity or queue overflow".to_owned(),
+                reason: reason.to_owned(),
             });
         }
         if result.dropped > 0 {

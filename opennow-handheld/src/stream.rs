@@ -15,6 +15,10 @@ const GRAPHICS_CONTEXT_VERSION: u32 = 3;
 const RENDER_COMMAND_VERSION: u32 = 3;
 const GRAPHICS_API_OPENGL_ES: u32 = 4;
 const PROTOCOL_VERSION: u64 = 7;
+// All embedded Linux video publishers currently allocate at least four GLES
+// slots. Rotating them avoids reusing one DMA-BUF import every frame, which
+// otherwise forces the presenter to drain the GPU before releasing it.
+const GLES_FRAME_SLOTS: u32 = 4;
 
 type Status = i32;
 type Callback = unsafe extern "C" fn(*const u8, usize, *mut c_void);
@@ -121,6 +125,7 @@ pub struct NativeStream {
     /// Kept alive because the callbacks borrow the heap allocation.
     _outgoing: Box<Sender<Value>>,
     graphics_ready: bool,
+    next_frame_slot: u32,
     held: Option<HeldFrame>,
     pad_buttons: u16,
     pad_left: (i16, i16),
@@ -171,6 +176,7 @@ impl NativeStream {
             messages,
             _outgoing: outgoing,
             graphics_ready: false,
+            next_frame_slot: 0,
             held: None,
             pad_buttons: 0,
             pad_left: (0, 0),
@@ -255,6 +261,7 @@ impl NativeStream {
                 eprintln!("stream: graphics context rejected ({status})");
                 return None;
             }
+            eprintln!("stream: GLES frame output rotates across {GLES_FRAME_SLOTS} slots");
             self.graphics_ready = true;
         }
         let mut frame = std::ptr::null_mut();
@@ -267,12 +274,13 @@ impl NativeStream {
             version: RENDER_COMMAND_VERSION,
             struct_size: size_of::<RecordCommand>(),
             command_buffer: 1 as *mut c_void,
-            frame_slot: 0,
+            frame_slot: self.next_frame_slot,
             upscale_width: 0,
             upscale_height: 0,
             upscale_sharpness: 0,
             upscale_denoise: 0,
         };
+        self.next_frame_slot = (self.next_frame_slot + 1) % GLES_FRAME_SLOTS;
         let mut recorded = RecordedFrame::default();
         let status = unsafe { (self.api.record_frame)(self.handle, frame, &command, &mut recorded) };
         if status != 0 || recorded.resource == 0 {
