@@ -13,7 +13,7 @@ Port of the open source GeForce NOW custom client [OpenNOW](https://github.com/O
 | ![Fortnite screenshot](./screenshots/screenfortnite.png) | ![Tomb Raider screenshot](./screenshots/screentombraider.png) |
 
 ## How to install
-Download latest release, extract the contents into the ports folder, on the handheld run OpenNOW, enjoy !
+Download the release ZIP, extract it into the `ports` folder, then launch OpenNOW on your handheld.
 ## What you can do
 - Sign in with a GeForce NOW account and start playing games from your library.
 - Browse the store section and add games to your library.
