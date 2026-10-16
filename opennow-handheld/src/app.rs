@@ -527,7 +527,8 @@ impl App {
             }
             return;
         }
-        if button == 4 || button == 12 {
+        let select_button = if raw_joystick { 12 } else { 4 };
+        if button == select_button {
             self.pad_select = pressed;
         }
         let x_button = if self.profile.xbox_layout { 3 } else { 2 };
