@@ -44,7 +44,14 @@ struct NavRepeat {
 
 impl NavRepeat {
     fn new() -> Self {
-        Self { dpad: [false; 4], hat: [false; 4], stick_x: 0, stick_y: 0, confirm: false, next: Instant::now() }
+        Self {
+            dpad: [false; 4],
+            hat: [false; 4],
+            stick_x: 0,
+            stick_y: 0,
+            confirm: false,
+            next: Instant::now(),
+        }
     }
 
     fn set_button(&mut self, index: usize, held: bool) {
@@ -59,7 +66,12 @@ impl NavRepeat {
     }
 
     fn set_hat(&mut self, value: u8) {
-        let next = [value & 1 != 0, value & 4 != 0, value & 8 != 0, value & 2 != 0];
+        let next = [
+            value & 1 != 0,
+            value & 4 != 0,
+            value & 8 != 0,
+            value & 2 != 0,
+        ];
         if self.hat == next {
             return;
         }
@@ -116,13 +128,15 @@ impl NavRepeat {
     }
 
     fn held(&self, index: usize) -> bool {
-        self.dpad[index] || self.hat[index] || match index {
-            0 => self.stick_y < 0,
-            1 => self.stick_y > 0,
-            2 => self.stick_x < 0,
-            3 => self.stick_x > 0,
-            _ => false,
-        }
+        self.dpad[index]
+            || self.hat[index]
+            || match index {
+                0 => self.stick_y < 0,
+                1 => self.stick_y > 0,
+                2 => self.stick_x < 0,
+                3 => self.stick_x > 0,
+                _ => false,
+            }
     }
 }
 
@@ -187,6 +201,7 @@ fn key_action(symbol: i32) -> Option<Action> {
         13 | 32 => Some(Action::Confirm),
         8 => Some(Action::Back),
         120 => Some(Action::Options),
+        121 => Some(Action::Y),
         27 => Some(Action::Escape),
         _ => None,
     }
@@ -194,11 +209,16 @@ fn key_action(symbol: i32) -> Option<Action> {
 
 fn controller_action(button: u8, pressed: bool, xbox_layout: bool) -> Option<Action> {
     // Nintendo: A east, B south, X top. Xbox: A south, B east, X on the printed Y.
-    let (confirm, back, options) = if xbox_layout { (0, 1, 3) } else { (1, 0, 2) };
+    let (confirm, back, options, y) = if xbox_layout {
+        (0, 1, 3, 2)
+    } else {
+        (1, 0, 2, 3)
+    };
     match (button, pressed) {
         (button, true) if button == confirm => Some(Action::Confirm),
         (button, true) if button == back => Some(Action::Back),
         (button, true) if button == options => Some(Action::Options),
+        (button, true) if button == y => Some(Action::Y),
         (4, held) => Some(Action::Select(held)),
         (6, held) => Some(Action::Start(held)),
         (11, true) => Some(Action::Up),
@@ -213,11 +233,16 @@ fn controller_action(button: u8, pressed: bool, xbox_layout: bool) -> Option<Act
 /// layout. The System panel shows raw indices when a device differs.
 fn raw_button_action(button: u8, pressed: bool, xbox_layout: bool) -> Option<Action> {
     // Raw indices already follow the printed Nintendo labels. Xbox swaps them.
-    let (confirm, back, options) = if xbox_layout { (0, 1, 3) } else { (1, 0, 2) };
+    let (confirm, back, options, y) = if xbox_layout {
+        (0, 1, 3, 2)
+    } else {
+        (1, 0, 2, 3)
+    };
     match (button, pressed) {
         (button, true) if button == confirm => Some(Action::Confirm),
         (button, true) if button == back => Some(Action::Back),
         (button, true) if button == options => Some(Action::Options),
+        (button, true) if button == y => Some(Action::Y),
         (8, true) => Some(Action::Up),
         (9, true) => Some(Action::Down),
         (10, true) => Some(Action::Left),
@@ -240,7 +265,13 @@ fn hat_action(value: u8) -> Option<Action> {
 
 /// Maps an event to an action and records it for the System panel and log.
 /// Returns `None` for the window-close request, which quits at once.
-fn translate(event: Event, stick: &mut Stick, repeat: &mut NavRepeat, status: &mut Status, xbox_layout: bool) -> Option<Option<Action>> {
+fn translate(
+    event: Event,
+    stick: &mut Stick,
+    repeat: &mut NavRepeat,
+    status: &mut Status,
+    xbox_layout: bool,
+) -> Option<Option<Action>> {
     let action = match event {
         Event::Quit => return None,
         Event::Key(symbol) => {
@@ -260,7 +291,11 @@ fn translate(event: Event, stick: &mut Stick, repeat: &mut NavRepeat, status: &m
             }
             controller_action(button, pressed, xbox_layout)
         }
-        Event::JoyButton { which, button, pressed } => {
+        Event::JoyButton {
+            which,
+            button,
+            pressed,
+        } => {
             let confirm_button = if xbox_layout { 0 } else { 1 };
             if button == confirm_button {
                 repeat.set_confirm(pressed);
@@ -308,12 +343,18 @@ struct Options {
 /// `--seconds N` quits after N seconds. Handhelds default to fullscreen and
 /// desktops to a 960×720 window; `--fullscreen` and `--window` override that.
 fn parse_options() -> Options {
-    let mut options = Options { limit: None, windowed: !cfg!(target_os = "linux") };
+    let mut options = Options {
+        limit: None,
+        windowed: !cfg!(target_os = "linux"),
+    };
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--seconds" => {
-                options.limit = arguments.next().and_then(|value| value.parse().ok()).map(Duration::from_secs);
+                options.limit = arguments
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .map(Duration::from_secs);
             }
             "--window" => options.windowed = true,
             "--fullscreen" => options.windowed = false,
@@ -329,10 +370,16 @@ fn run() -> Result<(), String> {
     sdl.init()?;
     let driver = sdl.video_driver();
     eprintln!("video driver: {driver}");
-    let window = sdl.create_gl_window(c"OpenNOW", options.windowed.then_some((960, 720)))?;
+    let mut window = sdl.create_gl_window(c"OpenNOW", options.windowed.then_some((960, 720)))?;
+    theme::set_canvas_for_display(window.width, window.height);
     let gl = Gl::load(|name| sdl.gl_proc(name))?;
     let renderer = gl.string(gl::RENDERER);
-    eprintln!("gl: {} | {} | {}", gl.string(gl::VENDOR), renderer, gl.string(gl::VERSION));
+    eprintln!(
+        "gl: {} | {} | {}",
+        gl.string(gl::VENDOR),
+        renderer,
+        gl.string(gl::VERSION)
+    );
     let mut painter = Painter::new(gl)?;
     let mut app = App::new();
     let mut vsync = sdl.set_vsync(app.vsync_enabled());
@@ -360,13 +407,23 @@ fn run() -> Result<(), String> {
                 status.devices.push(description);
             }
             match &event {
-                Event::ControllerButton { button, pressed } => app.pad_button(*button, *pressed, false),
+                Event::ControllerButton { button, pressed } => {
+                    app.pad_button(*button, *pressed, false)
+                }
                 Event::ControllerAxis { axis, value } => app.pad_axis(*axis, *value),
-                Event::JoyButton { button, pressed, .. } => app.pad_button(*button, *pressed, true),
+                Event::JoyButton {
+                    button, pressed, ..
+                } => app.pad_button(*button, *pressed, true),
                 Event::JoyAxis { axis, value, .. } => app.pad_axis(*axis, *value),
                 _ => {}
             }
-            match translate(event, &mut stick, &mut repeat, &mut status, app.xbox_layout()) {
+            match translate(
+                event,
+                &mut stick,
+                &mut repeat,
+                &mut status,
+                app.xbox_layout(),
+            ) {
                 None => break 'running,
                 Some(Some(action)) => app.act(action, &status),
                 Some(None) => {}
@@ -381,18 +438,29 @@ fn run() -> Result<(), String> {
                 app.repeat_keyboard_delete();
             }
         }
-        if options.limit.is_some_and(|limit| started.elapsed() >= limit) {
+        if options
+            .limit
+            .is_some_and(|limit| started.elapsed() >= limit)
+        {
             break;
         }
 
         let now = Instant::now();
+        if sdl.refresh_drawable_size(&mut window) {
+            status.resolution = format!("{} × {}", window.width, window.height);
+        }
+        theme::set_canvas_for_display(window.width, window.height);
         app.update(now - last_frame, &mut painter);
         if let Some(enabled) = app.take_vsync_change() {
             vsync = sdl.set_vsync(enabled);
             eprintln!("vsync: {}", if enabled { "on" } else { "off" });
         }
         last_frame = now;
-        painter.begin((window.width, window.height), theme::CANVAS, theme::BACKGROUND);
+        painter.begin(
+            (window.width, window.height),
+            theme::canvas(),
+            theme::BACKGROUND,
+        );
         app.draw(&mut painter, &status);
         painter.end();
         app.release_picture();

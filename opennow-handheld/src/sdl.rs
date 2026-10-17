@@ -12,6 +12,7 @@ const INIT_EVENTS: u32 = 0x4000;
 const WINDOW_FULLSCREEN: u32 = 0x1;
 const WINDOW_OPENGL: u32 = 0x2;
 const WINDOW_SHOWN: u32 = 0x4;
+const WINDOW_RESIZABLE: u32 = 0x20;
 const WINDOWPOS_CENTERED: c_int = 0x2FFF_0000;
 
 const GL_DOUBLEBUFFER: c_int = 5;
@@ -62,11 +63,28 @@ impl RawEvent {
 pub enum Event {
     Quit,
     Key(i32),
-    ControllerButton { button: u8, pressed: bool },
-    ControllerAxis { axis: u8, value: i16 },
-    JoyButton { which: i32, button: u8, pressed: bool },
-    JoyHat { which: i32, value: u8 },
-    JoyAxis { which: i32, axis: u8, value: i16 },
+    ControllerButton {
+        button: u8,
+        pressed: bool,
+    },
+    ControllerAxis {
+        axis: u8,
+        value: i16,
+    },
+    JoyButton {
+        which: i32,
+        button: u8,
+        pressed: bool,
+    },
+    JoyHat {
+        which: i32,
+        value: u8,
+    },
+    JoyAxis {
+        which: i32,
+        axis: u8,
+        value: i16,
+    },
     Other,
 }
 
@@ -118,7 +136,9 @@ fn text(pointer: *const c_char) -> String {
     if pointer.is_null() {
         return String::new();
     }
-    unsafe { CStr::from_ptr(pointer) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl Sdl {
@@ -130,7 +150,11 @@ impl Sdl {
         if cfg!(windows) {
             names.push("SDL2.dll".into());
         } else {
-            names.extend(["libSDL2-2.0.so.0".into(), "libSDL2-2.0.so".into(), "libSDL2.so".into()]);
+            names.extend([
+                "libSDL2-2.0.so.0".into(),
+                "libSDL2-2.0.so".into(),
+                "libSDL2.so".into(),
+            ]);
         }
         let mut failures = Vec::new();
         let library = names
@@ -193,7 +217,11 @@ impl Sdl {
     /// Creates the window and an OpenGL ES 3 context, which the video
     /// presenter needs. ES 2, then desktop OpenGL 2.1, are the fallbacks; the
     /// interface shaders run on all three.
-    pub fn create_gl_window(&self, title: &CStr, windowed: Option<(i32, i32)>) -> Result<Window, String> {
+    pub fn create_gl_window(
+        &self,
+        title: &CStr,
+        windowed: Option<(i32, i32)>,
+    ) -> Result<Window, String> {
         let mut mode = DisplayMode::default();
         if unsafe { (self.desktop_display_mode)(0, &mut mode) } != 0 {
             return Err(format!("no display mode: {}", self.error()));
@@ -205,8 +233,16 @@ impl Sdl {
             (self.gl_set_attribute)(GL_DOUBLEBUFFER, 1);
         }
         let (width, height, flags) = match windowed {
-            Some((width, height)) => (width, height, WINDOW_OPENGL | WINDOW_SHOWN),
-            None => (mode.w, mode.h, WINDOW_FULLSCREEN | WINDOW_OPENGL | WINDOW_SHOWN),
+            Some((width, height)) => (
+                width,
+                height,
+                WINDOW_OPENGL | WINDOW_SHOWN | WINDOW_RESIZABLE,
+            ),
+            None => (
+                mode.w,
+                mode.h,
+                WINDOW_FULLSCREEN | WINDOW_OPENGL | WINDOW_SHOWN,
+            ),
         };
         let window = unsafe {
             (self.create_window)(
@@ -259,12 +295,28 @@ impl Sdl {
             "display: {}x{} @ {} Hz, drawable {width}x{height}",
             mode.w, mode.h, mode.refresh_rate
         );
-        Ok(Window { window, context, width, height })
+        Ok(Window {
+            window,
+            context,
+            width,
+            height,
+        })
     }
 
     pub fn set_vsync(&self, enabled: bool) -> bool {
         let interval = if enabled { 1 } else { 0 };
         unsafe { (self.gl_set_swap_interval)(interval) == 0 && enabled }
+    }
+
+    pub fn refresh_drawable_size(&self, window: &mut Window) -> bool {
+        let (mut width, mut height) = (0, 0);
+        unsafe { (self.gl_get_drawable_size)(window.window, &mut width, &mut height) };
+        if width <= 0 || height <= 0 || (width, height) == (window.width, window.height) {
+            return false;
+        }
+        window.width = width;
+        window.height = height;
+        true
     }
 
     pub fn swap(&self, window: &Window) {
@@ -292,7 +344,8 @@ impl Sdl {
                 let controller = (self.game_controller_open)(index);
                 if !controller.is_null() {
                     let joystick = (self.game_controller_joystick)(controller);
-                    self.controller_joysticks.push((self.joystick_instance_id)(joystick));
+                    self.controller_joysticks
+                        .push((self.joystick_instance_id)(joystick));
                     let buttons = (self.joystick_num_buttons)(joystick);
                     return (text((self.game_controller_name)(controller)), buttons > 16);
                 }
@@ -345,7 +398,10 @@ impl Sdl {
                 }
             }
             _ if self.controller_joysticks.contains(&which) => Event::Other,
-            EVENT_JOYHATMOTION => Event::JoyHat { which, value: event.bytes[13] },
+            EVENT_JOYHATMOTION => Event::JoyHat {
+                which,
+                value: event.bytes[13],
+            },
             EVENT_JOYAXISMOTION => Event::JoyAxis {
                 which,
                 axis: event.bytes[12],

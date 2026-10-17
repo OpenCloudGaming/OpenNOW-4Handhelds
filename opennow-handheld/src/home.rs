@@ -12,14 +12,19 @@ use std::time::Duration;
 const INSET: f32 = 32.0;
 const TILE: f32 = 172.0;
 const GAP: f32 = 14.0;
-const TITLE_Y: f32 = 90.0;
-const SHELF_Y: f32 = 130.0;
 const DOCK: f32 = 50.0;
 const DOCK_SPACING: f32 = 24.0;
-const DOCK_Y: f32 = 336.0;
 /// Tiles either side of the selection whose art is loaded ahead of time.
 const ART_BEHIND: usize = 2;
 const ART_AHEAD: usize = 5;
+
+fn shelf_y() -> f32 {
+    (canvas().1 / 2.0 - 110.0).max(96.0)
+}
+
+fn dock_y() -> f32 {
+    separator_y() - 88.0
+}
 
 const DOCK_ITEMS: [(&str, Image); 3] = [
     ("Store", Image::Store),
@@ -36,6 +41,8 @@ pub enum Action {
     Confirm,
     Back,
     Options,
+    /// The Y face button, used for store filters.
+    Y,
     /// Escape on a keyboard: closes an overlay, or offers to quit.
     Escape,
     Start(bool),
@@ -50,11 +57,20 @@ pub enum Request {
     RetryLibrary,
     Play,
     /// Remove the highlighted title's current store version from the library.
-    Remove { id: String, variant_id: String },
+    Remove {
+        id: String,
+        variant_id: String,
+    },
     /// Make this store version the one Play launches, adding it first when needed.
-    ChooseStore { id: String, variant_id: String, owned: bool },
+    ChooseStore {
+        id: String,
+        variant_id: String,
+        owned: bool,
+    },
     /// Load every store variant for this game. The library list only includes the owned one.
-    LoadStores { id: String },
+    LoadStores {
+        id: String,
+    },
     Toast(&'static str),
 }
 
@@ -107,7 +123,15 @@ fn tile_x(index: usize) -> f32 {
 
 impl Home {
     pub fn new() -> Self {
-        Self { shelf_index: 0, dock_index: 0, focus: Focus::Shelf, menu: None, stores_loading: false, system_open: false, scroll: 0.0 }
+        Self {
+            shelf_index: 0,
+            dock_index: 0,
+            focus: Focus::Shelf,
+            menu: None,
+            stores_loading: false,
+            system_open: false,
+            scroll: 0.0,
+        }
     }
 
     /// Shows or hides the spinner inside the store list.
@@ -121,7 +145,11 @@ impl Home {
     /// Returns to the first tile, for a new account or a reloaded library.
     /// Shelf selection when a game tile is focused.
     pub fn selected_game(&self, games: usize) -> Option<usize> {
-        if self.focus == Focus::Shelf && self.shelf_index < games { Some(self.shelf_index) } else { None }
+        if self.focus == Focus::Shelf && self.shelf_index < games {
+            Some(self.shelf_index)
+        } else {
+            None
+        }
     }
 
     pub fn reset(&mut self) {
@@ -163,7 +191,9 @@ impl Home {
         match (action, &self.focus) {
             (Action::Escape, _) => return Some(Request::Quit),
             (Action::Left, Focus::Shelf) => self.shelf_index = self.shelf_index.saturating_sub(1),
-            (Action::Right, Focus::Shelf) => self.shelf_index = (self.shelf_index + 1).min(shelf_len - 1),
+            (Action::Right, Focus::Shelf) => {
+                self.shelf_index = (self.shelf_index + 1).min(shelf_len - 1)
+            }
             (Action::Down, Focus::Shelf) => self.focus = Focus::Dock,
             (Action::Confirm, Focus::Shelf) => {
                 if let LibraryStatus::Failed(_) = view.library {
@@ -180,7 +210,9 @@ impl Home {
                 self.menu = Some(LibraryMenu::Main(0));
             }
             (Action::Left, Focus::Dock) => self.dock_index = self.dock_index.saturating_sub(1),
-            (Action::Right, Focus::Dock) => self.dock_index = (self.dock_index + 1).min(DOCK_ITEMS.len() - 1),
+            (Action::Right, Focus::Dock) => {
+                self.dock_index = (self.dock_index + 1).min(DOCK_ITEMS.len() - 1)
+            }
             (Action::Up, Focus::Dock) => self.focus = Focus::Shelf,
             (Action::Options, Focus::Dock) => self.system_open = true,
             (Action::Confirm, Focus::Dock) => match DOCK_ITEMS[self.dock_index].1 {
@@ -212,7 +244,9 @@ impl Home {
         }
         match action {
             Action::Up => self.menu = Some(menu.with_row(row.saturating_sub(1))),
-            Action::Down => self.menu = Some(menu.with_row((row + 1).min(rows.len().saturating_sub(1)))),
+            Action::Down => {
+                self.menu = Some(menu.with_row((row + 1).min(rows.len().saturating_sub(1))))
+            }
             Action::Back | Action::Escape => {
                 self.menu = match menu {
                     LibraryMenu::Stores(_) => Some(LibraryMenu::Main(1)),
@@ -220,24 +254,34 @@ impl Home {
                 };
             }
             Action::Confirm => {
-                let kind = rows.get(row).map(|item| item.kind).unwrap_or(MenuKind::Close);
+                let kind = rows
+                    .get(row)
+                    .map(|item| item.kind)
+                    .unwrap_or(MenuKind::Close);
                 return match kind {
                     MenuKind::Remove => {
                         self.menu = None;
-                        Some(Request::Remove { id: game.id.clone(), variant_id: game.variant_id.clone() })
+                        Some(Request::Remove {
+                            id: game.id.clone(),
+                            variant_id: game.variant_id.clone(),
+                        })
                     }
                     MenuKind::OpenStores => {
                         self.menu = Some(LibraryMenu::Stores(0));
                         self.stores_loading = true;
-                        Some(Request::LoadStores { id: game.id.clone() })
+                        Some(Request::LoadStores {
+                            id: game.id.clone(),
+                        })
                     }
                     MenuKind::Store(index) => {
                         self.menu = None;
-                        game.versions.get(index).map(|version| Request::ChooseStore {
-                            id: game.id.clone(),
-                            variant_id: version.id.clone(),
-                            owned: version.in_library,
-                        })
+                        game.versions
+                            .get(index)
+                            .map(|version| Request::ChooseStore {
+                                id: game.id.clone(),
+                                variant_id: version.id.clone(),
+                                owned: version.in_library,
+                            })
                     }
                     MenuKind::Back => {
                         self.menu = Some(LibraryMenu::Main(1));
@@ -298,7 +342,11 @@ impl Home {
         }
         match self.focus {
             Focus::Dock => vec![("X", "System"), ("A", "Select")],
-            Focus::Shelf if view.games.is_empty() && matches!(view.library, LibraryStatus::Failed(_)) => vec![("A", "Retry")],
+            Focus::Shelf
+                if view.games.is_empty() && matches!(view.library, LibraryStatus::Failed(_)) =>
+            {
+                vec![("A", "Retry")]
+            }
             Focus::Shelf if self.shelf_index >= view.games.len() => vec![("A", "Add")],
             Focus::Shelf => vec![("X", "Library"), ("A", "Start")],
         }
@@ -312,14 +360,28 @@ impl Home {
             (None, LibraryStatus::Failed(_)) if games.is_empty() => "Library unavailable",
             (None, _) => "Add a game",
         };
-        painter.text_fit(INSET, TITLE_Y, 22.0, Weight::SemiBold, title, CANVAS.0 - INSET - EDGE, TITLE);
+        painter.text_fit(
+            INSET,
+            shelf_y() - 40.0,
+            22.0,
+            Weight::SemiBold,
+            title,
+            canvas().0 - INSET - EDGE,
+            TITLE,
+        );
 
         if games.is_empty() {
             match view.library {
                 LibraryStatus::Loading => {
                     draw_message_tile(painter, tile_x(0) - self.scroll, "Loading…", None);
                     let x = tile_x(0) - self.scroll;
-                    theme::draw_spinner(painter, x + TILE / 2.0, SHELF_Y + 66.0, 18.0, view.seconds);
+                    theme::draw_spinner(
+                        painter,
+                        x + TILE / 2.0,
+                        shelf_y() + 66.0,
+                        18.0,
+                        view.seconds,
+                    );
                     return;
                 }
                 LibraryStatus::Failed(_) => {
@@ -334,7 +396,7 @@ impl Home {
 
         for index in 0..=games.len() {
             let x = tile_x(index) - self.scroll;
-            if x > CANVAS.0 || x + TILE < 0.0 {
+            if x > canvas().0 || x + TILE < 0.0 {
                 continue;
             }
             match games.get(index) {
@@ -347,23 +409,61 @@ impl Home {
 
     fn draw_focus(&self, painter: &mut Painter, index: usize, x: f32) {
         if index == self.shelf_index && self.focus == Focus::Shelf {
-            painter.stroke(x - 8.0, SHELF_Y - 8.0, TILE + 16.0, TILE + 16.0, 9.0, 4.5, FOCUS);
+            painter.stroke(
+                x - 8.0,
+                shelf_y() - 8.0,
+                TILE + 16.0,
+                TILE + 16.0,
+                9.0,
+                4.5,
+                FOCUS,
+            );
         }
     }
 
     fn draw_dock(&self, painter: &mut Painter) {
         let width = DOCK_ITEMS.len() as f32 * DOCK + (DOCK_ITEMS.len() - 1) as f32 * DOCK_SPACING;
-        let left = (CANVAS.0 - width) / 2.0;
+        let left = (canvas().0 - width) / 2.0;
         for (index, (label, icon)) in DOCK_ITEMS.iter().enumerate() {
             let x = left + index as f32 * (DOCK + DOCK_SPACING);
-            painter.shadow(x, DOCK_Y + 4.0, DOCK, DOCK, DOCK / 2.0, 8.0, with_alpha(BLACK, 0.4));
-            painter.fill(x, DOCK_Y, DOCK, DOCK, DOCK / 2.0, DOCK_FACE);
+            painter.shadow(
+                x,
+                dock_y() + 4.0,
+                DOCK,
+                DOCK,
+                DOCK / 2.0,
+                8.0,
+                with_alpha(BLACK, 0.4),
+            );
+            painter.fill(x, dock_y(), DOCK, DOCK, DOCK / 2.0, DOCK_FACE);
             let icon_size = DOCK * 0.5;
-            painter.image(*icon, x + (DOCK - icon_size) / 2.0, DOCK_Y + (DOCK - icon_size) / 2.0, icon_size, icon_size, WHITE);
+            painter.image(
+                *icon,
+                x + (DOCK - icon_size) / 2.0,
+                dock_y() + (DOCK - icon_size) / 2.0,
+                icon_size,
+                icon_size,
+                WHITE,
+            );
             if self.focus == Focus::Dock && index == self.dock_index {
-                painter.stroke(x - 5.0, DOCK_Y - 5.0, DOCK + 10.0, DOCK + 10.0, DOCK / 2.0 + 5.0, 3.0, FOCUS);
+                painter.stroke(
+                    x - 5.0,
+                    dock_y() - 5.0,
+                    DOCK + 10.0,
+                    DOCK + 10.0,
+                    DOCK / 2.0 + 5.0,
+                    3.0,
+                    FOCUS,
+                );
                 let label_width = painter.measure(label, 14.0, Weight::Bold);
-                painter.text(x + (DOCK - label_width) / 2.0, DOCK_Y + DOCK + 10.0, 14.0, Weight::Bold, label, TEXT);
+                painter.text(
+                    x + (DOCK - label_width) / 2.0,
+                    dock_y() + DOCK + 10.0,
+                    14.0,
+                    Weight::Bold,
+                    label,
+                    TEXT,
+                );
             }
         }
     }
@@ -402,15 +502,24 @@ fn draw_menu(painter: &mut Painter, home: &Home, view: &HomeView) {
         return;
     }
     let rows = menu_rows(game, menu);
-    let (x, width, row_h) = (90.0, 460.0, 46.0);
+    let (width, row_h) = (460.0, 46.0);
+    let x = (canvas().0 - width) / 2.0;
     let height = 72.0 + rows.len() as f32 * row_h;
-    let y = ((CANVAS.1 - height) / 2.0).max(24.0);
+    let y = ((canvas().1 - height) / 2.0).max(24.0);
     theme::draw_panel(painter, x, y, width, height);
     let heading = match menu {
         LibraryMenu::Stores(_) => "Select store",
         LibraryMenu::Main(_) => game.title.as_str(),
     };
-    painter.text_fit(x + 24.0, y + 18.0, 20.0, Weight::Black, heading, width - 48.0, TEXT);
+    painter.text_fit(
+        x + 24.0,
+        y + 18.0,
+        20.0,
+        Weight::Black,
+        heading,
+        width - 48.0,
+        TEXT,
+    );
     let selected = menu.row();
     for (index, item) in rows.iter().enumerate() {
         let row_y = y + 56.0 + index as f32 * row_h;
@@ -418,7 +527,15 @@ fn draw_menu(painter: &mut Painter, home: &Home, view: &HomeView) {
             painter.fill(x + 16.0, row_y, width - 32.0, row_h - 6.0, 12.0, FOCUS);
         }
         let color = if index == selected { BACKGROUND } else { TEXT };
-        painter.text_fit(x + 32.0, row_y + 10.0, 16.0, Weight::ExtraBold, &item.label, width - 64.0, color);
+        painter.text_fit(
+            x + 32.0,
+            row_y + 10.0,
+            16.0,
+            Weight::ExtraBold,
+            &item.label,
+            width - 64.0,
+            color,
+        );
     }
 }
 
@@ -439,9 +556,18 @@ struct MenuItem {
 fn menu_rows(game: &Game, menu: LibraryMenu) -> Vec<MenuItem> {
     match menu {
         LibraryMenu::Main(_) => vec![
-            MenuItem { label: "Remove from library".into(), kind: MenuKind::Remove },
-            MenuItem { label: select_store_label(game), kind: MenuKind::OpenStores },
-            MenuItem { label: "Close".into(), kind: MenuKind::Close },
+            MenuItem {
+                label: "Remove from library".into(),
+                kind: MenuKind::Remove,
+            },
+            MenuItem {
+                label: select_store_label(game),
+                kind: MenuKind::OpenStores,
+            },
+            MenuItem {
+                label: "Close".into(),
+                kind: MenuKind::Close,
+            },
         ],
         LibraryMenu::Stores(_) => {
             let any_default = game.versions.iter().any(|version| version.selected);
@@ -451,26 +577,51 @@ fn menu_rows(game: &Game, menu: LibraryMenu) -> Vec<MenuItem> {
                 .enumerate()
                 .map(|(index, version)| {
                     let fallback = !any_default && version.id == game.variant_id;
-                    MenuItem { label: store_choice_label(version, fallback), kind: MenuKind::Store(index) }
+                    MenuItem {
+                        label: store_choice_label(version, fallback),
+                        kind: MenuKind::Store(index),
+                    }
                 })
                 .collect::<Vec<_>>();
             if rows.is_empty() {
-                rows.push(MenuItem { label: "Loading stores…".into(), kind: MenuKind::Back });
+                rows.push(MenuItem {
+                    label: "Loading stores…".into(),
+                    kind: MenuKind::Back,
+                });
             }
-            rows.push(MenuItem { label: "Back".into(), kind: MenuKind::Back });
+            rows.push(MenuItem {
+                label: "Back".into(),
+                kind: MenuKind::Back,
+            });
             rows
         }
     }
 }
 
 fn draw_store_loading(painter: &mut Painter, seconds: f32) {
-    let (x, y, width, height) = (90.0, 150.0, 460.0, 180.0);
+    let (width, height) = (460.0, 180.0);
+    let x = (canvas().0 - width) / 2.0;
+    let y = (canvas().1 - height) / 2.0;
     theme::draw_panel(painter, x, y, width, height);
-    painter.text(x + 24.0, y + 18.0, 20.0, Weight::Black, "Select store", TEXT);
+    painter.text(
+        x + 24.0,
+        y + 18.0,
+        20.0,
+        Weight::Black,
+        "Select store",
+        TEXT,
+    );
     theme::draw_spinner(painter, x + width / 2.0, y + 96.0, 16.0, seconds);
     let label = "Loading stores…";
     let label_width = painter.measure(label, 15.0, Weight::Bold);
-    painter.text(x + (width - label_width) / 2.0, y + 132.0, 15.0, Weight::Bold, label, MUTED);
+    painter.text(
+        x + (width - label_width) / 2.0,
+        y + 132.0,
+        15.0,
+        Weight::Bold,
+        label,
+        MUTED,
+    );
 }
 
 fn select_store_label(game: &Game) -> String {
@@ -481,65 +632,158 @@ fn select_store_label(game: &Game) -> String {
         .map(|version| version.store.as_str())
         .filter(|store| !store.is_empty())
         .unwrap_or(game.store.as_str());
-    if current.is_empty() { "Select store".into() } else { format!("Select store · {current}") }
+    if current.is_empty() {
+        "Select store".into()
+    } else {
+        format!("Select store · {current}")
+    }
 }
 
 fn store_choice_label(version: &crate::library::StoreVersion, fallback_default: bool) -> String {
-    let name = if version.store.is_empty() { "Store".to_owned() } else { version.store.clone() };
-    if version.selected || fallback_default { format!("{name} · default") } else { name }
+    let name = if version.store.is_empty() {
+        "Store".to_owned()
+    } else {
+        version.store.clone()
+    };
+    if version.selected || fallback_default {
+        format!("{name} · default")
+    } else {
+        name
+    }
 }
 
 fn draw_game_tile(painter: &mut Painter, game: &Game, artwork: &Artwork, x: f32) {
-    let y = SHELF_Y;
+    let y = shelf_y();
     match game.artwork.as_deref().and_then(|url| artwork.texture(url)) {
         Some(texture) => painter.texture(texture, x, y, TILE, TILE, 5.0, WHITE),
         None => {
             painter.fill(x, y, TILE, TILE, 5.0, game.color);
             let initial: String = game.title.chars().take(1).collect();
             let initial_width = painter.measure(&initial, 96.0, Weight::Black);
-            painter.text(x + (TILE - initial_width) / 2.0, y + 18.0, 96.0, Weight::Black, &initial, with_alpha(WHITE, 0.14));
+            painter.text(
+                x + (TILE - initial_width) / 2.0,
+                y + 18.0,
+                96.0,
+                Weight::Black,
+                &initial,
+                with_alpha(WHITE, 0.14),
+            );
         }
     }
-    painter.gradient(x, y, TILE, TILE, 5.0, y + TILE * 0.4, with_alpha(BLACK, 0.0), with_alpha(BLACK, 0.7));
+    painter.gradient(
+        x,
+        y,
+        TILE,
+        TILE,
+        5.0,
+        y + TILE * 0.4,
+        with_alpha(BLACK, 0.0),
+        with_alpha(BLACK, 0.7),
+    );
     let bottom = y + TILE - 28.0;
     if game.status.is_empty() {
-        painter.text_fit(x + 12.0, bottom, 13.0, Weight::ExtraBold, &game.store, TILE - 24.0, WHITE);
+        painter.text_fit(
+            x + 12.0,
+            bottom,
+            13.0,
+            Weight::ExtraBold,
+            &game.store,
+            TILE - 24.0,
+            WHITE,
+        );
     } else {
-        painter.text_fit(x + 12.0, bottom - 18.0, 12.0, Weight::Bold, &game.status, TILE - 24.0, with_alpha(WHITE, 0.85));
-        painter.text_fit(x + 12.0, bottom, 13.0, Weight::ExtraBold, &game.store, TILE - 24.0, WHITE);
+        painter.text_fit(
+            x + 12.0,
+            bottom - 18.0,
+            12.0,
+            Weight::Bold,
+            &game.status,
+            TILE - 24.0,
+            with_alpha(WHITE, 0.85),
+        );
+        painter.text_fit(
+            x + 12.0,
+            bottom,
+            13.0,
+            Weight::ExtraBold,
+            &game.store,
+            TILE - 24.0,
+            WHITE,
+        );
     }
 }
 
 fn draw_message_tile(painter: &mut Painter, x: f32, title: &str, detail: Option<&str>) {
-    let y = SHELF_Y;
+    let y = shelf_y();
     painter.fill(x, y, TILE, TILE, 5.0, ADD_TILE);
     let width = painter.measure(title, 17.0, Weight::ExtraBold);
-    painter.text(x + (TILE - width) / 2.0, y + 104.0, 17.0, Weight::ExtraBold, title, TEXT);
+    painter.text(
+        x + (TILE - width) / 2.0,
+        y + 104.0,
+        17.0,
+        Weight::ExtraBold,
+        title,
+        TEXT,
+    );
     if let Some(detail) = detail {
         let width = painter.measure(detail, 13.0, Weight::Bold);
-        painter.text(x + (TILE - width) / 2.0, y + 130.0, 13.0, Weight::Bold, detail, MUTED);
+        painter.text(
+            x + (TILE - width) / 2.0,
+            y + 130.0,
+            13.0,
+            Weight::Bold,
+            detail,
+            MUTED,
+        );
     }
 }
 
 fn draw_add_tile(painter: &mut Painter, x: f32) {
-    let y = SHELF_Y;
+    let y = shelf_y();
     painter.fill(x, y, TILE, TILE, 5.0, ADD_TILE);
     let circle = 44.0;
     let (cx, cy) = (x + (TILE - circle) / 2.0, y + 46.0);
     painter.fill(cx, cy, circle, circle, circle / 2.0, SEPARATOR);
-    painter.fill(cx + 13.0, cy + circle / 2.0 - 1.5, circle - 26.0, 3.0, 1.5, TEXT);
-    painter.fill(cx + circle / 2.0 - 1.5, cy + 13.0, 3.0, circle - 26.0, 1.5, TEXT);
+    painter.fill(
+        cx + 13.0,
+        cy + circle / 2.0 - 1.5,
+        circle - 26.0,
+        3.0,
+        1.5,
+        TEXT,
+    );
+    painter.fill(
+        cx + circle / 2.0 - 1.5,
+        cy + 13.0,
+        3.0,
+        circle - 26.0,
+        1.5,
+        TEXT,
+    );
     let label = "Add a game";
     let width = painter.measure(label, 17.0, Weight::ExtraBold);
-    painter.text(x + (TILE - width) / 2.0, cy + circle + 14.0, 17.0, Weight::ExtraBold, label, TEXT);
+    painter.text(
+        x + (TILE - width) / 2.0,
+        cy + circle + 14.0,
+        17.0,
+        Weight::ExtraBold,
+        label,
+        TEXT,
+    );
 }
 
 fn draw_system(painter: &mut Painter, view: &HomeView) {
     let status = view.status;
-    let (x, y, width, height) = (60.0, 56.0, 520.0, 352.0);
+    let (width, height) = (520.0, 352.0);
+    let x = (canvas().0 - width) / 2.0;
+    let y = (canvas().1 - height) / 2.0;
     theme::draw_panel(painter, x, y, width, height);
     painter.text(x + 26.0, y + 22.0, 24.0, Weight::Black, "System", TEXT);
-    let devices = if status.devices.is_empty() { "None found".to_owned() } else { status.devices.join(", ") };
+    let devices = if status.devices.is_empty() {
+        "None found".to_owned()
+    } else {
+        status.devices.join(", ")
+    };
     let rows = [
         ("Account", view.account),
         ("Video driver", status.driver.as_str()),
@@ -552,7 +796,15 @@ fn draw_system(painter: &mut Painter, view: &HomeView) {
     for (index, (label, value)) in rows.iter().enumerate() {
         let row_y = y + 70.0 + index as f32 * 44.0;
         painter.text(x + 26.0, row_y, 15.0, Weight::Bold, label, MUTED);
-        painter.text_fit(value_x, row_y, 15.0, Weight::SemiBold, value, x + width - 26.0 - value_x, TEXT);
+        painter.text_fit(
+            value_x,
+            row_y,
+            15.0,
+            Weight::SemiBold,
+            value,
+            x + width - 26.0 - value_x,
+            TEXT,
+        );
         if index + 1 < rows.len() {
             painter.fill(x + 26.0, row_y + 31.0, width - 52.0, 1.0, 0.0, SEPARATOR);
         }

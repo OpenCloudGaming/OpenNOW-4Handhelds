@@ -1679,6 +1679,7 @@ fn session_info(
         "appId":app_id,
         "status":status,
         "phase":session_phase(status),
+        "sessionTimeRemainingSec":session["sessionTimeRemainingSec"],
         "termination":if status == 7 { json!({"source":"cloudmatch-session-status","status":7,"sessionId":session_id,"resumable":false}) } else { Value::Null },
         "queuePosition":queue_position,
         "seatSetupInfo":session["seatSetupInfo"],

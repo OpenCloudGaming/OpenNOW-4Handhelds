@@ -533,22 +533,76 @@ impl GfnService {
             let scope = self.store_cache_scope(session, generation, settings)?;
             let mut filters = json!({});
             let mut sort = "itemMetadata.relevance:DESC,sortName:ASC".to_owned();
-            if params.get("filterId").is_some() || params.get("sortId").is_some() {
+            if params.get("filterId").is_some()
+                || params.get("filterIds").is_some()
+                || params.get("sortId").is_some()
+            {
                 let definitions =
                     self.store_presentation(&json!({"section":"filters"}), settings)?;
-                if params.get("filterId").is_some() {
-                    let id = bounded_id(params, "filterId", true)?;
-                    filters = definitions["items"]
+                if params.get("filterId").is_some() || params.get("filterIds").is_some() {
+                    let mut ids = if let Some(value) = params.get("filterIds") {
+                        let values = value
+                            .as_array()
+                            .filter(|values| values.len() <= 32)
+                            .ok_or_else(|| {
+                                ServiceError::invalid(
+                                    "filterIds must be an array of at most 32 identifiers",
+                                )
+                            })?;
+                        values
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .filter(|id| {
+                                        !id.is_empty()
+                                            && id.len() <= 256
+                                            && !id.chars().any(char::is_control)
+                                    })
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| {
+                                        ServiceError::invalid(
+                                            "filterIds contains an invalid identifier",
+                                        )
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        vec![bounded_id(params, "filterId", true)?]
+                    };
+                    ids.sort();
+                    ids.dedup();
+                    let options = definitions["items"]
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .flat_map(|group| group["options"].as_array().into_iter().flatten())
-                        .find(|option| option["id"] == id)
-                        .map(|option| option["expression"].clone())
-                        .filter(Value::is_object)
+                        .flat_map(|group| group["options"].as_array().into_iter().flatten());
+                    let selected = ids
+                        .iter()
+                        .map(|id| {
+                            options
+                                .clone()
+                                .find(|option| option["id"] == *id)
+                                .ok_or_else(|| {
+                                    ServiceError::invalid(
+                                        "The server filter expression is unavailable",
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut raw_filters = Vec::new();
+                    for option in selected {
+                        if let Some(items) = option["filters"].as_array() {
+                            raw_filters.extend(items.iter().cloned());
+                        } else if let Some(expression) = option["expression"].as_object() {
+                            raw_filters
+                                .push(Value::String(Value::Object(expression.clone()).to_string()));
+                        }
+                    }
+                    filters = crate::catalog_types::filter_expression(&Value::Array(raw_filters))
                         .ok_or_else(|| {
-                            ServiceError::invalid("The server filter expression is unavailable")
-                        })?;
+                        ServiceError::invalid("The server filter expression is unavailable")
+                    })?;
                 }
                 if params.get("sortId").is_some() {
                     let id = bounded_id(params, "sortId", true)?;
@@ -568,7 +622,6 @@ impl GfnService {
             // The console store's All Games shelf is the unfiltered popularity list,
             // the same order the GeForce NOW store uses for that section.
             if params["browse"].as_str() == Some("all-games") && page.search.is_empty() {
-                filters = json!({});
                 sort = "itemMetadata.gfnPopularityRank:ASC,sortName:ASC".to_owned();
             }
             let key = if filters == json!({}) && sort == "itemMetadata.relevance:DESC,sortName:ASC"
@@ -1092,18 +1145,14 @@ pub(super) fn complete_games(items: &Value) -> Result<Vec<Value>, ServiceError> 
                     variants.push(variant.clone());
                 }
             }
-            game["selectedVariantIndex"] = json!(
-                variants
-                    .iter()
-                    .position(|variant| variant["id"] == selected)
-                    .unwrap_or(0)
-            );
-            game["availableStores"] = json!(
-                variants
-                    .iter()
-                    .map(|variant| variant["store"].clone())
-                    .collect::<Vec<_>>()
-            );
+            game["selectedVariantIndex"] = json!(variants
+                .iter()
+                .position(|variant| variant["id"] == selected)
+                .unwrap_or(0));
+            game["availableStores"] = json!(variants
+                .iter()
+                .map(|variant| variant["store"].clone())
+                .collect::<Vec<_>>());
             game["isInLibrary"] =
                 json!(variants.iter().any(|variant| variant["inLibrary"] == true));
             game["variants"] = json!(variants);
