@@ -56,14 +56,14 @@ build.ps1            R36S build on Windows
 build.sh             R36S build on Linux
 ```
 
+## Libraries
+
+This project also relies on many open-source libraries. Some key ones are [SDL](https://github.com/libsdl-org/SDL) for the handheld interface and controller support, [FFmpeg](https://github.com/FFmpeg/FFmpeg), [OpenH264](https://github.com/cisco/openh264), and [Opus](https://github.com/xiph/opus) for media handling, [str0m](https://github.com/algesten/str0m) for WebRTC, [serde](https://github.com/serde-rs/serde) for data serialization, and [rustls](https://github.com/rustls/rustls) for TLS. See the Cargo manifests and lockfiles for the complete dependency list and versions.
+
 # Acknowledgements
 - [OpenNOW](https://github.com/OpenCloudGaming/OpenNOW), amazing project ^_^
 - [GreenOvercast](https://github.com/Producdevity/GreenOvercast) for the Rockchip MPP implementation and guidance on using it.
 - [Moonlight Embedded](https://github.com/moonlight-stream/moonlight-embedded) for Rockchip MPP improvements.
-
-## Libraries
-
-This project also relies on many open-source libraries. Some key ones are [SDL](https://github.com/libsdl-org/SDL) for the handheld interface and controller support, [FFmpeg](https://github.com/FFmpeg/FFmpeg), [OpenH264](https://github.com/cisco/openh264), and [Opus](https://github.com/xiph/opus) for media handling, [str0m](https://github.com/algesten/str0m) for WebRTC, [serde](https://github.com/serde-rs/serde) for data serialization, and [rustls](https://github.com/rustls/rustls) for TLS. See the Cargo manifests and lockfiles for the complete dependency list and versions.
 
 ## License
 MIT. Copyright (c) 2025 Zortos. See [LICENSE](LICENSE).
