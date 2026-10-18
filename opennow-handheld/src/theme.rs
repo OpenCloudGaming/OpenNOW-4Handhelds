@@ -48,6 +48,7 @@ pub const ADD_TILE: Color = rgb(0x2A2D33);
 pub const PANEL: Color = rgb(0x22252A);
 pub const BUTTON: Color = rgb(0x34383F);
 pub const ERROR: Color = rgb(0xFF8A80);
+pub const LOW_BATTERY: Color = rgb(0xFF3B30);
 pub const WHITE: Color = [1.0, 1.0, 1.0, 1.0];
 pub const BLACK: Color = [0.0, 0.0, 0.0, 1.0];
 
@@ -82,30 +83,29 @@ pub fn draw_header(painter: &mut Painter, clock: &Clock) {
         MUTED,
     );
 
-    let mut right = canvas().0 - EDGE;
+    draw_session_status(painter, clock);
+}
+
+/// Draw the battery and clock at the same top-right position used by menu headers.
+pub fn draw_session_status(painter: &mut Painter, clock: &Clock) {
+    let (width, height, top) = (24.0, 13.0, 31.0);
+    let right = canvas().0 - EDGE;
+    let mut text_right = right;
     if let Some(percent) = clock.battery {
-        let (width, height, top) = (24.0, 13.0, 31.0);
         let body = right - width - 3.0;
-        painter.fill(body + width + 0.5, top + 3.5, 2.5, 6.0, 1.0, TEXT);
-        painter.stroke(body, top, width, height, 3.5, 2.0, TEXT);
+        let color = if percent <= 15 { LOW_BATTERY } else { TEXT };
+        painter.fill(body + width + 0.5, top + 3.5, 2.5, 6.0, 1.0, color);
+        painter.stroke(body, top, width, height, 3.5, 2.0, color);
         let level = (width - 7.0) * percent as f32 / 100.0;
-        painter.fill(
-            body + 3.5,
-            top + 3.5,
-            level.max(1.5),
-            height - 7.0,
-            1.5,
-            TEXT,
-        );
+        painter.fill(body + 3.5, top + 3.5, level.max(1.5), height - 7.0, 1.5, color);
         let label = format!("{percent}%");
         let label_width = painter.measure(&label, 16.0, Weight::Bold);
-        right = body - 8.0 - label_width;
-        painter.text(right, 26.0, 16.0, Weight::Bold, &label, TEXT);
-        right -= 18.0;
+        painter.text(body - 8.0 - label_width, 26.0, 16.0, Weight::Bold, &label, color);
+        text_right = body - 8.0 - label_width - 18.0;
     }
     if !clock.time.is_empty() {
-        let width = painter.measure(&clock.time, 18.0, Weight::Bold);
-        painter.text(right - width, 25.0, 18.0, Weight::Bold, &clock.time, TEXT);
+        let time_width = painter.measure(&clock.time, 18.0, Weight::Bold);
+        painter.text(text_right - time_width, 25.0, 18.0, Weight::Bold, &clock.time, TEXT);
     }
 }
 
@@ -134,18 +134,44 @@ pub fn draw_footer(painter: &mut Painter, status: &str, hints: &[(&str, &str)]) 
     );
 }
 
-pub fn draw_centered_footer(painter: &mut Painter, status: &str) {
+pub fn draw_centered_footer_cycle(painter: &mut Painter, first: &str, second: &str, elapsed: f32) {
     painter.fill(0.0, separator_y(), canvas().0, 1.0, 0.0, SEPARATOR);
-    let width = painter.measure(status, 13.0, Weight::Bold);
+    let phase = elapsed.rem_euclid(10.0);
+    let (first_alpha, second_alpha) = if phase < 4.5 {
+        (1.0, 0.0)
+    } else if phase < 5.0 {
+        let progress = smoothstep((phase - 4.5) / 0.5);
+        (1.0 - progress, progress)
+    } else if phase < 9.5 {
+        (0.0, 1.0)
+    } else {
+        let progress = smoothstep((phase - 9.5) / 0.5);
+        (progress, 1.0 - progress)
+    };
+    draw_centered_footer_line(painter, first, first_alpha);
+    draw_centered_footer_line(painter, second, second_alpha);
+}
+
+fn draw_centered_footer_line(painter: &mut Painter, text: &str, alpha: f32) {
+    if alpha <= 0.0 {
+        return;
+    }
+    let font_size = 16.0;
+    let width = painter.measure(text, font_size, Weight::SemiBold);
     painter.text_fit(
         (canvas().0 - width) / 2.0,
-        separator_y() + 18.0,
-        13.0,
-        Weight::Bold,
-        status,
+        separator_y() + 21.0,
+        font_size,
+        Weight::SemiBold,
+        text,
         canvas().0 - EDGE * 2.0,
-        MUTED,
+        with_alpha(MUTED, alpha),
     );
+}
+
+fn smoothstep(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
 }
 
 /// Draws `text` on as many lines as the words need. A line that is still too
@@ -267,20 +293,21 @@ pub fn draw_confirm(
     }
 }
 
-pub fn draw_session_menu(painter: &mut Painter, selected: usize, time_left: &str) {
+pub fn draw_session_menu(painter: &mut Painter, selected: usize, time_left: &str, clock: &Clock) {
     let rows = ["End session", "Exit OpenNOW", "Mouse mode", "Stats"];
     let (width, row_h) = (380.0, 56.0);
     let x = (canvas().0 - width) / 2.0;
-    let header_h = 64.0;
+    let header_h = 76.0;
     let bottom_padding = 12.0;
     let height = header_h + rows.len() as f32 * row_h + bottom_padding;
     let y = (canvas().1 - height) / 2.0;
     draw_panel(painter, x, y, width, height);
+    draw_centered_session_status(painter, y + 17.0, clock);
     let remaining = format!("Session time remaining: {time_left}");
     let remaining_width = painter.measure(&remaining, 16.0, Weight::SemiBold);
     painter.text(
         x + (width - remaining_width) / 2.0,
-        y + 28.0,
+        y + 43.0,
         16.0,
         Weight::SemiBold,
         &remaining,
@@ -307,6 +334,38 @@ pub fn draw_session_menu(painter: &mut Painter, selected: usize, time_left: &str
             label,
             if focused { BACKGROUND } else { TEXT },
         );
+    }
+}
+
+fn draw_centered_session_status(painter: &mut Painter, y: f32, clock: &Clock) {
+    let battery_label = clock.battery.map(|percent| format!("{percent}%"));
+    let battery_label_width = battery_label
+        .as_deref()
+        .map(|label| painter.measure(label, 17.0, Weight::Bold))
+        .unwrap_or(0.0);
+    let time_width = if clock.time.is_empty() {
+        0.0
+    } else {
+        painter.measure(&clock.time, 17.0, Weight::Bold)
+    };
+    let battery_group_width = if battery_label.is_some() { 28.0 + 6.0 + battery_label_width } else { 0.0 };
+    let gap = if battery_group_width > 0.0 && time_width > 0.0 { 14.0 } else { 0.0 };
+    let total_width = battery_group_width + gap + time_width;
+    let mut x = (canvas().0 - total_width) / 2.0;
+
+    if let (Some(percent), Some(label)) = (clock.battery, battery_label.as_deref()) {
+        let color = if percent <= 15 { LOW_BATTERY } else { TEXT };
+        let (width, height, icon_y) = (28.0, 15.0, y + 2.0);
+        painter.fill(x + width + 0.5, icon_y + 4.0, 2.5, 7.0, 1.0, color);
+        painter.stroke(x, icon_y, width, height, 4.0, 2.0, color);
+        let level = (width - 7.0) * percent as f32 / 100.0;
+        painter.fill(x + 3.5, icon_y + 4.0, level.max(1.5), height - 8.0, 1.5, color);
+        x += width + 6.0;
+        painter.text(x, y - 1.0, 17.0, Weight::Bold, label, color);
+        x += battery_label_width + gap;
+    }
+    if !clock.time.is_empty() {
+        painter.text(x, y - 1.0, 17.0, Weight::Bold, &clock.time, TEXT);
     }
 }
 pub fn draw_toast(painter: &mut Painter, message: &str, remaining: f32) {

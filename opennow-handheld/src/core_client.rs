@@ -15,6 +15,90 @@ const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
 const FIRST_BUSY_RETRY: Duration = Duration::from_millis(100);
 const LAST_BUSY_RETRY: Duration = Duration::from_secs(1);
 
+fn redact_log_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase().replace('_', "").replace('-', "");
+                    let sensitive = [
+                        "token",
+                        "password",
+                        "secret",
+                        "authorization",
+                        "cookie",
+                        "devicecode",
+                        "usercode",
+                        "sessionid",
+                        "verificationuri",
+                        "challenge",
+                    ]
+                    .iter()
+                    .any(|needle| normalized.contains(needle));
+                    let url = normalized.ends_with("url");
+                    let safe_value = if sensitive {
+                        Value::String("[REDACTED]".to_owned())
+                    } else if url {
+                        value.as_str().map_or_else(
+                            || redact_log_value(value),
+                            |text| {
+                                Value::String(
+                                    text.split_once('?')
+                                        .map_or(text, |(base, _)| base)
+                                        .to_owned(),
+                                )
+                            },
+                        )
+                    } else {
+                        redact_log_value(value)
+                    };
+                    (key.clone(), safe_value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_log_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn log_json(kind: &str, value: &Value) {
+    let safe_value = redact_log_value(value);
+    let formatted = serde_json::to_string_pretty(&safe_value)
+        .unwrap_or_else(|_| safe_value.to_string());
+    eprintln!("core: {kind}\n{formatted}");
+}
+
+fn log_response(method: &str, value: &Value) {
+    if method.starts_with("settings.") || method.starts_with("session.") {
+        log_json("response", value);
+        return;
+    }
+
+    let id = value["id"].as_str().unwrap_or("?");
+    if value["ok"].as_bool() == Some(true) {
+        let result = &value["result"];
+        let summary = match result {
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(key, value)| match value {
+                    Value::Array(items) => format!("{key}[{}]", items.len()),
+                    Value::Object(nested) => format!("{key}{{{} fields}}", nested.len()),
+                    _ => key.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            Value::Array(items) => format!("array[{}]", items.len()),
+            Value::Null => "null".to_owned(),
+            _ => "value".to_owned(),
+        };
+        eprintln!("core: response id={id} method={method} outcome=ok result={summary}");
+    } else {
+        let code = value["error"]["code"].as_str().unwrap_or("error");
+        eprintln!("core: response id={id} method={method} outcome=error code={code}");
+    }
+}
+
 pub enum Message {
     Response { id: u64, result: Result<Value, CoreError> },
     Event { name: String, payload: Value },
@@ -175,6 +259,7 @@ impl Core {
         let expired: Vec<u64> = self.pending.iter().filter(|(_, request)| now >= request.deadline).map(|(id, _)| *id).collect();
         for id in expired {
             let method = self.pending[&id].method.clone();
+            eprintln!("core: response id={id} method={method} outcome=timeout");
             self.cancel(id);
             messages.push(Message::Response {
                 id,
@@ -202,8 +287,9 @@ impl Core {
                 let Some(request) = self.pending.get_mut(&id) else {
                     return;
                 };
+                let method = request.method.clone();
+                log_response(&method, &value);
                 if value["ok"].as_bool() == Some(true) {
-                    let method = request.method.clone();
                     self.pending.remove(&id);
                     // A created cloud seat is deleted unless the shell accepts it promptly.
                     if method == "session.create" {
@@ -247,6 +333,7 @@ impl Core {
             let request = self.pending.get_mut(&id).expect("due request is pending");
             request.retry_at = None;
             let line = json!({"type": "request", "id": id.to_string(), "method": request.method, "params": request.params});
+            log_json("request", &line);
             self.write(&line);
         }
     }

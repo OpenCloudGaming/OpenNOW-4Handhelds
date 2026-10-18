@@ -143,7 +143,9 @@ pub struct App {
     mouse_y: f32,
     mouse_left_down: bool,
     mouse_right_down: bool,
-    /// Latest stick deflection in mouse mode, from -1 to 1, after the dead zone.
+    /// Raw stick position and processed radial movement in mouse mode.
+    mouse_raw_x: i16,
+    mouse_raw_y: i16,
     mouse_stick_x: f32,
     mouse_stick_y: f32,
     /// Select (SDL buttons 4 and 12) is held, for the session-menu chord.
@@ -170,6 +172,7 @@ pub struct App {
     started: Instant,
     home: Home,
     account: String,
+    membership_tier: String,
     games: Vec<Game>,
     library: LibraryStatus,
     page: LibraryPage,
@@ -199,6 +202,7 @@ pub struct App {
     play_selected: bool,
     play_settings_left: u8,
     play_message: String,
+    session_wait_started: Option<Instant>,
     launch_catalog: String,
     launch_variant: String,
     launch_title: String,
@@ -212,6 +216,7 @@ pub struct App {
     session_time_session_id: Option<String>,
     /// A resumed seat may not include a remaining-time value in CloudMatch responses.
     resuming_existing_session: bool,
+    session_recreate_attempted: bool,
     next_session_poll: Option<Instant>,
     return_to_store: bool,
     sign_in: Phase,
@@ -277,6 +282,8 @@ impl App {
             mouse_y: canvas().1 / 2.0,
             mouse_left_down: false,
             mouse_right_down: false,
+            mouse_raw_x: 0,
+            mouse_raw_y: 0,
             mouse_stick_x: 0.0,
             mouse_stick_y: 0.0,
             pad_select: false,
@@ -298,6 +305,7 @@ impl App {
             started: Instant::now(),
             home: Home::new(),
             account: String::new(),
+            membership_tier: String::new(),
             games: Vec::new(),
             library: LibraryStatus::Loading,
             page: LibraryPage::default(),
@@ -323,6 +331,7 @@ impl App {
             play_selected: false,
             play_settings_left: 0,
             play_message: String::new(),
+            session_wait_started: None,
             launch_catalog: String::new(),
             launch_variant: String::new(),
             launch_title: String::new(),
@@ -332,6 +341,7 @@ impl App {
             session_time_deadline: None,
             session_time_session_id: None,
             resuming_existing_session: false,
+            session_recreate_attempted: false,
             next_session_poll: None,
             return_to_store: false,
             sign_in: Phase::Starting,
@@ -458,6 +468,7 @@ impl App {
                     artwork: &self.artwork,
                     library: &self.library,
                     account: &self.account,
+                    membership_tier: &self.membership_tier,
                     status,
                     clock: &self.clock,
                     seconds: 0.0,
@@ -639,6 +650,10 @@ impl App {
         self.mouse_mode = true;
         self.mouse_left_down = false;
         self.mouse_right_down = false;
+        self.mouse_raw_x = 0;
+        self.mouse_raw_y = 0;
+        self.mouse_stick_x = 0.0;
+        self.mouse_stick_y = 0.0;
         self.mouse_x = canvas().0 / 2.0;
         self.mouse_y = canvas().1 / 2.0;
         if let Some(stream) = self.stream.as_mut() {
@@ -659,6 +674,8 @@ impl App {
         self.mouse_left_down = false;
         self.mouse_right_down = false;
         self.mouse_mode = false;
+        self.mouse_raw_x = 0;
+        self.mouse_raw_y = 0;
         self.mouse_stick_x = 0.0;
         self.mouse_stick_y = 0.0;
         if let Some(stream) = self.stream.as_mut() {
@@ -666,15 +683,23 @@ impl App {
         }
     }
 
-    /// Turns a stick axis into a smooth -1..1 speed. Light pressure stays slow.
-    fn mouse_deflection(value: i16) -> f32 {
+    /// Applies a radial deadzone so a small diagonal component remains usable
+    /// when the stick is already pushed far along the other axis.
+    fn mouse_deflection(x: i16, y: i16) -> (f32, f32) {
         const DEADZONE: f32 = 0.16;
-        let amount = (value as f32 / 32767.0).clamp(-1.0, 1.0);
-        if amount.abs() < DEADZONE {
-            return 0.0;
+        let x = (x as f32 / 32767.0).clamp(-1.0, 1.0);
+        let y = (y as f32 / 32767.0).clamp(-1.0, 1.0);
+        let magnitude = (x * x + y * y).sqrt();
+        if magnitude <= DEADZONE {
+            return (0.0, 0.0);
         }
-        let scaled = (amount.abs() - DEADZONE) / (1.0 - DEADZONE);
-        scaled * scaled * amount.signum()
+        let scaled = ((magnitude - DEADZONE) / (1.0 - DEADZONE)).clamp(0.0, 1.0);
+        // A gentle curve avoids sluggish movement just beyond the deadzone,
+        // while the continuous range still allows fine cursor adjustments.
+        let response = 0.08 + 0.92 * scaled.sqrt();
+        let direction_x = x / magnitude;
+        let direction_y = y / magnitude;
+        (direction_x * response, direction_y * response)
     }
 
     fn send_mouse(&mut self) {
@@ -695,8 +720,8 @@ impl App {
 
     fn mouse_axis(&mut self, axis: u8, value: i16) {
         match axis {
-            0 | 2 => self.mouse_stick_x = Self::mouse_deflection(value),
-            1 | 3 => self.mouse_stick_y = Self::mouse_deflection(value),
+            0 | 2 => self.mouse_raw_x = value,
+            1 | 3 => self.mouse_raw_y = value,
             4 | 5 => {
                 let press = value > 12_000;
                 let release = value < 4_000;
@@ -721,6 +746,8 @@ impl App {
             }
             _ => {}
         }
+        (self.mouse_stick_x, self.mouse_stick_y) =
+            Self::mouse_deflection(self.mouse_raw_x, self.mouse_raw_y);
     }
 
     /// Moves the pointer from the held stick. Axis events only arrive when the
@@ -1052,6 +1079,10 @@ impl App {
             .as_str()
             .unwrap_or("Signed in")
             .to_owned();
+        self.membership_tier = user["membershipTier"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         self.session_limit_secs =
             settings::session_limit_secs(user["membershipTier"].as_str().unwrap_or(""));
         self.scope = json!({
@@ -1071,11 +1102,13 @@ impl App {
 
     fn show_sign_in(&mut self) {
         self.account.clear();
+        self.membership_tier.clear();
         self.playtime = None;
         self.session_limit_secs = None;
         self.session_time_deadline = None;
         self.session_time_session_id = None;
         self.resuming_existing_session = false;
+        self.session_recreate_attempted = false;
         self.scope = Value::Null;
         self.games.clear();
         self.store_games.clear();
@@ -1901,6 +1934,13 @@ impl App {
     }
 
     fn resolutions_loaded(&mut self, value: &Value) {
+        if let Some(tier) = value["subscription"]["membershipTier"]
+            .as_str()
+            .filter(|tier| !tier.is_empty())
+        {
+            self.membership_tier = tier.to_owned();
+            self.session_limit_secs = settings::session_limit_secs(tier);
+        }
         self.playtime = settings::playtime_from_subscription(value);
         if let Some(limit) = self
             .playtime
@@ -2029,9 +2069,11 @@ impl App {
         self.queue_position = None;
         self.cancel_session_create = false;
         self.resuming_existing_session = false;
+        self.session_recreate_attempted = false;
         self.launch_catalog = catalog_id.to_owned();
         self.launch_variant = variant_id.to_owned();
         self.launch_title = title.to_owned();
+        self.session_wait_started = Some(Instant::now());
         self.play_added = false;
         self.play_selected = false;
         self.return_to_store = from_store;
@@ -2208,6 +2250,31 @@ impl App {
         );
     }
 
+    fn request_new_cloud_session(&mut self) {
+        let Some(capabilities) = self.stream_capabilities.clone() else {
+            self.fail_stream("The video runtime is not ready.".into());
+            return;
+        };
+        self.play = PlayPhase::Create;
+        self.play_message = "Requesting a new cloud gaming session...".into();
+        eprintln!("stream: requesting a new GeForce NOW session");
+        self.send(
+            "session.create",
+            json!({
+                "appId": self.launch_variant,
+                "catalogAppId": self.launch_catalog,
+                "variantId": self.launch_variant,
+                "scope": self.scope,
+                "title": self.launch_title,
+                "runtimeCapabilities": capabilities,
+                "maxEntitledFps": 60,
+                "appLaunchMode": "gamepadFriendly",
+            }),
+            Duration::from_secs(60),
+            Pending::SessionCreate,
+        );
+    }
+
     fn session_created(&mut self, value: &Value) {
         let session = if value["session"].is_object() {
             value["session"].clone()
@@ -2253,6 +2320,13 @@ impl App {
             return;
         }
         let Some(session) = resumable_session(value, &self.launch_variant) else {
+            if !self.session_recreate_attempted {
+                self.session_recreate_attempted = true;
+                self.cloud_session = None;
+                self.resuming_existing_session = false;
+                self.request_new_cloud_session();
+                return;
+            }
             self.fail_stream(
                 "A GeForce NOW session is already active, but it could not be resumed.".into(),
             );
@@ -2290,6 +2364,13 @@ impl App {
 
     fn session_polled(&mut self, value: &Value) {
         if value.get("session").is_some_and(Value::is_null) {
+            if self.resuming_existing_session && !self.session_recreate_attempted {
+                self.session_recreate_attempted = true;
+                self.cloud_session = None;
+                self.resuming_existing_session = false;
+                self.request_new_cloud_session();
+                return;
+            }
             self.fail_stream("The GeForce NOW session ended before it could be resumed.".into());
             return;
         }
@@ -2440,6 +2521,7 @@ impl App {
         self.session_time_session_id = None;
         self.resuming_existing_session = false;
         self.stream_frame = None;
+        self.session_wait_started = None;
         if let Some(mut stream) = self.stream.take() {
             stream.stop_media();
             stream.release_pad();
@@ -2516,6 +2598,7 @@ impl App {
         self.cloud_session = None;
         self.stream_capabilities = None;
         self.stream_frame = None;
+        self.session_wait_started = None;
         self.session_menu = false;
         self.screen = if self.return_to_store {
             Screen::Store
@@ -2599,6 +2682,7 @@ impl App {
                     artwork: &self.artwork,
                     library: &self.library,
                     account: &self.account,
+                    membership_tier: &self.membership_tier,
                     status,
                     clock: &self.clock,
                     seconds,
@@ -2666,13 +2750,20 @@ impl App {
                         canvas().0 - EDGE * 2.0,
                         TEXT,
                     );
-                    theme::draw_centered_footer(painter, "FN or Select + X opens the session menu");
+                    theme::draw_centered_footer_cycle(
+                        painter,
+                        "FN or Select + X opens the session menu",
+                        "Low FPS or unstable internet? Lower bitrate and FPS in Settings.",
+                        self.session_wait_started
+                            .map(|started| started.elapsed().as_secs_f32())
+                            .unwrap_or(0.0),
+                    );
                 }
             }
         }
         if self.session_menu && self.play == PlayPhase::Live {
             let time_left = session_time_left_label(self.session_time_deadline);
-            theme::draw_session_menu(painter, self.session_menu_index as usize, &time_left);
+            theme::draw_session_menu(painter, self.session_menu_index as usize, &time_left, &self.clock);
         }
         if self.show_stats && matches!(self.screen, Screen::Stream) && self.play == PlayPhase::Live
         {
@@ -2883,12 +2974,4 @@ fn draw_notice(painter: &mut Painter, message: &str) {
             MUTED,
         );
     }
-    painter.text(
-        x + 28.0,
-        y + height - 42.0,
-        14.0,
-        Weight::Bold,
-        "Press B to close",
-        TEXT,
-    );
 }

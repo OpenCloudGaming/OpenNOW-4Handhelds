@@ -511,7 +511,7 @@ impl Store {
                 let (kind, enabled) = rows
                     .get(row)
                     .map(|item| (item.kind, item.enabled))
-                    .unwrap_or((MenuKind::Close, true));
+                    .unwrap_or((MenuKind::Back, true));
                 if !enabled {
                     return None;
                 }
@@ -546,11 +546,6 @@ impl Store {
                     MenuKind::Back => {
                         self.picking_store = false;
                         self.menu = Some(2);
-                        None
-                    }
-                    MenuKind::Close => {
-                        self.menu = None;
-                        self.picking_store = false;
                         None
                     }
                 };
@@ -604,10 +599,10 @@ impl Store {
 
     fn hints(&self, view: &View) -> Vec<(&'static str, &'static str)> {
         if self.filters_open {
-            return vec![("A", "Select"), ("B", "Close"), ("↑↓", "Navigate")];
+            return vec![("A", "Select"), ("↑↓", "Navigate")];
         }
         if self.keyboard.is_some() {
-            return vec![("X", "Shift"), ("A", "Type"), ("B", "Close")];
+            return vec![("X", "Shift"), ("A", "Type")];
         }
         if self.stores_loading {
             return vec![("B", "Back")];
@@ -616,7 +611,7 @@ impl Store {
             return vec![("A", "Select"), ("B", "Back")];
         }
         if self.menu.is_some() {
-            return vec![("A", "Select"), ("B", "Close")];
+            return vec![("A", "Select")];
         }
         if view.games.is_empty() && matches!(view.status, Status::Ready) {
             return vec![("X", "Search"), ("B", "Home")];
@@ -920,7 +915,6 @@ enum MenuKind {
     OpenStores,
     Store(usize),
     Back,
-    Close,
 }
 
 fn menu_rows(game: &Game, picking_store: bool) -> Vec<MenuItem> {
@@ -994,11 +988,6 @@ fn menu_rows(game: &Game, picking_store: bool) -> Vec<MenuItem> {
             label: select_label,
             kind: MenuKind::OpenStores,
             enabled: !game.id.is_empty(),
-        },
-        MenuItem {
-            label: "Close".into(),
-            kind: MenuKind::Close,
-            enabled: true,
         },
     ]
 }

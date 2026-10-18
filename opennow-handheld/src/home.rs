@@ -94,6 +94,7 @@ pub struct HomeView<'a> {
     pub artwork: &'a Artwork,
     pub library: &'a LibraryStatus,
     pub account: &'a str,
+    pub membership_tier: &'a str,
     pub status: &'a Status,
     pub clock: &'a Clock,
     pub seconds: f32,
@@ -257,7 +258,7 @@ impl Home {
                 let kind = rows
                     .get(row)
                     .map(|item| item.kind)
-                    .unwrap_or(MenuKind::Close);
+                    .unwrap_or(MenuKind::Back);
                 return match kind {
                     MenuKind::Remove => {
                         self.menu = None;
@@ -287,10 +288,6 @@ impl Home {
                         self.menu = Some(LibraryMenu::Main(1));
                         None
                     }
-                    MenuKind::Close => {
-                        self.menu = None;
-                        None
-                    }
                 };
             }
             _ => {}
@@ -312,19 +309,25 @@ impl Home {
         theme::draw_header(painter, view.clock);
         self.draw_shelf(painter, view);
         self.draw_dock(painter);
+        let tier = tier_label(view.membership_tier);
+        let identity = if tier.is_empty() {
+            view.account.to_owned()
+        } else {
+            format!("{} · {tier}", view.account)
+        };
         let status = match view.library {
             LibraryStatus::Loading if view.games.is_empty() => "Loading your library…".to_owned(),
-            LibraryStatus::Loading => format!("{} · loading more games…", view.account),
-            LibraryStatus::Loaded => format!("{} · {} games", view.account, view.games.len()),
+            LibraryStatus::Loading => format!("{identity} · loading more games…"),
+            LibraryStatus::Loaded => format!("{identity} · {} games", view.games.len()),
             LibraryStatus::Failed(message) => message.clone(),
         };
+        theme::draw_footer(painter, &status, &self.hints(view));
         if self.system_open {
             draw_system(painter, view);
         }
         if self.menu.is_some() {
             draw_menu(painter, self, view);
         }
-        theme::draw_footer(painter, &status, &self.hints(view));
     }
 
     fn hints(&self, view: &HomeView) -> Vec<(&'static str, &'static str)> {
@@ -335,10 +338,10 @@ impl Home {
             return vec![("A", "Select"), ("B", "Back")];
         }
         if self.menu.is_some() {
-            return vec![("A", "Select"), ("B", "Close")];
+            return vec![("A", "Select")];
         }
         if self.system_open {
-            return vec![("X", "Sign out"), ("B", "Close")];
+            return vec![("X", "Sign out")];
         }
         match self.focus {
             Focus::Dock => vec![("X", "System"), ("A", "Select")],
@@ -469,6 +472,17 @@ impl Home {
     }
 }
 
+fn tier_label(tier: &str) -> &str {
+    match tier.to_ascii_uppercase().as_str() {
+        "ULTIMATE" => "Ultimate",
+        "PERFORMANCE" => "Performance",
+        "PRIORITY" => "Priority",
+        "FOUNDERS" => "Founders",
+        _ if tier.is_empty() => "",
+        _ => tier,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LibraryMenu {
     Main(usize),
@@ -545,7 +559,6 @@ enum MenuKind {
     OpenStores,
     Store(usize),
     Back,
-    Close,
 }
 
 struct MenuItem {
@@ -563,10 +576,6 @@ fn menu_rows(game: &Game, menu: LibraryMenu) -> Vec<MenuItem> {
             MenuItem {
                 label: select_store_label(game),
                 kind: MenuKind::OpenStores,
-            },
-            MenuItem {
-                label: "Close".into(),
-                kind: MenuKind::Close,
             },
         ],
         LibraryMenu::Stores(_) => {
