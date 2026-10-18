@@ -58,8 +58,8 @@ build.sh             R36S build on Linux
 
 # Acknowledgements
 - [OpenNOW](https://github.com/OpenCloudGaming/OpenNOW), amazing project ^_^
-- [GreenOvercast](https://github.com/Producdevity/GreenOvercast) for giving an understanding on how to take advantage of hardware acceleration.
-- [Moonlight Embedded](https://github.com/moonlight-stream/moonlight-embedded)
+- [GreenOvercast](https://github.com/Producdevity/GreenOvercast) for the Rockchip MPP implementation used in this project.
+- [Moonlight Embedded](https://github.com/moonlight-stream/moonlight-embedded) for Rockchip MPP improvements.
 
 ## License
 MIT. Copyright (c) 2025 Zortos. See [LICENSE](LICENSE).
