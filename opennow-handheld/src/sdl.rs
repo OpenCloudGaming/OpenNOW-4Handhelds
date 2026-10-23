@@ -1,5 +1,7 @@
-//! Runtime-loaded SDL2. On dArkOS the system SDL2 drives the panel through
-//! KMSDRM and the Mali EGL driver, so no window manager is involved.
+//! Runtime-loaded SDL2. Handheld ports use PortMaster's libSDL2 when
+//! `OPENNOW_SDL2` points at it. dArkOS otherwise uses the system SDL2, which
+//! drives the panel through KMSDRM and the Mali EGL driver, so no window
+//! manager is involved.
 
 use libloading::Library;
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -203,6 +205,11 @@ impl Sdl {
     }
 
     pub fn init(&self) -> Result<(), String> {
+        // Face buttons stay in Xbox positions (A south, B east). The Nintendo
+        // layout then swaps them onto the labels printed on the handheld.
+        // SDL's label hint would swap them first and undo that default.
+        // Called once on this thread before SDL or any other thread starts.
+        unsafe { std::env::set_var("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0") };
         let flags = INIT_VIDEO | INIT_JOYSTICK | INIT_GAMECONTROLLER | INIT_EVENTS;
         if unsafe { (self.init)(flags) } != 0 {
             return Err(format!("SDL_Init failed: {}", self.error()));
@@ -381,15 +388,14 @@ impl Sdl {
                 button: event.bytes[12],
                 pressed: kind == EVENT_CONTROLLERBUTTONDOWN,
             },
-            // A mapped PC pad reports Select and Start through the controller
-            // API. Its raw buttons 12 and 13 are D-pad down and left, so
-            // forwarding them makes a roll of the D-pad hold Select and Start
-            // and quit. The R36S reports Select and Start only as raw buttons
-            // 12 and 13, including when SDL has a mapping, so Linux keeps them.
+            // A mapped pad already reports face buttons, the D-pad, and the
+            // sticks through the controller API. Forwarding the raw copies
+            // presses each one twice. Xbox layout sends those two copies to
+            // different face buttons, so both A and B fire. Select, Start, and
+            // FN stay raw: this port does not take those from the controller map.
             EVENT_JOYBUTTONDOWN | EVENT_JOYBUTTONUP
                 if !self.controller_joysticks.contains(&which)
-                    || matches!(event.bytes[12], 14 | 15 | 16)
-                    || (cfg!(target_os = "linux") && matches!(event.bytes[12], 12 | 13)) =>
+                    || matches!(event.bytes[12], 12 | 13 | 16) =>
             {
                 Event::JoyButton {
                     which,
@@ -397,16 +403,16 @@ impl Sdl {
                     pressed: kind == EVENT_JOYBUTTONDOWN,
                 }
             }
-            _ if self.controller_joysticks.contains(&which) => Event::Other,
-            EVENT_JOYHATMOTION => Event::JoyHat {
+            EVENT_JOYHATMOTION if !self.controller_joysticks.contains(&which) => Event::JoyHat {
                 which,
                 value: event.bytes[13],
             },
-            EVENT_JOYAXISMOTION => Event::JoyAxis {
+            EVENT_JOYAXISMOTION if !self.controller_joysticks.contains(&which) => Event::JoyAxis {
                 which,
                 axis: event.bytes[12],
                 value: event.i16_at(16),
             },
+            _ if self.controller_joysticks.contains(&which) => Event::Other,
             _ => Event::Other,
         };
         Some((parsed, None))

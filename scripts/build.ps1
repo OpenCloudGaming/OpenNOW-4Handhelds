@@ -8,16 +8,20 @@
 # Zig's Windows launcher is a batch file, and cmd.exe splits arguments at spaces.
 # rustc also expands an 8.3 short path back to the real folder name, so a project
 # path that contains a space cannot hold the compile cache. In that case the cache
-# is stored at C:\OpenNOW-r36s. The ports folder stays in builds\r36s\dist.
+# is stored at C:\OpenNOW-4Handhelds. Otherwise the cache is .cache\OpenNOW-4Handhelds.
+# The built port is build: OpenNOW.sh next to opennow/.
 
 param(
-    [string]$BuildRoot = (Join-Path $PSScriptRoot "builds\r36s"),
+    [string]$BuildRoot = "",
     [string]$CacheRoot = "",
     [string]$Glibc = "2.36"
 )
 
 $ErrorActionPreference = "Stop"
-$root = $PSScriptRoot
+$root = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
+    $BuildRoot = Join-Path $root "build"
+}
 $target = "aarch64-unknown-linux-gnu"
 
 function Get-ShortPath([string]$Path) {
@@ -38,11 +42,11 @@ if ($sysroot.Contains(" ")) { throw "No space-free short path for the Rust sysro
 if ([string]::IsNullOrWhiteSpace($CacheRoot)) {
     $projectPath = (Get-Item -LiteralPath $root).FullName
     if ($projectPath.Contains(" ")) {
-        $CacheRoot = "C:\OpenNOW-r36s"
+        $CacheRoot = "C:\OpenNOW-4Handhelds"
         Write-Host "The project path contains a space, so the compile cache cannot be stored in the project."
         Write-Host "The cache will be stored at $CacheRoot"
     } else {
-        $CacheRoot = $BuildRoot
+        $CacheRoot = Join-Path $root ".cache\OpenNOW-4Handhelds"
         Write-Host "Compile cache: $CacheRoot"
     }
 }
@@ -66,21 +70,21 @@ Invoke-ZigBuild (Join-Path $root "opennow-core\Cargo.toml") @("--no-default-feat
 Invoke-ZigBuild (Join-Path $root "opennow-streamer\Cargo.toml") @("-p", "opennow-streamer-ffi")
 Invoke-ZigBuild (Join-Path $root "opennow-handheld\Cargo.toml") @()
 
-# dist/ mirrors an EmulationStation ports directory: OpenNOW.sh plus opennow/.
-$dist = Join-Path $BuildRoot "dist"
+# build/ mirrors an EmulationStation ports directory: OpenNOW.sh plus opennow/.
+$dist = $BuildRoot
 $out = Join-Path $dist "opennow"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 $release = Join-Path $env:CARGO_TARGET_DIR "$target\release"
 foreach ($file in @("opennow-handheld", "opennow-core")) {
     Copy-Item (Join-Path $release $file) $out -Force
 }
-$libraries = Join-Path $out "libraries"
-New-Item -ItemType Directory -Force -Path $libraries | Out-Null
-Copy-Item (Join-Path $release "libopennow_streamer_ffi.so") $libraries -Force
+$libs = Join-Path $out "libraries"
+New-Item -ItemType Directory -Force -Path $libs | Out-Null
+Copy-Item (Join-Path $release "libopennow_streamer_ffi.so") $libs -Force
 Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Name -like "*.so*" } | Remove-Item -Force
 $mpp = Join-Path $root "third_party"
 foreach ($file in @("librockchip_mpp.so.0", "librockchip_mpp.so.1", "librockchip_vpu.so.0", "librockchip_vpu.so.1")) {
-    Copy-Item (Join-Path $mpp $file) $libraries -Force
+    Copy-Item (Join-Path $mpp $file) $libs -Force
 }
 # Windows editors save the launcher with CR LF. The kernel then looks for /bin/bash
 # plus a carriage return and reports "required file not found".
@@ -91,4 +95,6 @@ $config = Join-Path $out "stream.json"
 if (-not (Test-Path $config)) {
     Copy-Item (Join-Path $root "opennow-handheld\stream.json") $config
 }
+python (Join-Path $root "scripts\collect_licenses.py") --root $root --out (Join-Path $out "licenses")
+if ($LASTEXITCODE -ne 0) { throw "collecting third-party licenses failed" }
 Write-Host "R36S ports folder: $dist"

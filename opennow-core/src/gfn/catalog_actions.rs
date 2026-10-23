@@ -40,34 +40,45 @@ pub(super) fn readiness_decision(
     variant: &Value,
     playability: PlayabilityMetadata,
 ) -> Option<LaunchDecision> {
+    readiness_decision_for_provider(game, variant, playability, false)
+}
+
+fn readiness_decision_for_provider(
+    game: &Value,
+    variant: &Value,
+    playability: PlayabilityMetadata,
+    partner_managed_entitlements: bool,
+) -> Option<LaunchDecision> {
     use LaunchStatus::*;
     let decide = |status, message| LaunchDecision { status, message };
-    match game["playabilityState"].as_str() {
-        Some("PLAYABLE") => (),
-        Some("UNPLAYABLE_DUE_TO_UPGRADE" | "UNPLAYABLE_DUE_TO_TIME_CAPPED_LIMIT") => {
-            return Some(decide(
-                SubscriptionRequired,
-                "Your GeForce NOW membership does not currently allow this game. Check your membership and available playtime.",
-            ));
-        }
-        Some("UNKNOWN") => {
-            return Some(decide(
-                MetadataUnconfirmed,
-                "Game availability could not be confirmed. Refresh and try again.",
-            ));
-        }
-        None if matches!(playability, PlayabilityMetadata::Required) => {
-            return Some(decide(
-                MetadataUnconfirmed,
-                "Game availability could not be confirmed. Refresh and try again.",
-            ));
-        }
-        None => (),
-        _ => {
-            return Some(decide(
-                Unavailable,
-                "This game is currently unavailable on GeForce NOW.",
-            ));
+    if !partner_managed_entitlements {
+        match game["playabilityState"].as_str() {
+            Some("PLAYABLE") => (),
+            Some("UNPLAYABLE_DUE_TO_UPGRADE" | "UNPLAYABLE_DUE_TO_TIME_CAPPED_LIMIT") => {
+                return Some(decide(
+                    SubscriptionRequired,
+                    "Your GeForce NOW membership does not currently allow this game. Check your membership and available playtime.",
+                ));
+            }
+            Some("UNKNOWN") => {
+                return Some(decide(
+                    MetadataUnconfirmed,
+                    "Game availability could not be confirmed. Refresh and try again.",
+                ));
+            }
+            None if matches!(playability, PlayabilityMetadata::Required) => {
+                return Some(decide(
+                    MetadataUnconfirmed,
+                    "Game availability could not be confirmed. Refresh and try again.",
+                ));
+            }
+            None => (),
+            _ => {
+                return Some(decide(
+                    Unavailable,
+                    "This game is currently unavailable on GeForce NOW.",
+                ));
+            }
         }
     }
     match variant["stateDetails"]["__typename"].as_str() {
@@ -128,6 +139,17 @@ pub(super) fn account_decision(
     access: &Value,
     subscription: &Value,
 ) -> Option<LaunchDecision> {
+    account_decision_for_provider(game, variant, variant_id, access, subscription, false)
+}
+
+fn account_decision_for_provider(
+    game: &Value,
+    variant: &Value,
+    variant_id: &str,
+    access: &Value,
+    subscription: &Value,
+    partner_managed_entitlements: bool,
+) -> Option<LaunchDecision> {
     use LaunchStatus::*;
     let decide = |status, message| LaunchDecision { status, message };
     let store =
@@ -135,7 +157,13 @@ pub(super) fn account_decision(
     // NVIDIA hosts these versions itself. A demo on NV Bundle has no Steam or
     // Epic account to link, so the missing store record is not a launch block.
     if nvidia_bundle(&store) {
-        return membership_decision(game, variant, access, subscription);
+        return membership_decision(
+            game,
+            variant,
+            access,
+            subscription,
+            partner_managed_entitlements,
+        );
     }
     if access["definitions"]["stores"]["status"] != "success" {
         return Some(decide(
@@ -171,7 +199,13 @@ pub(super) fn account_decision(
             "The selected store's linking requirement could not be confirmed.",
         ));
     }
-    membership_decision(game, variant, access, subscription)
+    membership_decision(
+        game,
+        variant,
+        access,
+        subscription,
+        partner_managed_entitlements,
+    )
 }
 
 fn nvidia_bundle(store: &str) -> bool {
@@ -186,6 +220,7 @@ fn membership_decision(
     variant: &Value,
     access: &Value,
     subscription: &Value,
+    partner_managed_entitlements: bool,
 ) -> Option<LaunchDecision> {
     use LaunchStatus::*;
     let decide = |status, message| LaunchDecision { status, message };
@@ -203,6 +238,12 @@ fn membership_decision(
                 "The store subscription recorded for this version is not active. Check your store account and sync your library.",
             ));
         }
+    }
+    // Alliance partners manage membership tiers and playtime independently.
+    // NVIDIA's MES/catalog entitlement fields are not authoritative for them;
+    // the partner's session service makes the final entitlement decision.
+    if partner_managed_entitlements {
+        return None;
     }
     if game["membershipTierLabel"].as_str().is_some_and(|tier| {
         !tier.trim().is_empty() && !tier.trim().to_ascii_lowercase().starts_with("free")
@@ -239,12 +280,24 @@ pub(super) fn game_play_denial(subscription: &Value) -> Option<LaunchDecision> {
     })
 }
 
+#[cfg(test)]
 fn launch_decision(
     game: &Value,
     app_id: &str,
     variant_id: &str,
     subscription: &Value,
     access: &Value,
+) -> LaunchDecision {
+    launch_decision_for_provider(game, app_id, variant_id, subscription, access, false)
+}
+
+fn launch_decision_for_provider(
+    game: &Value,
+    app_id: &str,
+    variant_id: &str,
+    subscription: &Value,
+    access: &Value,
+    partner_managed_entitlements: bool,
 ) -> LaunchDecision {
     use LaunchStatus::*;
     let decide = |status, message| LaunchDecision { status, message };
@@ -260,7 +313,12 @@ fn launch_decision(
             "The selected store version is no longer available. Choose a store version again.",
         );
     };
-    if let Some(decision) = readiness_decision(game, variant, PlayabilityMetadata::Required) {
+    if let Some(decision) = readiness_decision_for_provider(
+        game,
+        variant,
+        PlayabilityMetadata::Required,
+        partner_managed_entitlements,
+    ) {
         return decision;
     }
     match variant["libraryStatus"].as_str() {
@@ -278,7 +336,14 @@ fn launch_decision(
             );
         }
     }
-    if let Some(decision) = account_decision(game, variant, variant_id, access, subscription) {
+    if let Some(decision) = account_decision_for_provider(
+        game,
+        variant,
+        variant_id,
+        access,
+        subscription,
+        partner_managed_entitlements,
+    ) {
         return decision;
     }
     if variant["librarySelected"] == false {
@@ -411,7 +476,8 @@ impl GfnService {
             return self.store_launch_inspect(params, Some((&app_id, &variant_id)), settings);
         }
         let mut result = self.catalog_game(&json!({"appId":app_id}), settings)?;
-        let subscription = if result["game"]["membershipTierLabel"]
+        let partner_managed_entitlements = result["scope"]["providerIdpId"] != DEFAULT_IDP_ID;
+        let subscription = if !partner_managed_entitlements && result["game"]["membershipTierLabel"]
             .as_str()
             .is_some_and(|tier| {
                 !tier.trim().is_empty() && !tier.trim().to_ascii_lowercase().starts_with("free")
@@ -444,12 +510,13 @@ impl GfnService {
         } else {
             Value::Null
         };
-        result["decision"] = serde_json::to_value(launch_decision(
+        result["decision"] = serde_json::to_value(launch_decision_for_provider(
             &result["game"],
             &app_id,
             &variant_id,
             &subscription,
             &access,
+            partner_managed_entitlements,
         ))
         .expect("launch decision serializable");
         result["appId"] = json!(app_id);

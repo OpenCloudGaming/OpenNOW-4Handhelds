@@ -42,7 +42,7 @@ pub const TEXT: Color = rgb(0xF2F4F6);
 pub const MUTED: Color = rgb(0x9AA0A6);
 pub const TITLE: Color = rgb(0x76EF36);
 pub const FOCUS: Color = rgb(0x76EF36);
-pub const DOCK_FACE: Color = rgb(0xF4F4F5);
+pub const DOCK_FACE: Color = rgb(0x34383F);
 pub const SEPARATOR: Color = rgb(0x3A3E46);
 pub const ADD_TILE: Color = rgb(0x2A2D33);
 pub const PANEL: Color = rgb(0x22252A);
@@ -136,16 +136,20 @@ pub fn draw_footer(painter: &mut Painter, status: &str, hints: &[(&str, &str)]) 
 
 pub fn draw_centered_footer_cycle(painter: &mut Painter, first: &str, second: &str, elapsed: f32) {
     painter.fill(0.0, separator_y(), canvas().0, 1.0, 0.0, SEPARATOR);
-    let phase = elapsed.rem_euclid(10.0);
-    let (first_alpha, second_alpha) = if phase < 4.5 {
+    const MESSAGE_INTERVAL: f32 = 8.0;
+    const FADE_DURATION: f32 = 0.5;
+    let phase = elapsed.rem_euclid(MESSAGE_INTERVAL * 2.0);
+    let fade_start = MESSAGE_INTERVAL - FADE_DURATION;
+    let cycle_fade_start = MESSAGE_INTERVAL * 2.0 - FADE_DURATION;
+    let (first_alpha, second_alpha) = if phase < fade_start {
         (1.0, 0.0)
-    } else if phase < 5.0 {
-        let progress = smoothstep((phase - 4.5) / 0.5);
+    } else if phase < MESSAGE_INTERVAL {
+        let progress = smoothstep((phase - fade_start) / FADE_DURATION);
         (1.0 - progress, progress)
-    } else if phase < 9.5 {
+    } else if phase < cycle_fade_start {
         (0.0, 1.0)
     } else {
-        let progress = smoothstep((phase - 9.5) / 0.5);
+        let progress = smoothstep((phase - cycle_fade_start) / FADE_DURATION);
         (progress, 1.0 - progress)
     };
     draw_centered_footer_line(painter, first, first_alpha);
@@ -186,9 +190,10 @@ fn draw_wrapped(
     max_width: f32,
     line_gap: f32,
     color: Color,
-) {
+) -> f32 {
     let mut line = String::new();
     let mut line_y = y;
+    let mut lines = 0.0;
     for word in text.split_whitespace() {
         let candidate = if line.is_empty() {
             word.to_owned()
@@ -201,11 +206,14 @@ fn draw_wrapped(
         }
         painter.text(x, line_y, size, weight, &line, color);
         line_y += line_gap;
+        lines += 1.0;
         line = word.to_owned();
     }
     if !line.is_empty() {
         painter.text_fit(x, line_y, size, weight, &line, max_width, color);
+        lines += 1.0;
     }
+    lines * line_gap
 }
 
 fn draw_button_glyph(painter: &mut Painter, x: f32, y: f32, glyph: &str) {
@@ -252,45 +260,81 @@ pub fn draw_confirm(
     confirm: &str,
     confirm_selected: bool,
 ) {
-    let (width, height) = (380.0, 190.0);
+    let pad = 20.0;
+    let width = (canvas().0 - 40.0).clamp(260.0, 360.0);
+    let text_width = width - pad * 2.0;
+    let line_gap = 20.0;
+    let body_height = wrap_height(painter, body, 15.0, Weight::SemiBold, text_width, line_gap);
+    let button_height = 40.0;
+    let height = pad + 26.0 + body_height + 14.0 + button_height + pad;
     let x = (canvas().0 - width) / 2.0;
-    let y = (canvas().1 - height) / 2.0;
+    let y = ((canvas().1 - height) / 2.0).max(12.0);
     draw_panel(painter, x, y, width, height);
-    painter.text(x + 26.0, y + 24.0, 24.0, Weight::Black, title, TEXT);
+    painter.text(x + pad, y + pad, 20.0, Weight::Black, title, TEXT);
     draw_wrapped(
         painter,
-        x + 26.0,
-        y + 62.0,
+        x + pad,
+        y + pad + 26.0,
         15.0,
         Weight::SemiBold,
         body,
-        width - 52.0,
-        20.0,
+        text_width,
+        line_gap,
         MUTED,
     );
+    let button_width = (text_width - 8.0) / 2.0;
+    let button_y = y + height - pad - button_height;
     for (index, label) in ["Cancel", confirm].iter().enumerate() {
         let selected = (index == 1) == confirm_selected;
-        let (button_x, button_y, button_width) =
-            (x + 26.0 + index as f32 * 176.0, y + 118.0, 152.0);
+        let button_x = x + pad + index as f32 * (button_width + 8.0);
         painter.fill(
             button_x,
             button_y,
             button_width,
-            44.0,
-            22.0,
+            button_height,
+            17.0,
             if selected { FOCUS } else { BUTTON },
         );
         let label_width = painter.measure(label, 16.0, Weight::ExtraBold);
         let color = if selected { BACKGROUND } else { TEXT };
         painter.text(
             button_x + (button_width - label_width) / 2.0,
-            button_y + 11.0,
+            button_y + 10.0,
             16.0,
             Weight::ExtraBold,
             label,
             color,
         );
     }
+}
+
+fn wrap_height(
+    painter: &mut Painter,
+    text: &str,
+    size: f32,
+    weight: Weight,
+    max_width: f32,
+    line_gap: f32,
+) -> f32 {
+    let mut line = String::new();
+    let mut lines: f32 = 0.0;
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if line.is_empty() || painter.measure(&candidate, size, weight) <= max_width {
+            line = candidate;
+            continue;
+        }
+        lines += 1.0;
+        line = word.to_owned();
+    }
+    if !line.is_empty() {
+        lines += 1.0;
+    }
+    lines.max(1.0) * line_gap
 }
 
 pub fn draw_session_menu(painter: &mut Painter, selected: usize, time_left: &str, clock: &Clock) {

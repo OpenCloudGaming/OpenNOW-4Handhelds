@@ -221,6 +221,8 @@ impl CloudMatchService {
         device_id: &str,
         connection: impl FnOnce() -> Result<(Client, Url), ServiceError>,
     ) -> Result<Value, ServiceError> {
+        let settings = allocation_settings(settings, auth);
+        let settings = &settings;
         let (client, base) = connection()?;
         crate::requests::check()?;
         let app_id = launch_app_id(params)?;
@@ -257,9 +259,14 @@ impl CloudMatchService {
             .join("v2/session")
             .map_err(|_| invalid("Invalid CloudMatch session URL"))?;
         crate::language::append_session_preferences(&mut url, settings);
+        let headers = cloudmatch_headers_with(
+            token,
+            device_id,
+            settings["allianceWebrtcCompatibility"] == true,
+        )?;
         let response = client
             .post(url)
-            .headers(cloudmatch_headers(token, device_id)?)
+            .headers(headers.clone())
             .json(&body)
             .send()
             .map_err(|error| network("Session creation failed", error))?;
@@ -279,6 +286,12 @@ impl CloudMatchService {
             .or_else(|| base.host_str().map(ToOwned::to_owned))
             .unwrap_or_default();
         let mut info = session_info(&payload, &base, &zone, &app_id, device_id)?;
+        info["transportMode"] = json!(if settings["allianceWebrtcCompatibility"] == true {
+            "webrtc"
+        } else {
+            "nvst"
+        });
+        select_webrtc_endpoint(&mut info);
         info["keyboardLayout"] = json!(crate::language::session_keyboard_layout(settings));
         if let Some(session_id) = network_test["sessionId"].as_str() {
             info["networkTestSessionId"] = json!(session_id);
@@ -295,7 +308,7 @@ impl CloudMatchService {
             info: info.clone(),
             base: control_base,
             client: client.clone(),
-            headers: cloudmatch_headers(token, device_id)?,
+            headers,
             owner: (auth.provider.idp_id.clone(), auth.user.user_id.clone()),
         });
         if crate::requests::current().cancelled() {
@@ -313,6 +326,13 @@ impl CloudMatchService {
             request_profile["codecSource"] = json!("unreported");
         } else {
             request_profile["codecSource"] = json!("request");
+        }
+        if info["transportMode"] == "webrtc" {
+            request_profile["codec"] =
+                json!(setting_string(settings, "codec", "h264").to_ascii_uppercase());
+            request_profile["codecSource"] = json!("request");
+            request_profile["enableHdr"] = json!(false);
+            request_profile["enableHdrSource"] = json!("request");
         }
         let request_codec = json!({
             "sessionId":info["sessionId"],
@@ -476,7 +496,10 @@ impl CloudMatchService {
             .ok_or_else(|| invalid("No active session control endpoint"))?;
         let base = trusted_cloudmatch_base(&control_base)?;
         let token = session_token(auth);
-        let headers = cloudmatch_headers(token, device_id)?;
+        let webrtc = current
+            .as_ref()
+            .is_some_and(|state| state.info["transportMode"] == "webrtc");
+        let headers = cloudmatch_headers_with(token, device_id, webrtc)?;
         let payload = match self.get_session(&client, &base, &session_id, &headers) {
             Ok(payload) => {
                 eprintln!(
@@ -504,6 +527,14 @@ impl CloudMatchService {
             .map(|state| state.app_id.clone())
             .unwrap_or_default();
         let mut info = session_info(&payload, &base, &zone, &app_id, device_id)?;
+        if current
+            .as_ref()
+            .is_some_and(|state| state.info["transportMode"] == "webrtc")
+        {
+            info["transportMode"] = json!("webrtc");
+            info["preferredTransportMode"] = json!("webrtc");
+            select_webrtc_endpoint(&mut info);
+        }
 
         info["phase"] =
             Value::String(session_phase(info["status"].as_i64().unwrap_or_default()).to_owned());
@@ -514,18 +545,25 @@ impl CloudMatchService {
             mark_resume_progress(&mut info);
         }
         let ready = matches!(info["status"].as_i64(), Some(2 | 3))
-            && info["rtspsEndpoints"]
+            && (info["rtspsEndpoints"]
                 .as_array()
-                .is_some_and(|endpoints| !endpoints.is_empty());
+                .is_some_and(|endpoints| !endpoints.is_empty())
+                || (info["transportMode"] == "webrtc" && has_webrtc_endpoint(&info)));
         if !ready {
-            // Stay on the host that created this session. The response's
-            // sessionControlInfo.ip otherwise points the next poll at another
-            // zone, and each zone reports a different queue position.
-            info["streamingBaseUrl"] = json!(base.origin().ascii_serialization());
+            // sessionControlInfo names the host that owns the queue. Staying on
+            // the create host after that moves makes the old host abandon the
+            // request with SESSION_REQUEST_IN_QUEUE_ABANDONED.
+            info["streamingBaseUrl"] = json!(queue_poll_base(
+                &base,
+                info["streamingBaseUrl"].as_str().unwrap_or("")
+            ));
             let server_id = payload["requestStatus"]["serverId"].as_str().unwrap_or("");
             let host = base.host_str().unwrap_or("");
             if !response_matches_host(host, server_id) {
-                if let Some(previous) = current.as_ref().filter(|state| state.session_id == session_id) {
+                if let Some(previous) = current
+                    .as_ref()
+                    .filter(|state| state.session_id == session_id)
+                {
                     info["queuePosition"] = previous.info["queuePosition"].clone();
                     info["seatSetupInfo"] = previous.info["seatSetupInfo"].clone();
                 }
@@ -625,7 +663,14 @@ impl CloudMatchService {
             &session_id,
             &client,
             url,
-            cloudmatch_headers(session_token(auth), device_id)?,
+            cloudmatch_headers_with(
+                session_token(auth),
+                device_id,
+                current
+                    .as_ref()
+                    .is_some_and(|state| state.info["transportMode"] == "webrtc")
+                    || webrtc_compatibility_enabled(settings, auth),
+            )?,
         )
     }
 
@@ -932,7 +977,11 @@ impl CloudMatchService {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| invalid("session.claim requires sessionId"))?;
         let requested = requested_streaming_base(params, settings, auth)?;
-        let headers = cloudmatch_headers(session_token(auth), device_id)?;
+        let headers = cloudmatch_headers_with(
+            session_token(auth),
+            device_id,
+            webrtc_compatibility_enabled(settings, auth),
+        )?;
         let discovered = self
             .discovered
             .lock()
@@ -974,6 +1023,8 @@ impl CloudMatchService {
         if session["sessionId"] != session_id {
             return Err(upstream("CloudMatch returned a different session ID"));
         }
+        // Alliance only has WebRTC. CloudMatch often omits GSStreamerType on a
+        // live seat. Refusing that seat and stopping it throws away the queue.
         let initial_status = value_i64(&session["status"]).unwrap_or_default();
         let learned_server = first_string(&session["sessionControlInfo"]["ip"]);
         let control_base = learned_server
@@ -987,13 +1038,15 @@ impl CloudMatchService {
         if initial_status == 7 {
             check()?;
             self.clear_active(session_id);
-            let info = session_info(&initial_payload, &control_base, "", &app_id, device_id)?;
+            let mut info = session_info(&initial_payload, &control_base, "", &app_id, device_id)?;
+            keep_alliance_webrtc(&mut info, settings, auth);
             return Ok(json!({"session":info}));
         }
         if mode == AttachMode::Reconcile {
             session_requires_resume(initial_status)?;
             let zone = zone_base.host_str().unwrap_or_default();
             let mut info = session_info(&initial_payload, &control_base, zone, &app_id, device_id)?;
+            keep_alliance_webrtc(&mut info, settings, auth);
             check()?;
             self.store_active(&mut info, &control_base, zone, &app_id, client)?;
             return Ok(json!({"session":info}));
@@ -1024,8 +1077,13 @@ impl CloudMatchService {
         // Qt schedules cancellable session.poll requests until the fresh GET
         // reports status 2/3 with native endpoints. No long blocking RPC loop.
         let mut info = session_info(&initial_payload, &control_base, zone, &app_id, device_id)?;
+        keep_alliance_webrtc(&mut info, settings, auth);
         if resumed {
             info["keyboardLayout"] = json!(crate::language::session_keyboard_layout(settings));
+            // A resumed Alliance seat must sign in as a new signaling peer.
+            // reconnect=1 only resends the offer to the peer that already
+            // received it, and that peer id does not survive the previous
+            // client. Setting it here made the second launch wait forever.
         }
         info["resumePending"] = json!(true);
         info["phase"] = json!("resuming");
@@ -1183,6 +1241,16 @@ impl CloudMatchService {
                             408 | 425 | 429 | 500 | 502 | 503 | 504
                         ) =>
                 {
+                    let status_code = response.status();
+                    let body = response.text().unwrap_or_default();
+                    if queue_was_abandoned(&body) {
+                        let payload = serde_json::from_str(&body).ok();
+                        return Err(cloudmatch_http_error(
+                            "Session polling failed",
+                            status_code,
+                            payload.as_ref(),
+                        ));
+                    }
                     thread::sleep(Duration::from_millis(if attempt == 0 { 250 } else { 750 }));
                 }
                 Ok(response) => {
@@ -1332,17 +1400,110 @@ fn mark_resume_progress(info: &mut Value) {
         return;
     }
     let ready = matches!(info["status"].as_i64(), Some(2 | 3))
-        && info["rtspsEndpoints"]
-            .as_array()
-            .is_some_and(|endpoints| !endpoints.is_empty());
+        && if info["transportMode"] == "webrtc" {
+            has_webrtc_endpoint(info)
+        } else {
+            info["rtspsEndpoints"]
+                .as_array()
+                .is_some_and(|endpoints| !endpoints.is_empty())
+        };
     info["resumePending"] = json!(!ready);
     if !ready {
         info["phase"] = json!("resuming");
     }
 }
 
+fn webrtc_compatibility_enabled(settings: &Value, auth: &AuthSession) -> bool {
+    let provider = auth.provider.code.trim();
+    let automatic = !auth.provider.idp_id.is_empty()
+        && !provider.is_empty()
+        && !provider.eq_ignore_ascii_case("NVIDIA");
+    match settings["webrtcCompatibilityMode"].as_str() {
+        Some("on") => true,
+        Some("off") => false,
+        Some("auto") => automatic,
+        _ => settings["allianceWebrtcCompatibility"] == true || automatic,
+    }
+}
+
+fn allocation_settings(settings: &Value, auth: &AuthSession) -> Value {
+    let mut settings = settings.clone();
+    let enabled = webrtc_compatibility_enabled(&settings, auth);
+    settings["allianceWebrtcCompatibility"] = json!(enabled);
+    if enabled {
+        let hevc = codec_wire(&setting_string(&settings, "codec", "auto")) == 2;
+        settings["codec"] = json!(if hevc { "h265" } else { "h264" });
+        settings["colorQuality"] = json!(if hevc
+            && matches!(
+                settings["colorQuality"].as_str(),
+                Some("10bit_420" | "10bit_444")
+            ) {
+            "10bit_420"
+        } else {
+            "8bit_420"
+        });
+        settings["enableHdr"] = json!(false);
+        settings["nativeHdrSupported"] = json!(false);
+        settings["microphoneMode"] = json!("disabled");
+        settings["enableCloudGsync"] = json!(false);
+        settings["nativeCloudGsyncMode"] = json!("disabled");
+        let (width, height) =
+            parse_resolution(&setting_string(&settings, "resolution", "1920x1080"));
+        if (!hevc && (width > 1920 || height > 1080)) || width == 0 || height == 0 {
+            settings["resolution"] = json!("1920x1080");
+        }
+        settings["fps"] = json!(
+            settings["fps"]
+                .as_u64()
+                .filter(|fps| *fps > 0)
+                .unwrap_or(60)
+                .clamp(30, if hevc { 360 } else { 60 })
+        );
+    }
+    settings
+}
+
+fn keep_alliance_webrtc(info: &mut Value, settings: &Value, auth: &AuthSession) {
+    if !webrtc_compatibility_enabled(settings, auth) {
+        return;
+    }
+    info["transportMode"] = json!("webrtc");
+    info["preferredTransportMode"] = json!("webrtc");
+    select_webrtc_endpoint(info);
+}
+
+fn reported_webrtc_session(session: &Value) -> bool {
+    session["sessionRequestData"]["secureRTSPSupported"] != true
+        && session["sessionRequestData"]["metaData"]
+            .as_array()
+            .is_some_and(|metadata| {
+                metadata
+                    .iter()
+                    .any(|entry| entry["key"] == "GSStreamerType" && entry["value"] == "WebRTC")
+            })
+}
+
+fn reported_native_session(session: &Value) -> bool {
+    session["sessionRequestData"]["secureRTSPSupported"] == true
+        || value_i64(&session["sessionRequestData"]["streamerVersion"]) == Some(14)
+}
+
+pub(crate) fn has_webrtc_endpoint(session: &Value) -> bool {
+    session["connectionInfo"]
+        .as_array()
+        .is_some_and(|connections| {
+            connections
+                .iter()
+                .filter_map(webrtc_signaling_endpoint)
+                .any(|url| session["signalingUrl"] == url.as_str())
+        })
+}
+
 fn build_resume_body(app_id: &str, session: &Value, settings: &Value, device_id: &str) -> Value {
-    let created = build_create_body(app_id, &json!({}), settings, device_id);
+    let mut settings = settings.clone();
+    let webrtc = reported_webrtc_session(session) || session["transportMode"] == "webrtc";
+    settings["allianceWebrtcCompatibility"] = json!(webrtc);
+    let created = build_create_body(app_id, &json!({}), &settings, device_id);
     let source = &created["sessionRequestData"];
     let mut request = serde_json::Map::new();
     // Resume must not renegotiate codec, monitor geometry, FPS or bitrate.
@@ -1371,6 +1532,10 @@ fn build_resume_body(app_id: &str, session: &Value, settings: &Value, device_id:
         "sdrHdrMode".to_owned(),
         json!(accepted_hdr_mode(session).unwrap_or(0)),
     );
+    if webrtc {
+        request.insert("sdkVersion".to_owned(), json!("1.0"));
+        request.insert("enhancedStreamMode".to_owned(), json!(1));
+    }
     request.insert(
         "metaData".to_owned(),
         json!(
@@ -1466,8 +1631,7 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
     };
     let cloud_gsync = resolved_cloud_gsync(settings);
     let reflex = cloud_gsync || fps >= 120;
-    let persistence = setting_bool(settings, "enablePersistingInGameSettings", true)
-        && params["supportsInGameSettingsPersistence"].as_bool() == Some(true);
+    let persistence = false;
     let metadata = vec![
         json!({"key":"wssignaling","value":"1"}),
         json!({"key":"SubSessionId","value":random_uuid()}),
@@ -1497,7 +1661,7 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
     features["mouseMovementFlags"] = json!(0);
     features["trueHdr"] = json!(false);
     features["hidDevices"] = Value::Null;
-    json!({"sessionRequestData":{
+    let mut body = json!({"sessionRequestData":{
         "appId":app_id.parse::<i64>().unwrap_or_default(),
         "internalTitle":params["title"].as_str(),
         "availableSupportedControllers":[2],
@@ -1536,7 +1700,230 @@ fn build_create_body(app_id: &str, params: &Value, settings: &Value, device_id: 
         "userAge":25,
         "requestedStreamingFeatures":features,
         "transport":null
-    }})
+    }});
+    if settings["allianceWebrtcCompatibility"] == true {
+        let request = &mut body["sessionRequestData"];
+        request["sdkVersion"] = json!("1.0");
+        request["streamerVersion"] = json!(1);
+        request["enhancedStreamMode"] = json!(1);
+        request["secureRTSPSupported"] = json!(false);
+        request["remoteControllersBitmap"] = json!(0);
+        request["clientPlatformName"] = json!("browser");
+        request["availableSupportedControllers"] = json!([]);
+        request["partnerCustomData"] = json!("");
+        request["clientRequestMonitorSettings"][0]["dpi"] = json!(0);
+        request["clientRequestMonitorSettings"][0]["displayData"] = json!({
+            "desiredContentMaxLuminance":0,
+            "desiredContentMinLuminance":0,
+            "desiredContentMaxFrameAverageLuminance":0
+        });
+        if let Some(features) = request["requestedStreamingFeatures"].as_object_mut() {
+            features.insert("profile".to_owned(), json!(1));
+            features.remove("supportedHidDevices");
+            features.remove("mouseMovementFlags");
+            features.remove("trueHdr");
+            features.remove("hidDevices");
+            features.remove("prefilterSharpness");
+            features.remove("prefilterNoiseReduction");
+            features.insert(
+                "dlssOverrides".to_owned(),
+                json!({
+                    "srMode":0,"srModel":0,"srScale":100,
+                    "rrModel":0,"fgMode":0,"fgModel":0,"fgMultiplier":3
+                }),
+            );
+        }
+        let width = request["clientRequestMonitorSettings"][0]["widthInPixels"].clone();
+        let height = request["clientRequestMonitorSettings"][0]["heightInPixels"].clone();
+        request["metaData"]
+            .as_array_mut()
+            .expect("session metadata array")
+            .extend([
+                json!({"key":"GSStreamerType","value":"WebRTC"}),
+                json!({"key":"networkType","value":"Unknown"}),
+                json!({"key":"ClientImeSupport","value":"0"}),
+                json!({
+                    "key":"clientPhysicalResolution",
+                    "value":json!({"horizontalPixels":width,"verticalPixels":height}).to_string()
+                }),
+            ]);
+        let request = request.as_object_mut().expect("session request object");
+        request.remove("preferredController");
+        request.remove("requestedAudioFormat");
+        request.remove("transport");
+    }
+    body
+}
+
+fn valid_webrtc_endpoint(value: &Value) -> bool {
+    value
+        .as_str()
+        .and_then(|raw| Url::parse(raw).ok())
+        .is_some_and(|url| {
+            url.scheme() == "wss"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+fn select_webrtc_endpoint(session: &mut Value) {
+    if session["transportMode"] != "webrtc" {
+        return;
+    }
+    let endpoint = session["connectionInfo"]
+        .as_array()
+        .and_then(|connections| {
+            connections
+                .iter()
+                .filter(|connection| {
+                    let resource = connection["resourcePath"].as_str().unwrap_or_default();
+                    resource.starts_with("wss://")
+                        || resource.starts_with("https://")
+                        || (value_i64(&connection["usage"]) == Some(14)
+                            && !matches!(value_i64(&connection["appLevelProtocol"]), Some(1 | 6))
+                            && !resource.starts_with("rtsp://")
+                            && !resource.starts_with("rtsps://"))
+                })
+                .chain(
+                    connections
+                        .iter()
+                        .filter(|connection| value_i64(&connection["usage"]) == Some(14)),
+                )
+                .chain(
+                    connections
+                        .iter()
+                        .filter(|connection| value_i64(&connection["usage"]) == Some(16)),
+                )
+                .find_map(|connection| {
+                    webrtc_signaling_endpoint(connection)
+                        .map(|url| (url, first_string(&connection["ip"])))
+                })
+        });
+    let media = session["connectionInfo"]
+        .as_array()
+        .and_then(|connections| {
+            [2, 17]
+                .into_iter()
+                .find_map(|usage| {
+                    connections
+                        .iter()
+                        .filter(|connection| value_i64(&connection["usage"]) == Some(usage))
+                        .find_map(media_connection_info)
+                })
+                .or_else(|| {
+                    connections
+                        .iter()
+                        .filter(|connection| {
+                            value_i64(&connection["usage"]) == Some(14)
+                                && !matches!(
+                                    value_i64(&connection["appLevelProtocol"]),
+                                    Some(1 | 6)
+                                )
+                                && !connection["resourcePath"].as_str().is_some_and(|resource| {
+                                    resource.starts_with("rtsp://")
+                                        || resource.starts_with("rtsps://")
+                                })
+                        })
+                        .filter_map(media_connection_info)
+                        .max_by_key(|media| media["port"].as_i64())
+                })
+        });
+    session["mediaConnectionInfo"] = json!(media);
+    session["signalingUrl"] = json!(endpoint.as_ref().map(|(url, _)| url.as_str()));
+    if let Some((endpoint, server_ip)) = endpoint {
+        session["serverIp"] = json!(server_ip.or_else(|| {
+            endpoint
+                .host_str()
+                .map(|host| host.trim_matches(['[', ']']).to_owned())
+        }));
+        session["signalingServer"] = json!(format!(
+            "{}:{}",
+            endpoint.host_str().unwrap_or_default(),
+            endpoint.port_or_known_default().unwrap_or(443)
+        ));
+    }
+}
+
+fn media_connection_info(connection: &Value) -> Option<Value> {
+    let ip = first_string(&connection["ip"]).or_else(|| {
+        connection["resourcePath"]
+            .as_str()
+            .and_then(host_from_resource)
+    })?;
+    let port = value_i64(&connection["port"]).or_else(|| {
+        Url::parse(connection["resourcePath"].as_str()?)
+            .ok()?
+            .port()
+            .map(i64::from)
+    })?;
+    (1..=65535)
+        .contains(&port)
+        .then(|| json!({"ip":ip,"port":port,"usage":connection["usage"]}))
+}
+
+fn webrtc_signaling_endpoint(connection: &Value) -> Option<Url> {
+    if !matches!(value_i64(&connection["usage"]), Some(14 | 16)) {
+        return None;
+    }
+    let resource = connection["resourcePath"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+        .unwrap_or("/nvst/");
+    let rtsp = resource.starts_with("rtsp://") || resource.starts_with("rtsps://");
+    let native_descriptor = value_i64(&connection["usage"]) == Some(16)
+        || matches!(value_i64(&connection["appLevelProtocol"]), Some(1 | 6));
+    let absolute = resource.starts_with("wss://") || resource.starts_with("https://") || rtsp;
+    let mut url = if absolute {
+        let mut url = if rtsp {
+            Url::parse(&format!("wss://{}", resource.split_once("://")?.1)).ok()?
+        } else {
+            Url::parse(resource).ok()?
+        };
+        url.set_scheme("wss").ok()?;
+        // Desktop OpenNOW signals Alliance seats at wss://<server>:443/nvst/.
+        // The rtsps://host:322 string is only how CloudMatch names that server.
+        if rtsp {
+            url.set_port(None).ok()?;
+            url.set_path("/nvst/");
+            url.set_query(None);
+        }
+        url
+    } else {
+        if resource.contains("://") || !resource.starts_with('/') {
+            return None;
+        }
+        let host = connection["ip"].as_str()?;
+        let mut url = Url::parse("wss://endpoint.invalid/").ok()?;
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            url.set_ip_host(ip).ok()?;
+        } else {
+            url.set_host(Some(host)).ok()?;
+        }
+        url.set_path(resource);
+        url
+    };
+    if !absolute && let Some(host) = connection["ip"].as_str().filter(|host| !host.is_empty()) {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if ip.is_unspecified() {
+                return None;
+            }
+            url.set_ip_host(ip).ok()?;
+        } else {
+            url.set_host(Some(host)).ok()?;
+        }
+    }
+    if !absolute
+        && !native_descriptor
+        && let Some(port) = value_i64(&connection["port"])
+    {
+        if !(1..=65535).contains(&port) {
+            return None;
+        }
+        url.set_port(Some(port as u16)).ok()?;
+    }
+    valid_webrtc_endpoint(&json!(url.as_str())).then_some(url)
 }
 
 fn session_info(
@@ -1673,8 +2060,10 @@ fn session_info(
         "unreported"
     });
     let ad_state = normalize_ad_state(session);
-    Ok(json!({
+    let mut info = json!({
         "sessionId":session_id,
+        "transportMode":if reported_webrtc_session(session) { "webrtc" } else { "nvst" },
+        "reportedNativeTransport":reported_native_session(session),
         "subSessionId":session["subSessionId"],
         "appId":app_id,
         "status":status,
@@ -1703,7 +2092,9 @@ fn session_info(
         "finalizedStreamingFeatures":session["finalizedStreamingFeatures"],
         "clientId":LCARS_CLIENT_ID,
         "deviceId":device_id
-    }))
+    });
+    select_webrtc_endpoint(&mut info);
+    Ok(info)
 }
 
 fn normalize_ad_state(session: &Value) -> Value {
@@ -1755,6 +2146,10 @@ fn preserve_session_profile(info: &mut Value, previous: &Value) {
     let profile = &previous["negotiatedStreamProfile"];
     if previous["sessionId"].as_str() != Some(session_id) {
         return;
+    }
+    if previous["transportMode"] == "webrtc" {
+        info["transportMode"] = json!("webrtc");
+        select_webrtc_endpoint(info);
     }
     if (info["negotiatedStreamProfile"]["codecSource"] == "unreported"
         || (info["negotiatedStreamProfile"]["codecSource"] == "request"
@@ -1849,27 +2244,67 @@ fn negotiated_profile(monitor: &Value, features: &Value) -> Value {
 }
 
 fn cloudmatch_headers(token: &str, device_id: &str) -> Result<HeaderMap, ServiceError> {
+    cloudmatch_headers_with(token, device_id, false)
+}
+
+fn cloudmatch_headers_with(
+    token: &str,
+    device_id: &str,
+    webrtc: bool,
+) -> Result<HeaderMap, ServiceError> {
     let mut headers = HeaderMap::new();
-    let user_agent = bifrost_user_agent();
-    insert_header(&mut headers, USER_AGENT, &user_agent)?;
+    let bifrost_agent;
+    let user_agent = if webrtc {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+    } else {
+        bifrost_agent = bifrost_user_agent();
+        bifrost_agent.as_str()
+    };
+    insert_header(&mut headers, USER_AGENT, user_agent)?;
     insert_header(&mut headers, AUTHORIZATION, &format!("GFNJWT {token}"))?;
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(if webrtc {
+            "application/json"
+        } else {
+            "text/plain"
+        }),
+    );
     headers.insert("nv-client-id", HeaderValue::from_static(LCARS_CLIENT_ID));
     headers.insert(
         "nv-client-streamer",
-        HeaderValue::from_static("NVIDIA-CLASSIC"),
+        HeaderValue::from_static(if webrtc { "WEBRTC" } else { "NVIDIA-CLASSIC" }),
     );
-    headers.insert("nv-client-type", HeaderValue::from_static("NATIVE"));
+    headers.insert(
+        "nv-client-type",
+        HeaderValue::from_static(if webrtc { "BROWSER" } else { "NATIVE" }),
+    );
     headers.insert(
         "nv-client-version",
-        HeaderValue::from_static(GFN_CLIENT_VERSION),
+        HeaderValue::from_static(if webrtc {
+            "2.0.89.154"
+        } else {
+            GFN_CLIENT_VERSION
+        }),
     );
-    headers.insert("nv-device-os", HeaderValue::from_static(device_os()));
+    headers.insert(
+        "nv-device-os",
+        HeaderValue::from_static(if webrtc { "WINDOWS" } else { device_os() }),
+    );
     headers.insert("nv-device-type", HeaderValue::from_static(device_type()));
     headers.insert("nv-device-make", HeaderValue::from_static(device_make()));
     headers.insert("nv-device-model", HeaderValue::from_static(device_model()));
+    if webrtc {
+        headers.insert("nv-browser-type", HeaderValue::from_static("CHROME"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://play.geforcenow.com"),
+        );
+    }
     insert_header(&mut headers, "x-device-id", device_id)?;
-    insert_header(&mut headers, "x-nv-client-identity", &user_agent)?;
+    if !webrtc {
+        insert_header(&mut headers, "x-nv-client-identity", user_agent)?;
+    }
     Ok(headers)
 }
 
@@ -1968,8 +2403,11 @@ fn cloudmatch_http_error(
     payload: Option<&Value>,
 ) -> ServiceError {
     let detail = payload.and_then(|payload| payload["requestStatus"]["statusDescription"].as_str());
+    let abandoned = detail.is_some_and(queue_was_abandoned);
     ServiceError {
-        code: if status.as_u16() == 401 {
+        code: if abandoned {
+            "queue_abandoned"
+        } else if status.as_u16() == 401 {
             "http_unauthorized"
         } else if status.as_u16() == 403 {
             "authentication_required"
@@ -2240,6 +2678,22 @@ fn normalize_ice_servers(session: &Value) -> Vec<Value> {
     servers
 }
 
+fn queue_was_abandoned(detail: &str) -> bool {
+    detail
+        .to_ascii_uppercase()
+        .contains("SESSION_REQUEST_IN_QUEUE_ABANDONED")
+}
+
+/// The next queue poll uses the control host from the response when that host
+/// is a different trusted CloudMatch server. Otherwise it stays put.
+fn queue_poll_base(current: &Url, learned: &str) -> String {
+    trusted_cloudmatch_base(learned)
+        .ok()
+        .filter(|learned| learned.host_str() != current.host_str())
+        .map(|learned| learned.origin().ascii_serialization())
+        .unwrap_or_else(|| current.origin().ascii_serialization())
+}
+
 fn response_matches_host(host: &str, server_id: &str) -> bool {
     if server_id.is_empty() {
         return true;
@@ -2480,9 +2934,12 @@ fn try_network_test_session(
         "address":session.address,
         "port":session.port,
         "secure":session.secure,
-        "measuredDatagramBytes":measured_datagram_bytes,
-        "probes":outcome.probes,
-        "thresholds":{
+            "measuredDatagramBytes":measured_datagram_bytes,
+            "probes":outcome.probes,
+            "latencyMs":outcome.latency_ms,
+            "bandwidthMbps":outcome.bandwidth_mbps,
+            "packetLossPct":outcome.packet_loss_pct,
+            "thresholds":{
             "bandwidthRecommendedMbps":session.thresholds.bandwidth_recommended_mbps,
             "bandwidthLimitMbps":session.thresholds.bandwidth_limit_mbps,
             "latencyRecommendedMs":session.thresholds.latency_recommended_ms,
@@ -2491,6 +2948,16 @@ fn try_network_test_session(
             "packetLossLimitPct":session.thresholds.packet_loss_limit_pct,
         },
     }))
+}
+
+pub(crate) fn run_network_test(
+    client: &Client,
+    base: &Url,
+    token: &str,
+    device_id: &str,
+    settings: &Value,
+) -> Result<Value, ServiceError> {
+    try_network_test_session(client, base, token, device_id, &json!({}), settings)
 }
 
 fn probe_network_test_path(
@@ -2504,14 +2971,29 @@ fn probe_network_test_path(
         "[::]:0"
     })
     .map_err(|_| invalid("Network test probe could not bind a UDP socket"))?;
-    crate::network_test::probe_mtu(
+    let mut outcome = crate::network_test::probe_mtu(
         &socket,
         peer,
         key,
         session.session_id.as_bytes(),
         crate::network_test::PROBE_FLOOR_BYTES,
         crate::network_test::PROBE_CEILING_BYTES,
-    )
+    )?;
+    if let Some(size) = outcome.measured_datagram_bytes {
+        let sample_size = size.min(1_200);
+        if let Some(sample) = crate::network_test::probe_bandwidth(
+            &socket,
+            peer,
+            key,
+            session.session_id.as_bytes(),
+            sample_size,
+            crate::network_test::BANDWIDTH_WINDOW,
+        ) {
+            outcome.bandwidth_mbps = Some(sample.mbps);
+            outcome.packet_loss_pct = Some(sample.packet_loss_pct);
+        }
+    }
+    Ok(outcome)
 }
 
 fn session_token(auth: &AuthSession) -> &str {
@@ -4622,7 +5104,7 @@ mod tests {
                 let body = build_create_body("123", &params, &settings, "stable-device");
                 assert_eq!(
                     body["sessionRequestData"]["enablePersistingInGameSettings"],
-                    preference != false && support == true
+                    false
                 );
             }
         }
@@ -4701,6 +5183,17 @@ mod tests {
     }
 
     #[test]
+    fn alliance_session_creation_uses_the_browser_webrtc_identity() {
+        let headers = cloudmatch_headers_with("token", "device-id", true).unwrap();
+        assert_eq!(headers["nv-client-type"], "BROWSER");
+        assert_eq!(headers["nv-client-streamer"], "WEBRTC");
+        assert_eq!(headers["nv-browser-type"], "CHROME");
+        assert_eq!(headers["nv-device-os"], "WINDOWS");
+        assert_eq!(headers["origin"], "https://play.geforcenow.com");
+        assert_eq!(headers["content-type"], "application/json");
+    }
+
+    #[test]
     fn builds_a_stable_official_session_shape() {
         let body = build_create_body(
             "12345",
@@ -4734,7 +5227,7 @@ mod tests {
                 .is_none()
         );
         assert!(request.get("externalAppId").is_none());
-        assert_eq!(request["enablePersistingInGameSettings"], true);
+        assert_eq!(request["enablePersistingInGameSettings"], false);
         assert_eq!(request["internalTitle"], "Portal 2");
         assert_eq!(request["accountLinked"], true);
         assert_eq!(request["appLaunchMode"], 2);
@@ -5625,6 +6118,55 @@ mod tests {
             ])
         );
         assert_eq!(info["signalingUrl"], "wss://first.example:322");
+    }
+
+    #[test]
+    fn queue_poll_follows_a_different_trusted_control_host() {
+        let current = trusted_cloudmatch_base("https://npa-aby-mvd-03.aby.geforcenow.nvidiagrid.net").unwrap();
+        assert_eq!(
+            queue_poll_base(&current, "https://npa-aby-mvd-02.aby.geforcenow.nvidiagrid.net"),
+            "https://npa-aby-mvd-02.aby.geforcenow.nvidiagrid.net"
+        );
+        assert_eq!(
+            queue_poll_base(&current, "https://npa-aby-mvd-03.aby.geforcenow.nvidiagrid.net"),
+            "https://npa-aby-mvd-03.aby.geforcenow.nvidiagrid.net"
+        );
+        assert_eq!(
+            queue_poll_base(&current, "https://seat.local"),
+            "https://npa-aby-mvd-03.aby.geforcenow.nvidiagrid.net"
+        );
+        let error = cloudmatch_http_error(
+            "Session polling failed",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some(&json!({"requestStatus":{"statusDescription":"SESSION_REQUEST_IN_QUEUE_ABANDONED 4A8C300F"}})),
+        );
+        assert_eq!(error.code, "queue_abandoned");
+    }
+
+    #[test]
+    fn alliance_rtsp_allocation_stays_on_webrtc() {
+        let base = trusted_cloudmatch_base(DEFAULT_STREAMING_BASE).unwrap();
+        let payload = json!({"session":{
+            "sessionId":"seat",
+            "status":2,
+            "sessionRequestData":{
+                "secureRTSPSupported":false,
+                "metaData":[{"key":"GSStreamerType","value":"WebRTC"}]
+            },
+            "connectionInfo":[
+                {"usage":14,"appLevelProtocol":6,"protocol":1,"port":322,
+                    "resourcePath":"rtsps://179-31-61-200.aby.geforcenow.nvidiagrid.net:322"},
+                {"usage":14,"appLevelProtocol":6,"protocol":1,"port":48322,
+                    "resourcePath":"rtsps://179-31-61-200.aby.geforcenow.nvidiagrid.net:48322"},
+                {"usage":2,"appLevelProtocol":0,"protocol":2,"ip":"179.31.61.200","port":13461}
+            ]
+        }});
+        let info = session_info(&payload, &base, "zone", "123", "device").unwrap();
+        assert_eq!(info["transportMode"], "webrtc");
+        assert_eq!(
+            info["signalingUrl"],
+            "wss://179-31-61-200.aby.geforcenow.nvidiagrid.net/nvst/"
+        );
     }
 
     fn network_test_udp_server(

@@ -16,6 +16,7 @@ pub struct Challenge {
 
 pub enum Phase {
     Starting,
+    ChooseProvider,
     Waiting(Challenge),
     Completing,
     Failed(String),
@@ -27,25 +28,130 @@ const COLUMN: f32 = 290.0;
 
 pub fn hints(phase: &Phase) -> Vec<(&'static str, &'static str)> {
     match phase {
+        Phase::ChooseProvider => vec![("A", "Choose")],
         Phase::Failed(_) | Phase::Waiting(_) => vec![("A", "New code")],
         Phase::Starting | Phase::Completing => Vec::new(),
     }
 }
 
-pub fn draw(painter: &mut Painter, phase: &Phase, clock: &Clock, now_ms: u64, seconds: f32) {
+pub fn draw(
+    painter: &mut Painter,
+    phase: &Phase,
+    providers: &[&str],
+    selected_provider: usize,
+    clock: &Clock,
+    now_ms: u64,
+    seconds: f32,
+) {
     theme::draw_header(painter, clock);
     let offset_y = ((canvas().1 - 480.0) / 2.0).max(0.0);
     let (card_x, card_y, card) = (CARD.0, CARD.1 + offset_y, CARD.2);
     let width = canvas().0 - COLUMN - EDGE;
-    painter.text(
-        COLUMN,
-        96.0 + offset_y,
-        24.0,
-        Weight::Black,
-        "Sign in",
-        TEXT,
-    );
+    if !matches!(phase, Phase::ChooseProvider) {
+        painter.text(
+            COLUMN,
+            96.0 + offset_y,
+            24.0,
+            Weight::Black,
+            "Sign in",
+            TEXT,
+        );
+    }
     match phase {
+        Phase::ChooseProvider => {
+            let heading = "Choose your GeForce NOW provider";
+            let heading_width = painter.measure(heading, 23.0, Weight::Black);
+            painter.text(
+                ((canvas().0 - heading_width) / 2.0).max(EDGE),
+                82.0 + offset_y,
+                23.0,
+                Weight::Black,
+                heading,
+                TEXT,
+            );
+            let subtitle = "Select the provider where your membership is active";
+            let subtitle_width = painter.measure(subtitle, 14.0, Weight::SemiBold);
+            painter.text(
+                ((canvas().0 - subtitle_width) / 2.0).max(EDGE),
+                113.0 + offset_y,
+                14.0,
+                Weight::SemiBold,
+                subtitle,
+                MUTED,
+            );
+            let warning = "Selecting the wrong one can prevent the session from starting";
+            let warning_width = painter.measure(warning, 13.0, Weight::SemiBold);
+            painter.text(
+                ((canvas().0 - warning_width) / 2.0).max(EDGE),
+                132.0 + offset_y,
+                13.0,
+                Weight::SemiBold,
+                warning,
+                MUTED,
+            );
+            const VISIBLE_PROVIDERS: usize = 5;
+            const ROW_HEIGHT: f32 = 46.0;
+            let visible_count = providers.len().min(VISIBLE_PROVIDERS);
+            let first = selected_provider
+                .saturating_sub(VISIBLE_PROVIDERS - 1)
+                .min(providers.len().saturating_sub(VISIBLE_PROVIDERS));
+            let button_width = (canvas().0 - EDGE * 2.0).min(480.0);
+            let button_x = (canvas().0 - button_width) / 2.0;
+            for row in 0..visible_count {
+                let index = first + row;
+                let y = 160.0 + offset_y + row as f32 * ROW_HEIGHT;
+                let selected = index == selected_provider;
+                painter.fill(
+                    button_x,
+                    y,
+                    button_width,
+                    ROW_HEIGHT - 3.0,
+                    11.0,
+                    if selected { ADD_TILE } else { PANEL },
+                );
+                if selected {
+                    painter.stroke(
+                        button_x,
+                        y,
+                        button_width,
+                        ROW_HEIGHT - 3.0,
+                        11.0,
+                        2.5,
+                        FOCUS,
+                    );
+                }
+                let label_weight = if selected { Weight::Bold } else { Weight::SemiBold };
+                let label_size = 19.0;
+                let label_width = painter.measure(providers[index], label_size, label_weight);
+                let fitted_size = if label_width > button_width - 88.0 {
+                    label_size * (button_width - 88.0) / label_width
+                } else {
+                    label_size
+                };
+                let fitted_width = painter.measure(providers[index], fitted_size, label_weight);
+                painter.text(
+                    button_x + (button_width - fitted_width) / 2.0,
+                    y + 9.0,
+                    fitted_size,
+                    label_weight,
+                    providers[index],
+                    if selected { FOCUS } else { TEXT },
+                );
+            }
+            if !providers.is_empty() {
+                let hint = format!("{} providers available", providers.len());
+                let hint_width = painter.measure(&hint, 12.0, Weight::SemiBold);
+                painter.text_fit(
+                    ((canvas().0 - hint_width) / 2.0).max(EDGE),
+                    393.0 + offset_y,
+                    12.0,
+                    Weight::SemiBold,
+                    &hint,
+                    canvas().0 - EDGE * 2.0,
+                    MUTED,
+                );
+            }
+        }
         Phase::Starting | Phase::Completing => {
             painter.fill(card_x, card_y, card, card, 14.0, PANEL);
             theme::draw_spinner(

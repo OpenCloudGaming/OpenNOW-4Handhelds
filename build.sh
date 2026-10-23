@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the R36S port (RK3326, dArkOS) on a Linux machine.
-# The result is builds/r36s/dist: OpenNOW.sh plus opennow/.
+# The result is build: OpenNOW.sh plus opennow/.
 #
 # Requires rustup, cargo-zigbuild, and Zig:
 #   rustup target add aarch64-unknown-linux-gnu
@@ -11,7 +11,7 @@ set -euo pipefail
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-        echo "On Windows, run: powershell -File ./build.ps1" >&2
+        echo "On Windows, run: build.bat" >&2
         exit 1
         ;;
 esac
@@ -19,10 +19,10 @@ esac
 root="$(cd "$(dirname "$0")" && pwd)"
 target="aarch64-unknown-linux-gnu"
 glibc="2.36"
-build_root="${OPENNOW_BUILD_ROOT:-$root/builds/r36s}"
-dist="$build_root/dist"
+dist="${OPENNOW_BUILD_ROOT:-$root/build}"
 out="$dist/opennow"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$build_root/target}"
+cache="${OPENNOW_CACHE_ROOT:-$root/.cache/OpenNOW-4Handhelds}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$cache/target}"
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo is not installed. Install rustup, then: rustup target add $target" >&2
@@ -68,4 +68,5 @@ chmod +x "$dist/OpenNOW.sh" "$out/opennow-handheld" "$out/opennow-core"
 if [[ ! -f "$out/stream.json" ]]; then
     cp "$root/opennow-handheld/stream.json" "$out/stream.json"
 fi
+python3 "$root/scripts/collect_licenses.py" --root "$root" --out "$out/licenses"
 echo "R36S ports folder: $dist"

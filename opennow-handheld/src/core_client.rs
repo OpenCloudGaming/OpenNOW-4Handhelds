@@ -62,40 +62,123 @@ fn redact_log_value(value: &Value) -> Value {
     }
 }
 
-fn log_json(kind: &str, value: &Value) {
-    let safe_value = redact_log_value(value);
-    let formatted = serde_json::to_string_pretty(&safe_value)
-        .unwrap_or_else(|_| safe_value.to_string());
-    eprintln!("core: {kind}\n{formatted}");
+const BRIEF_KEYS: &[&str] = &[
+    "appId",
+    "variantId",
+    "title",
+    "status",
+    "phase",
+    "zone",
+    "serverIp",
+    "transportMode",
+    "resolution",
+    "fps",
+    "codec",
+    "maxBitrateMbps",
+    "key",
+    "code",
+    "message",
+    "queuePosition",
+    "hasNextPage",
+    "limit",
+    "region",
+    "outcome",
+    "value",
+];
+
+fn log_brief(kind: &str, value: &Value) {
+    let safe = redact_log_value(value);
+    let mut notes = Vec::new();
+    brief_fields(&safe, 0, &mut notes);
+    if notes.is_empty() {
+        eprintln!("core: {kind}");
+    } else {
+        eprintln!("core: {kind} {}", notes.join(" "));
+    }
+}
+
+fn brief_fields(value: &Value, depth: u8, notes: &mut Vec<String>) {
+    let Value::Object(fields) = value else {
+        return;
+    };
+    if depth > 3 || notes.len() >= 12 {
+        return;
+    }
+    for (key, child) in fields {
+        if notes.len() >= 12 || skipped_key(key) {
+            continue;
+        }
+        match child {
+            Value::String(text) if BRIEF_KEYS.contains(&key.as_str()) => {
+                notes.push(format!("{key}={}", clip(text)));
+            }
+            Value::Number(number) if BRIEF_KEYS.contains(&key.as_str()) => {
+                notes.push(format!("{key}={number}"));
+            }
+            Value::Bool(flag) if BRIEF_KEYS.contains(&key.as_str()) => {
+                notes.push(format!("{key}={flag}"));
+            }
+            _ => {}
+        }
+    }
+    for (key, child) in fields {
+        if notes.len() >= 12 || skipped_key(key) {
+            continue;
+        }
+        if let Value::Object(_) = child
+            && depth < 3
+            && key != "runtimeCapabilities"
+            && key != "iceServers"
+        {
+            brief_fields(child, depth + 1, notes);
+        }
+    }
+    for (key, child) in fields {
+        if notes.len() >= 12 || skipped_key(key) {
+            continue;
+        }
+        if let Value::Array(items) = child {
+            notes.push(format!("{key}[{}]", items.len()));
+        }
+    }
+}
+
+fn skipped_key(key: &str) -> bool {
+    key == "type" || key == "id" || key == "method" || key == "ok"
+}
+
+fn clip(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= 80 {
+        return text;
+    }
+    let mut end = text.chars().take(77).collect::<String>();
+    end.push_str("...");
+    end
 }
 
 fn log_response(method: &str, value: &Value) {
-    if method.starts_with("settings.") || method.starts_with("session.") {
-        log_json("response", value);
-        return;
-    }
-
     let id = value["id"].as_str().unwrap_or("?");
-    if value["ok"].as_bool() == Some(true) {
-        let result = &value["result"];
-        let summary = match result {
-            Value::Object(fields) => fields
-                .iter()
-                .map(|(key, value)| match value {
-                    Value::Array(items) => format!("{key}[{}]", items.len()),
-                    Value::Object(nested) => format!("{key}{{{} fields}}", nested.len()),
-                    _ => key.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(","),
-            Value::Array(items) => format!("array[{}]", items.len()),
-            Value::Null => "null".to_owned(),
-            _ => "value".to_owned(),
+    let safe = redact_log_value(value);
+    if safe["ok"].as_bool() == Some(true) {
+        let mut notes = Vec::new();
+        brief_fields(&safe["result"], 0, &mut notes);
+        let detail = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", notes.join(" "))
         };
-        eprintln!("core: response id={id} method={method} outcome=ok result={summary}");
+        eprintln!("core: response id={id} method={method} outcome=ok{detail}");
     } else {
-        let code = value["error"]["code"].as_str().unwrap_or("error");
-        eprintln!("core: response id={id} method={method} outcome=error code={code}");
+        let code = safe["error"]["code"].as_str().unwrap_or("error");
+        let message = safe["error"]["message"].as_str().map(clip).unwrap_or_default();
+        if message.is_empty() {
+            eprintln!("core: response id={id} method={method} outcome=error code={code}");
+        } else {
+            eprintln!(
+                "core: response id={id} method={method} outcome=error code={code} message={message}"
+            );
+        }
     }
 }
 
@@ -333,7 +416,10 @@ impl Core {
             let request = self.pending.get_mut(&id).expect("due request is pending");
             request.retry_at = None;
             let line = json!({"type": "request", "id": id.to_string(), "method": request.method, "params": request.params});
-            log_json("request", &line);
+            log_brief(
+                &format!("request id={id} method={}", request.method),
+                &line,
+            );
             self.write(&line);
         }
     }

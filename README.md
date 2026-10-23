@@ -26,7 +26,7 @@ Download the release ZIP, extract it into the `ports` folder, then launch OpenNO
 **Start** and **Select** together quit OpenNOW while in menu, it does not apply while in a session
 
 ## Build from source
-The scripts build the R36S port only. Both produce `builds/r36s/dist`.
+The scripts build the R36S port only. Both produce `build`, with `OpenNOW.sh` next to `opennow/`.
 Install Rust, then:
 ```sh
 rustup target add aarch64-unknown-linux-gnu
@@ -39,12 +39,9 @@ git clone https://github.com/dpadGuy/OpenNOW-4Handhelds.git
 cd OpenNOW-4Handhelds
 ./build.sh
 ```
-On Windows, from the same checkout:
-```powershell
-./build.ps1
-```
+On Windows, from the same checkout, double-click `build.bat` or run it from a command prompt.
 `cargo-zigbuild` targets glibc 2.36 so the binaries run on dArkOS. On the handheld itself, `./build.sh` can use the device's own Rust toolchain when Zig is not installed.
-On Windows, the compile cache stays inside the project when the folder path has no spaces. If the path contains a space, the script stores the cache at `C:\OpenNOW-r36s` and says so. The ports folder is still `builds\r36s\dist`.
+On Windows, the compile cache stays in `.cache\OpenNOW-4Handhelds` when the folder path has no spaces. If the path contains a space, the script stores the cache at `C:\OpenNOW-4Handhelds` and says so. The built port is `build`.
 ## How it works
 The handheld UI is a small Rust program. It starts `opennow-core` for sign-in, the catalog, and session setup, and loads the streamer from `opennow/libraries`. Video is decoded with Rockchip MPP and drawn in the same window as the menus.
 ```text
@@ -52,7 +49,8 @@ opennow-handheld/    Controller UI and the Ports launcher
 opennow-core/        Accounts, settings, catalog, and sessions
 opennow-streamer/    NVST transport, input, and Rockchip MPP decode
 third_party/         Rockchip libraries shipped with the port
-build.ps1            R36S build on Windows
+build.bat            Windows build. Runs scripts/build.ps1
+scripts/build.ps1    R36S build on Windows
 build.sh             R36S build on Linux
 ```
 

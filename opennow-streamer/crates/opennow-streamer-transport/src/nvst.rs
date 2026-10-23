@@ -48,9 +48,9 @@ use super::nvst_control::{
 use super::nvst_cursor::{CursorCommand, NvstCursorCapture, valid_cursor_channel_message};
 use super::nvst_haptics::NvstHaptics;
 use super::nvst_input::{
-    NvstEncodedInput, NvstInputChannelState, NvstInputChannels, NvstInputCodec, SonyDeviceControl,
-    for_each_sony_output, native_input_type_is_motion, native_input_type_name, native_input_types,
-    next_control_keepalive, server_cursor_messages, sony_device_change_command,
+    NvstEncodedInput, NvstInputChannelState, NvstInputChannels, NvstInputCodec, NvstInputRoute,
+    SonyDeviceControl, for_each_sony_output, native_input_type_is_motion, native_input_type_name,
+    native_input_types, next_control_keepalive, server_cursor_messages, sony_device_change_command,
     sony_report_command,
 };
 use super::{
@@ -84,6 +84,10 @@ const RTCP_RECOVERY_INTERVAL: Duration = Duration::from_millis(4);
 const NACK_RETRY_INTERVAL: Duration = Duration::from_millis(4);
 const DEFAULT_NACK_RTT: Duration = Duration::from_millis(30);
 const NACK_TRACKING_TIMEOUT: Duration = Duration::from_millis(52);
+/// Added to a measured round trip so the NACK can leave and the server can answer.
+const LOSS_RECOVERY_RTT_MARGIN: Duration = Duration::from_millis(20);
+/// Longest a sequence hole stays open. Past this the client still asks for a keyframe.
+const LOSS_RECOVERY_WAIT_CEILING: Duration = Duration::from_millis(200);
 const MAX_NACK_ATTEMPTS: u8 = 3;
 const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_PENDING_NACK_RANGES: usize = 16;
@@ -210,7 +214,18 @@ const MAX_REORDER_WINDOW: usize = 2_048;
 // Cloud packet reordering plus RTCP-over-SCTP NACK round trips can exceed one or two frame times.
 // Keep the wait exceptional and bounded, but long enough for a retransmission to beat an IDR
 // reset. This adds latency only while a sequence gap is open; the normal path still drains at once.
-const MJOLNIR_REORDER_DEQUEUE_TIMEOUT: Duration = Duration::from_millis(52);
+// 52 ms covers a fast path. `loss_recovery_wait` stretches the same hole up to
+// `LOSS_RECOVERY_WAIT_CEILING` when the measured round trip is longer.
+const MJOLNIR_REORDER_DEQUEUE_TIMEOUT: Duration = NACK_TRACKING_TIMEOUT;
+
+fn loss_recovery_wait(rtt: Option<Duration>) -> Duration {
+    let Some(rtt) = rtt.filter(|rtt| !rtt.is_zero()) else {
+        return MJOLNIR_REORDER_DEQUEUE_TIMEOUT;
+    };
+    MJOLNIR_REORDER_DEQUEUE_TIMEOUT
+        .max(rtt.saturating_add(LOSS_RECOVERY_RTT_MARGIN))
+        .min(LOSS_RECOVERY_WAIT_CEILING)
+}
 // The replay filter must be at least as deep as the reorder/NACK window. The old 64-packet bitmap
 // rejected valid retransmissions after roughly 10 ms on a high-bitrate stream, guaranteeing that
 // every NACK eventually degraded into a keyframe reset.
@@ -1205,23 +1220,21 @@ impl NvstFeedbackState {
     }
 
     fn take_nack(&self, now: Instant, retry_rtt: Option<Duration>) -> Option<(u64, u64)> {
-        let (retry_interval, max_attempts) =
-            retry_rtt.map_or((NACK_RETRY_INTERVAL, MAX_NACK_ATTEMPTS), |rtt| {
-                let attempts = if rtt.is_zero() {
-                    MAX_NACK_ATTEMPTS
-                } else {
-                    (NACK_TRACKING_TIMEOUT.as_nanos() / rtt.as_nanos())
-                        .clamp(1, u128::from(MAX_NACK_ATTEMPTS)) as u8
-                };
+        let tracking_timeout = loss_recovery_wait(retry_rtt);
+        let (retry_interval, max_attempts) = match retry_rtt.filter(|rtt| !rtt.is_zero()) {
+            Some(rtt) => {
+                let attempts = (tracking_timeout.as_nanos() / rtt.as_nanos())
+                    .clamp(1, u128::from(MAX_NACK_ATTEMPTS)) as u8;
                 (rtt.saturating_add(NACK_RETRY_INTERVAL), attempts)
-            });
+            }
+            None => (NACK_RETRY_INTERVAL, MAX_NACK_ATTEMPTS),
+        };
         let mut pending = self
             .pending_nacks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.retain(|range| {
-            now.saturating_duration_since(range.requested_at) < NACK_TRACKING_TIMEOUT
-        });
+        pending
+            .retain(|range| now.saturating_duration_since(range.requested_at) < tracking_timeout);
         let index = pending.iter().position(|range| {
             range.attempts < max_attempts
                 && range.last_sent_at.is_none_or(|last_sent| {
@@ -3276,6 +3289,7 @@ struct RtpReorderBuffer {
     packets: BTreeMap<u64, RtpPacket>,
     max_packets: usize,
     gap_wait: Option<(u64, Instant)>,
+    recovery_wait: Duration,
 }
 
 struct ReorderResult {
@@ -3293,6 +3307,7 @@ impl RtpReorderBuffer {
             packets: BTreeMap::new(),
             max_packets,
             gap_wait: None,
+            recovery_wait: MJOLNIR_REORDER_DEQUEUE_TIMEOUT,
         }
     }
 
@@ -3300,6 +3315,11 @@ impl RtpReorderBuffer {
         self.next_index = None;
         self.packets.clear();
         self.gap_wait = None;
+    }
+
+    fn set_recovery_wait(&mut self, wait: Duration) {
+        self.recovery_wait =
+            wait.clamp(MJOLNIR_REORDER_DEQUEUE_TIMEOUT, LOSS_RECOVERY_WAIT_CEILING);
     }
 
     fn push(&mut self, packet: RtpPacket, now: Instant) -> ReorderResult {
@@ -3368,8 +3388,7 @@ impl RtpReorderBuffer {
             let gap_exceeded_window = first_available.saturating_sub(expected)
                 >= self.max_packets as u64
                 || self.packets.len() >= self.max_packets;
-            let gap_timed_out =
-                now.saturating_duration_since(gap_started) >= MJOLNIR_REORDER_DEQUEUE_TIMEOUT;
+            let gap_timed_out = now.saturating_duration_since(gap_started) >= self.recovery_wait;
             if !gap_exceeded_window && !gap_timed_out {
                 break;
             }
@@ -3850,6 +3869,7 @@ struct FecReorderBuffer {
     blocks: BTreeMap<u64, FecBlock>,
     completed_through: Option<u64>,
     gap_wait: Option<(u64, Instant)>,
+    recovery_wait: Duration,
     shard_len: usize,
 }
 
@@ -3859,6 +3879,7 @@ impl FecReorderBuffer {
             blocks: BTreeMap::new(),
             completed_through: None,
             gap_wait: None,
+            recovery_wait: MJOLNIR_REORDER_DEQUEUE_TIMEOUT,
             shard_len: video_packet_size + NVST_FEC_RTP_HEADER_ALLOWANCE,
         }
     }
@@ -3867,6 +3888,11 @@ impl FecReorderBuffer {
         self.blocks.clear();
         self.completed_through = None;
         self.gap_wait = None;
+    }
+
+    fn set_recovery_wait(&mut self, wait: Duration) {
+        self.recovery_wait =
+            wait.clamp(MJOLNIR_REORDER_DEQUEUE_TIMEOUT, LOSS_RECOVERY_WAIT_CEILING);
     }
 
     fn push(&mut self, packet: RtpPacket, layout: FecPacketLayout, now: Instant) -> ReorderResult {
@@ -3933,7 +3959,7 @@ impl FecReorderBuffer {
                         now
                     }
                 };
-                if now.saturating_duration_since(started) < MJOLNIR_REORDER_DEQUEUE_TIMEOUT
+                if now.saturating_duration_since(started) < self.recovery_wait
                     && base.saturating_sub(expected) < MAX_REORDER_WINDOW as u64
                     && self.blocks.len() < MAX_PENDING_FEC_BLOCKS
                 {
@@ -4013,7 +4039,7 @@ impl FecReorderBuffer {
                 .blocks
                 .last_key_value()
                 .map_or(0, |(&last_base, _)| last_base.saturating_sub(base));
-            if now.saturating_duration_since(started) < MJOLNIR_REORDER_DEQUEUE_TIMEOUT
+            if now.saturating_duration_since(started) < self.recovery_wait
                 && block_span < MAX_REORDER_WINDOW as u64
                 && self.blocks.len() < MAX_PENDING_FEC_BLOCKS
             {
@@ -4424,6 +4450,9 @@ impl NvstVideoReceiver {
             video,
         );
 
+        let recovery_wait = loss_recovery_wait(self.config.feedback.ping(now));
+        self.reorder.set_recovery_wait(recovery_wait);
+        self.fec_reorder.set_recovery_wait(recovery_wait);
         let result = if let Some(layout) = FecPacketLayout::from_packet(&packet) {
             if layout.shard_index >= layout.data_shards {
                 self.fec_packets += 1;
@@ -5403,7 +5432,7 @@ fn set_exclusive_udp_address(socket: &Socket) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn disable_udp_connreset(socket: &Socket) -> std::io::Result<()> {
+pub(crate) fn disable_udp_connreset(socket: &Socket) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{
         SIO_UDP_CONNRESET, SOCKET_ERROR, WSAGetLastError, WSAIoctl,
@@ -6128,14 +6157,11 @@ fn send_nvst_captured_input(
     let previous_codec = codec.clone();
     let result = codec
         .encode(bytes, timestamp_us)
-        .map_err(|error| error.to_string())
+        .map_err(|error| InputSendError::Encode(error.to_string()))
         .and_then(|messages| {
             for message in messages {
                 if !send(&message) {
-                    return Err(format!(
-                        "input packet could not be queued on {:?}",
-                        message.route
-                    ));
+                    return Err(InputSendError::Queue(message.route));
                 }
             }
             Ok(())
@@ -6144,6 +6170,14 @@ fn send_nvst_captured_input(
     if let Err(error) = &result {
         *codec = previous_codec;
         eprintln!("NVST input packet rejected: {error}");
+        if matches!(error, InputSendError::Queue(NvstInputRoute::InputPartial)) {
+            // A gamepad report is a full snapshot and is repeated. A full
+            // partial channel must not disconnect a live video session.
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(TransportError::InputNotReady));
+            }
+            return true;
+        }
     }
     if let Some(reply) = reply {
         let _ = reply.send(result.map_err(|_| TransportError::InputNotReady));
@@ -6161,6 +6195,22 @@ fn send_nvst_captured_input(
         "discrete input delivery failed; stopping to prevent stuck input".to_owned(),
     ));
     false
+}
+
+enum InputSendError {
+    Encode(String),
+    Queue(NvstInputRoute),
+}
+
+impl std::fmt::Display for InputSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode(error) => formatter.write_str(error),
+            Self::Queue(route) => {
+                write!(formatter, "input packet could not be queued on {route:?}")
+            }
+        }
+    }
 }
 
 struct EndpointGuard {
@@ -7831,6 +7881,29 @@ mod tests {
             assert!(ready.load(Ordering::Acquire));
             assert!(received.try_recv().is_err());
         }
+    }
+
+    #[test]
+    fn gamepad_partial_channel_rejection_keeps_the_video_session() {
+        let mut gamepad = vec![0; 38];
+        gamepad[..4].copy_from_slice(&12_u32.to_le_bytes());
+        gamepad[4..6].copy_from_slice(&26_u16.to_le_bytes());
+        gamepad[8..10].copy_from_slice(&0x0001_u16.to_le_bytes());
+        gamepad[12..14].copy_from_slice(&0x1000_u16.to_le_bytes());
+        let mut codec = NvstInputCodec::default();
+        let ready = AtomicBool::new(true);
+        let (events, received) = mpsc::channel();
+        assert!(send_nvst_captured_input(
+            &mut codec,
+            &gamepad,
+            1,
+            None,
+            &ready,
+            &events,
+            |message| message.route != NvstInputRoute::InputPartial,
+        ));
+        assert!(ready.load(Ordering::Acquire));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]
@@ -11150,6 +11223,87 @@ mod tests {
             [3, 4, 5]
         );
         assert_eq!(recovered.nack, None);
+    }
+
+    #[test]
+    fn loss_recovery_wait_keeps_the_fast_path_and_caps_a_slow_round_trip() {
+        assert_eq!(loss_recovery_wait(None), MJOLNIR_REORDER_DEQUEUE_TIMEOUT);
+        assert_eq!(
+            loss_recovery_wait(Some(Duration::ZERO)),
+            MJOLNIR_REORDER_DEQUEUE_TIMEOUT
+        );
+        assert_eq!(
+            loss_recovery_wait(Some(Duration::from_millis(30))),
+            MJOLNIR_REORDER_DEQUEUE_TIMEOUT
+        );
+        assert_eq!(
+            loss_recovery_wait(Some(Duration::from_millis(120))),
+            Duration::from_millis(140)
+        );
+        assert_eq!(
+            loss_recovery_wait(Some(Duration::from_millis(500))),
+            LOSS_RECOVERY_WAIT_CEILING
+        );
+        assert_eq!(
+            loss_recovery_wait(Some(Duration::MAX)),
+            LOSS_RECOVERY_WAIT_CEILING
+        );
+    }
+
+    #[test]
+    fn slow_ping_holds_a_video_gap_until_one_retransmission_can_return() {
+        let config = config();
+        let feedback = Arc::clone(&config.feedback);
+        let crypto = test_srtp(&config);
+        let mut receiver = NvstVideoReceiver::new(config);
+        let started = Instant::now();
+        let rtt = Duration::from_millis(120);
+        feedback.publish_ping(true, started, rtt);
+        let wait = loss_recovery_wait(Some(rtt));
+        assert!(wait > MJOLNIR_REORDER_DEQUEUE_TIMEOUT);
+
+        let packet = |sequence: u16| {
+            protect_for_test(
+                &crypto,
+                build_plaintext_rtp(
+                    sequence,
+                    FLAG_SOF | FLAG_EOF | FLAG_CONTAINS_PIC_DATA,
+                    u32::from(sequence),
+                    &[0, 0, 1, 0x65],
+                ),
+                0,
+            )
+        };
+        let gap_started = started + Duration::from_millis(1);
+        let _ = receiver.process_datagram(peer(), &packet(1), started);
+        let waiting = receiver.process_datagram(peer(), &packet(3), gap_started);
+        assert!(
+            waiting
+                .iter()
+                .all(|event| !matches!(event, NvstReceiveEvent::RecoveryNeeded(_)))
+        );
+        assert_eq!(feedback.take_nack(gap_started, Some(rtt)), Some((2, 2)));
+
+        let still_waiting = receiver.process_datagram(
+            peer(),
+            &packet(4),
+            gap_started + MJOLNIR_REORDER_DEQUEUE_TIMEOUT,
+        );
+        assert!(
+            still_waiting
+                .iter()
+                .all(|event| !matches!(event, NvstReceiveEvent::RecoveryNeeded(_))),
+            "a 52 ms hole must stay open when the round trip is {rtt:?}"
+        );
+
+        let recovered = receiver.process_datagram(peer(), &packet(5), gap_started + wait);
+        assert!(recovered.iter().any(|event| matches!(
+            event,
+            NvstReceiveEvent::RecoveryNeeded(NvstRecovery::PacketGap {
+                first_missing_index: 2,
+                last_missing_index: 2,
+            })
+        )));
     }
 
     #[test]

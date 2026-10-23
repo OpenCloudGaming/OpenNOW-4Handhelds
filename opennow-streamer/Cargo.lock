@@ -1783,6 +1783,7 @@ dependencies = [
  "mtu",
  "opennow-streamer-hid",
  "opennow-streamer-protocol",
+ "serde",
  "serde_json",
  "sha1",
  "socket2",

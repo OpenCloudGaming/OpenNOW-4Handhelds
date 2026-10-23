@@ -9,14 +9,12 @@ use crate::theme::{self, *};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-pub const ROWS: usize = 8;
-pub const SERVER_ROW: usize = 6;
-pub const SIGN_OUT_ROW: usize = 7;
+pub const ROWS: usize = 9;
+pub const SERVER_ROW: usize = 7;
+pub const SIGN_OUT_ROW: usize = 8;
 
-const BITRATES: [f64; 20] = [
-    5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0,
-    85.0, 90.0, 95.0, 100.0,
-];
+const BITRATE_MIN: f64 = 5.0;
+const BITRATE_MAX: f64 = 100.0;
 const FRAME_RATES: [u64; 3] = [30, 60, 120];
 
 #[derive(Clone)]
@@ -34,6 +32,8 @@ pub struct Profile {
     pub vsync: bool,
     /// Off uses the Nintendo face labels printed on most handhelds.
     pub xbox_layout: bool,
+    /// On keeps a live session running with no controller or pointer input.
+    pub anti_afk: bool,
 }
 
 impl Profile {
@@ -45,10 +45,11 @@ impl Profile {
             aspect_ratio: "16:9".into(),
             fps: 30,
             max_bitrate_mbps: 10.0,
-            render_resolution: "640x480".into(),
+            render_resolution: "native".into(),
             resolutions: Vec::new(),
             vsync: false,
             xbox_layout: false,
+            anti_afk: false,
         }
     }
 
@@ -85,7 +86,7 @@ impl Profile {
 
     pub fn nudge(&mut self, row: usize, delta: i32) {
         match row {
-            0 => self.max_bitrate_mbps = step_f64(&BITRATES, self.max_bitrate_mbps, delta),
+            0 => self.max_bitrate_mbps = step_bitrate(self.max_bitrate_mbps, delta),
             1 => self.fps = step_u64(&FRAME_RATES, self.fps, delta),
             2 => {
                 let choices: Vec<&str> = self.resolutions.iter().map(String::as_str).collect();
@@ -103,6 +104,7 @@ impl Profile {
             }
             4 => self.vsync = !self.vsync,
             5 => self.xbox_layout = !self.xbox_layout,
+            6 => self.anti_afk = !self.anti_afk,
             _ => {}
         }
     }
@@ -115,14 +117,22 @@ impl Profile {
                 if self.resolution.is_empty() {
                     "Loading…".into()
                 } else {
-                    pretty_size(&self.resolution)
+                    format!(
+                        "{} · {}",
+                        pretty_size(&self.resolution),
+                        aspect_for(&self.resolution)
+                    )
                 }
             }
             3 => {
                 if self.render_resolution.eq_ignore_ascii_case("native") {
                     "Native".into()
                 } else {
-                    pretty_size(&self.render_resolution)
+                    format!(
+                        "{} · {}",
+                        pretty_size(&self.render_resolution),
+                        aspect_for(&self.render_resolution)
+                    )
                 }
             }
             4 => {
@@ -137,6 +147,13 @@ impl Profile {
                     "Xbox".into()
                 } else {
                     "Nintendo".into()
+                }
+            }
+            6 => {
+                if self.anti_afk {
+                    "On".into()
+                } else {
+                    "Off".into()
                 }
             }
             _ => String::new(),
@@ -154,6 +171,7 @@ impl Profile {
             "renderResolution": self.render_resolution,
             "vsync": self.vsync,
             "xboxLayout": self.xbox_layout,
+            "antiAfk": self.anti_afk,
         }))
         .unwrap_or_else(|_| "{}".into())
     }
@@ -235,6 +253,10 @@ pub fn load() -> Profile {
             .get("xboxLayout")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        anti_afk: value
+            .get("antiAfk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     if !resolution_ok(&profile.resolution) {
         profile.resolution.clear();
@@ -249,7 +271,7 @@ pub fn load() -> Profile {
         profile.render_resolution = fallback.render_resolution.clone();
     }
     eprintln!(
-        "settings: {} · {} at {} fps, {} Mbps, render {}, vsync {}, {}",
+        "settings: {} · {} at {} fps, {} Mbps, render {}, vsync {}, {}, anti-afk {}",
         profile.resolution,
         profile.codec,
         profile.fps,
@@ -264,12 +286,18 @@ pub fn load() -> Profile {
             "xbox layout"
         } else {
             "nintendo layout"
-        }
+        },
+        if profile.anti_afk { "on" } else { "off" }
     );
+    let replaced_render = profile.render_resolution.eq_ignore_ascii_case("640x480");
+    if replaced_render {
+        profile.render_resolution = "native".into();
+    }
     let missing_local = value.get("renderResolution").is_none()
         || value.get("vsync").is_none()
-        || value.get("xboxLayout").is_none();
-    if missing_local {
+        || value.get("xboxLayout").is_none()
+        || value.get("antiAfk").is_none();
+    if missing_local || replaced_render {
         profile.save();
     }
     profile
@@ -461,7 +489,8 @@ fn row_label(row: usize) -> &'static str {
         3 => "Render",
         4 => "VSync",
         5 => "Layout",
-        6 => "Server",
+        6 => "Anti-AFK",
+        7 => "Server",
         _ => "Sign out",
     }
 }
@@ -487,8 +516,18 @@ fn bitrate_text(value: f64) -> String {
 }
 
 fn snap_bitrate(value: f64) -> f64 {
-    let stepped = (value / 5.0).round() * 5.0;
-    stepped.clamp(5.0, 100.0)
+    value.round().clamp(BITRATE_MIN, BITRATE_MAX)
+}
+
+fn step_bitrate(current: f64, delta: i32) -> f64 {
+    let next = snap_bitrate(current) + f64::from(delta);
+    if next > BITRATE_MAX {
+        BITRATE_MIN
+    } else if next < BITRATE_MIN {
+        BITRATE_MAX
+    } else {
+        next
+    }
 }
 
 /// Unique entitled sizes from `account.subscription.get`, smallest first.
@@ -575,13 +614,6 @@ fn step_str<'a>(choices: &'a [&'a str], current: &str, delta: i32) -> &'a str {
 
 fn step_u64(choices: &[u64], current: u64, delta: i32) -> u64 {
     let index = choices.iter().position(|item| *item == current);
-    choices[step_index(choices.len(), index, delta)]
-}
-
-fn step_f64(choices: &[f64], current: f64, delta: i32) -> f64 {
-    let index = choices
-        .iter()
-        .position(|item| (*item - current).abs() < 0.05);
     choices[step_index(choices.len(), index, delta)]
 }
 

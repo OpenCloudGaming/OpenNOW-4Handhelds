@@ -29,7 +29,7 @@ fn dock_y() -> f32 {
 const DOCK_ITEMS: [(&str, Image); 3] = [
     ("Store", Image::Store),
     ("Settings", Image::Settings),
-    ("Power", Image::Power),
+    ("Exit", Image::Power),
 ];
 
 #[derive(Clone, Copy)]
@@ -51,6 +51,8 @@ pub enum Action {
 
 pub enum Request {
     Quit,
+    /// Leave immediately. The dock Exit button uses this and skips the confirm dialog.
+    Exit,
     SignOut,
     OpenStore,
     OpenSettings,
@@ -177,7 +179,9 @@ impl Home {
         self.shelf_index = self.shelf_index.min(shelf_len - 1);
         if self.system_open {
             match action {
-                Action::Confirm | Action::Back | Action::Escape => self.system_open = false,
+                Action::Confirm | Action::Back | Action::Escape | Action::Select(true) => {
+                    self.system_open = false;
+                }
                 Action::Options => {
                     self.system_open = false;
                     return Some(Request::SignOut);
@@ -219,7 +223,7 @@ impl Home {
             (Action::Confirm, Focus::Dock) => match DOCK_ITEMS[self.dock_index].1 {
                 Image::Store => return Some(Request::OpenStore),
                 Image::Settings => return Some(Request::OpenSettings),
-                _ => return Some(Request::Quit),
+                _ => return Some(Request::Exit),
             },
             _ => {}
         }
@@ -248,7 +252,7 @@ impl Home {
             Action::Down => {
                 self.menu = Some(menu.with_row((row + 1).min(rows.len().saturating_sub(1))))
             }
-            Action::Back | Action::Escape => {
+            Action::Back | Action::Escape | Action::Select(true) => {
                 self.menu = match menu {
                     LibraryMenu::Stores(_) => Some(LibraryMenu::Main(1)),
                     LibraryMenu::Main(_) => None,

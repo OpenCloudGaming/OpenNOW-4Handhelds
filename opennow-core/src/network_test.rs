@@ -514,10 +514,13 @@ impl std::fmt::Debug for NetworkTestSession {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProbeOutcome {
     pub measured_datagram_bytes: Option<u32>,
     pub probes: usize,
+    pub latency_ms: Option<u64>,
+    pub bandwidth_mbps: Option<f64>,
+    pub packet_loss_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -703,12 +706,14 @@ pub fn probe_mtu(
     }
     let deadline = std::time::Instant::now() + PROBE_BUDGET;
     let mut probes = 0_usize;
-    let confirmed = |size: u32, probes: &mut usize| -> bool {
+    let mut best_rtt: Option<std::time::Duration> = None;
+    let confirmed = |size: u32, probes: &mut usize, best_rtt: &mut Option<std::time::Duration>| -> bool {
         if *probes >= MAX_PROBES || std::time::Instant::now() >= deadline {
             return false;
         }
         *probes += 1;
-        confirm_datagram(
+        let started = std::time::Instant::now();
+        let ok = confirm_datagram(
             socket,
             peer,
             key,
@@ -716,25 +721,39 @@ pub fn probe_mtu(
             u32::try_from(*probes).unwrap_or(u32::MAX),
             size,
             deadline,
-        )
+        );
+        if ok {
+            let rtt = started.elapsed();
+            *best_rtt = Some(best_rtt.map(|current| current.min(rtt)).unwrap_or(rtt));
+        }
+        ok
     };
-    if confirmed(ceiling, &mut probes) {
+    let latency_ms = |best_rtt: Option<std::time::Duration>| {
+        best_rtt.map(|rtt| u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX))
+    };
+    if confirmed(ceiling, &mut probes, &mut best_rtt) {
         return Ok(ProbeOutcome {
             measured_datagram_bytes: Some(ceiling),
             probes,
+            latency_ms: latency_ms(best_rtt),
+            bandwidth_mbps: None,
+            packet_loss_pct: None,
         });
     }
-    if !confirmed(floor, &mut probes) {
+    if !confirmed(floor, &mut probes, &mut best_rtt) {
         return Ok(ProbeOutcome {
             measured_datagram_bytes: None,
             probes,
+            latency_ms: latency_ms(best_rtt),
+            bandwidth_mbps: None,
+            packet_loss_pct: None,
         });
     }
     let mut low = floor;
     let mut high = ceiling;
     while high - low > PROBE_STEP && probes < MAX_PROBES {
         let middle = low + (high - low) / 2;
-        if confirmed(middle, &mut probes) {
+        if confirmed(middle, &mut probes, &mut best_rtt) {
             low = middle;
         } else {
             high = middle;
@@ -743,7 +762,111 @@ pub fn probe_mtu(
     Ok(ProbeOutcome {
         measured_datagram_bytes: Some(low),
         probes,
+        latency_ms: latency_ms(best_rtt),
+        bandwidth_mbps: None,
+        packet_loss_pct: None,
     })
+}
+
+pub const BANDWIDTH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+const BANDWIDTH_DRAIN: std::time::Duration = std::time::Duration::from_millis(300);
+const BANDWIDTH_MAX_PACKETS: u32 = 40_000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandwidthSample {
+    pub mbps: f64,
+    pub packet_loss_pct: f64,
+}
+
+/// Flood the measured datagram size and count the echoes. Megabits are the
+/// bytes that came back divided by the send window.
+pub fn probe_bandwidth(
+    socket: &std::net::UdpSocket,
+    peer: std::net::SocketAddr,
+    key: &[u8],
+    session_id: &[u8],
+    size: u32,
+    window: std::time::Duration,
+) -> Option<BandwidthSample> {
+    if size < 64 || window.is_zero() {
+        return None;
+    }
+    let _ = socket.set_nonblocking(true);
+    let mut buffer = vec![0_u8; MAX_MESSAGE_BYTES];
+    let started = std::time::Instant::now();
+    let mut sequence = 1_u32;
+    let mut sent = 0_u32;
+    let mut received = 0_u32;
+    while started.elapsed() < window && sent < BANDWIDTH_MAX_PACKETS {
+        if crate::requests::check().is_err() {
+            break;
+        }
+        let mut message = NetworkTestMessage::mtu_probe(size, session_id, sequence);
+        if message.seal(key).is_err() {
+            break;
+        }
+        match socket.send_to(&message.encode(), peer) {
+            Ok(_) => {
+                sent += 1;
+                sequence = sequence.wrapping_add(1);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                received += drain_echoes(socket, peer, session_id, size, &mut buffer);
+            }
+            Err(_) => break,
+        }
+        if sent % 32 == 0 {
+            received += drain_echoes(socket, peer, session_id, size, &mut buffer);
+        }
+    }
+    let elapsed = started.elapsed();
+    let _ = socket.set_nonblocking(false);
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(20)));
+    let drain_deadline = std::time::Instant::now() + BANDWIDTH_DRAIN;
+    while std::time::Instant::now() < drain_deadline {
+        let before = received;
+        received += drain_echoes(socket, peer, session_id, size, &mut buffer);
+        if received >= sent || received == before {
+            if received >= sent {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    if sent == 0 || elapsed.is_zero() {
+        return None;
+    }
+    let echoed = received.min(sent);
+    let mbps = (f64::from(echoed) * f64::from(size) * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
+    let loss = f64::from(sent - echoed) / f64::from(sent) * 100.0;
+    Some(BandwidthSample {
+        mbps,
+        packet_loss_pct: loss,
+    })
+}
+
+fn drain_echoes(
+    socket: &std::net::UdpSocket,
+    peer: std::net::SocketAddr,
+    session_id: &[u8],
+    size: u32,
+    buffer: &mut [u8],
+) -> u32 {
+    let mut accepted = 0_u32;
+    loop {
+        let Ok((length, source)) = socket.recv_from(buffer) else {
+            return accepted;
+        };
+        if source != peer || length < size as usize {
+            continue;
+        }
+        let Ok(reply) = NetworkTestMessage::decode_reply(&buffer[..length]) else {
+            continue;
+        };
+        if reply_is_accepted(&reply, session_id, size) {
+            accepted += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +1008,27 @@ mod probe_tests {
         let socket = client_socket();
         let outcome = probe_mtu(&socket, peer, &KEY, SESSION, PROBE_FLOOR_BYTES, 1_340).unwrap();
         assert_eq!(outcome.measured_datagram_bytes, None);
+        drop(socket);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn echoed_datagrams_produce_a_megabit_rate() {
+        let (peer, server) = vendor_server(u32::MAX, |size| {
+            vec![vendor_datagram(SESSION, size, MESSAGE_TYPE_MTU_RESPONSE)]
+        });
+        let socket = client_socket();
+        let sample = probe_bandwidth(
+            &socket,
+            peer,
+            &KEY,
+            SESSION,
+            512,
+            Duration::from_millis(200),
+        )
+        .expect("bandwidth sample");
+        assert!(sample.mbps > 0.0, "measured {}", sample.mbps);
+        assert!(sample.packet_loss_pct < 100.0);
         drop(socket);
         let _ = server.join();
     }

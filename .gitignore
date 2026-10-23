@@ -1,4 +1,5 @@
-builds/
+build/
+.cache/
 **/target/
 *.log
 data/

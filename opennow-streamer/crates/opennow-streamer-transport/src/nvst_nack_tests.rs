@@ -232,7 +232,15 @@ fn rtt_aware_nack_spacing_and_send_caps_match_the_wait_budget() {
             }
         }
         assert_eq!(sent_at, expected, "RTT {rtt:?}");
-        assert!(!feedback.resolve_nack(42));
+        let deadline = loss_recovery_wait(Some(rtt));
+        if deadline > Duration::from_millis(52) {
+            assert!(
+                feedback.resolve_nack(42),
+                "RTT {rtt:?} remains recoverable until {deadline:?}"
+            );
+        } else {
+            assert!(!feedback.resolve_nack(42), "RTT {rtt:?}");
+        }
         assert!(!feedback.keyframe_request_pending());
     }
 }
@@ -243,13 +251,21 @@ fn rtt_aware_nack_cap_keeps_sent_packets_resolvable_until_the_deadline() {
     let now = Instant::now();
     let rtt = Some(Duration::from_millis(40));
     feedback.request_nack(42, 43, now);
+    let deadline = loss_recovery_wait(rtt);
+    assert!(deadline > NACK_TRACKING_TIMEOUT);
     assert_eq!(feedback.take_nack(now, rtt), Some((42, 43)));
     assert_eq!(
         feedback.take_nack(now + Duration::from_millis(44), rtt),
         None
     );
     assert!(feedback.resolve_nack(42));
-    assert_eq!(feedback.take_nack(now + NACK_TRACKING_TIMEOUT, rtt), None);
+    assert_eq!(
+        feedback.take_nack(now + deadline - Duration::from_nanos(1), rtt),
+        None
+    );
+    assert!(feedback.resolve_nack(43));
+    feedback.request_nack(43, 43, now);
+    assert_eq!(feedback.take_nack(now + deadline, rtt), None);
     assert!(!feedback.resolve_nack(43));
 }
 

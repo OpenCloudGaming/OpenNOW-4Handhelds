@@ -699,6 +699,13 @@ fn dispatch(method: &str, params: &Value, core: &AppCore) -> DispatchResult {
         "network.regions.ping" => network::ping_regions(params)
             .map(|value| (value, None))
             .map_err(|message| ("region_ping_failed".to_owned(), message)),
+        "network.test" => {
+            let settings = core.settings.lock().expect("settings poisoned").all();
+            core.gfn
+                .network_test(&settings)
+                .map(|value| (value, None))
+                .map_err(gfn_error)
+        }
         "queue.servers.list" => queue_servers::list()
             .map(|value| (value, None))
             .map_err(gfn_error),

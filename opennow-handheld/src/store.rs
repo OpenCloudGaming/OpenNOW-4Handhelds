@@ -20,6 +20,7 @@ fn grid_bottom() -> f32 {
     separator_y()
 }
 const MAX_QUERY: usize = 40;
+const GAMEPAD_FILTER_ID: &str = "opennow.gamepadCompatible";
 
 const CELL: f32 = 42.0;
 const CELL_GAP: f32 = 3.0;
@@ -298,6 +299,27 @@ impl Store {
                 (!options.is_empty()).then_some(FilterGroup { label, options })
             })
             .collect();
+        let features = self
+            .filters
+            .iter_mut()
+            .find(|group| group.label.eq_ignore_ascii_case("Features"));
+        let option = FilterOption {
+            id: GAMEPAD_FILTER_ID.to_owned(),
+            label: "Gamepad compatible".to_owned(),
+        };
+        if let Some(group) = features {
+            if !group.options.iter().any(|existing| existing.id == GAMEPAD_FILTER_ID) {
+                group.options.push(option);
+            }
+        } else {
+            self.filters.insert(
+                0,
+                FilterGroup {
+                    label: "Features".to_owned(),
+                    options: vec![option],
+                },
+            );
+        }
         self.filters_loading = false;
     }
 
@@ -305,8 +327,18 @@ impl Store {
         self.filters_loading = false;
     }
 
-    pub fn selected_filter_ids(&self) -> &[String] {
-        &self.selected_filters
+    pub fn selected_filter_ids(&self) -> Vec<String> {
+        self.selected_filters
+            .iter()
+            .filter(|id| id.as_str() != GAMEPAD_FILTER_ID)
+            .cloned()
+            .collect()
+    }
+
+    pub fn gamepad_filter_selected(&self) -> bool {
+        self.selected_filters
+            .iter()
+            .any(|id| id == GAMEPAD_FILTER_ID)
     }
 
     /// Repeats deletion only while the delete key remains selected.
@@ -499,7 +531,7 @@ impl Store {
         match action {
             Action::Up => self.menu = Some(row.saturating_sub(1)),
             Action::Down => self.menu = Some((row + 1).min(rows.len().saturating_sub(1))),
-            Action::Back | Action::Escape => {
+            Action::Back | Action::Escape | Action::Select(true) => {
                 if self.picking_store {
                     self.picking_store = false;
                     self.menu = Some(2);

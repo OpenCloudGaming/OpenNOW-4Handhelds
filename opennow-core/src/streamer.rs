@@ -589,6 +589,31 @@ impl StreamerService {
             ));
         }
         let profile = &session["negotiatedStreamProfile"];
+        if session["transportMode"] == "webrtc" {
+            if session["reportedNativeTransport"] == true {
+                return Err(invalid(
+                    "CloudMatch returned a native allocation for this WebRTC session",
+                ));
+            }
+            if !crate::cloudmatch::has_webrtc_endpoint(&session) {
+                return Err(invalid(
+                    "The WebRTC session has no valid signaling endpoint",
+                ));
+            }
+            if profile["codec"]
+                .as_str()
+                .is_some_and(|codec| !matches!(codec, "H264" | "H265"))
+                || (profile["codecSource"] == "server" && profile["codec"].as_str().is_none())
+                || profile["enableHdr"] == true
+                || profile["colorQuality"].as_str().is_some_and(|color| {
+                    color != "8bit_420" && !(profile["codec"] == "H265" && color == "10bit_420")
+                })
+            {
+                return Err(invalid(
+                    "WebRTC compatibility requires H.264 8-bit or H.265 8/10-bit SDR 4:2:0",
+                ));
+            }
+        }
         if profile["enableHdrSource"] == "server" && profile["enableHdr"].as_bool().is_none() {
             return Err(invalid("CloudMatch returned an unsupported HDR mode"));
         }
@@ -1711,8 +1736,15 @@ pub(crate) fn validated_native_hdr_display(display: &Value) -> Option<NativeHdrD
 
 fn streamer_context(mut session: Value, settings: &Value) -> Value {
     let mut normalized = settings.clone();
+    let provider = session["providerCode"].as_str().unwrap_or("");
+    let alliance = !provider.is_empty() && !provider.eq_ignore_ascii_case("NVIDIA");
+    let webrtc = session["transportMode"] == "webrtc" || alliance;
     let negotiated_codec = session["negotiatedStreamProfile"]["codec"].as_str();
-    let requested_codec = normalized["codec"].as_str().unwrap_or("auto").to_owned();
+    let requested_codec = if webrtc {
+        "H264".to_owned()
+    } else {
+        normalized["codec"].as_str().unwrap_or("auto").to_owned()
+    };
     let codec = negotiated_codec.map(ToOwned::to_owned).unwrap_or_else(|| {
         if requested_codec.eq_ignore_ascii_case("auto") {
             "H264".to_owned()
@@ -1727,13 +1759,31 @@ fn streamer_context(mut session: Value, settings: &Value) -> Value {
             .unwrap_or(false)
     );
     normalized["nativeHdrSupported"] = json!(false);
+    // Alliance partners only have WebRTC. NVST stays on NVIDIA Global.
+    let preferred_transport = if webrtc { "webrtc" } else { "nvst" };
+    normalized["preferredTransportMode"] = json!(preferred_transport);
     if let Some(color) = session["negotiatedStreamProfile"]["colorQuality"].as_str() {
         normalized["colorQuality"] = json!(color);
     }
-    // The Qt/native client owns negotiation and media over NVST. Ignore old
-    // persisted WebRTC values so manual HEVC/AV1 selections cannot be routed
-    // through the retired browser transport.
-    normalized["transportMode"] = Value::String("nvst".to_owned());
+    normalized["transportMode"] = json!(preferred_transport);
+    if webrtc {
+        normalized["colorQuality"] = json!(
+            session["negotiatedStreamProfile"]["colorQuality"]
+                .as_str()
+                .unwrap_or("8bit_420")
+        );
+        normalized["enableHdr"] = json!(false);
+        normalized["microphoneMode"] = json!("disabled");
+        normalized["enableCloudGsync"] = json!(false);
+        normalized["nativeCloudGsyncMode"] = json!("disabled");
+        normalized["resolution"] = json!("1920x1080");
+        normalized["fps"] = json!(60);
+    }
+    for key in ["resolution", "fps"] {
+        if !session["negotiatedStreamProfile"][key].is_null() {
+            normalized[key] = session["negotiatedStreamProfile"][key].clone();
+        }
+    }
     if session["negotiatedStreamProfile"].is_null() {
         session["negotiatedStreamProfile"] = json!({"codec":codec.to_ascii_uppercase()});
     }

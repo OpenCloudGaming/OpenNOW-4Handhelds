@@ -208,11 +208,12 @@ fn key_action(symbol: i32) -> Option<Action> {
 }
 
 fn controller_action(button: u8, pressed: bool, xbox_layout: bool) -> Option<Action> {
-    // Nintendo: A east, B south, X top. Xbox: A south, B east, X on the printed Y.
+    // Mapped pads already name the face buttons. Nintendo keeps SDL A as
+    // confirm. Xbox swaps A/B and X/Y.
     let (confirm, back, options, y) = if xbox_layout {
-        (0, 1, 3, 2)
+        (1, 0, 3, 2)
     } else {
-        (1, 0, 2, 3)
+        (0, 1, 2, 3)
     };
     match (button, pressed) {
         (button, true) if button == confirm => Some(Action::Confirm),
@@ -279,7 +280,7 @@ fn translate(
             key_action(symbol)
         }
         Event::ControllerButton { button, pressed } => {
-            let confirm_button = if xbox_layout { 0 } else { 1 };
+            let confirm_button = if xbox_layout { 1 } else { 0 };
             if button == confirm_button {
                 repeat.set_confirm(pressed);
             }
@@ -385,6 +386,7 @@ fn run() -> Result<(), String> {
     let mut vsync = sdl.set_vsync(app.vsync_enabled());
     eprintln!("vsync: {}", if app.vsync_enabled() { "on" } else { "off" });
 
+    let mut layout = app.xbox_layout();
     let mut status = Status {
         driver,
         resolution: format!("{} × {}", window.width, window.height),
@@ -428,6 +430,11 @@ fn run() -> Result<(), String> {
                 Some(Some(action)) => app.act(action, &status),
                 Some(None) => {}
             }
+        }
+        if app.xbox_layout() != layout {
+            layout = app.xbox_layout();
+            repeat = NavRepeat::new();
+            app.release_held_pad();
         }
         if app.repeats_navigation() {
             let (actions, repeat_confirm) = repeat.tick(Instant::now());

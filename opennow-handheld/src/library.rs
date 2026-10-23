@@ -29,6 +29,7 @@ pub struct Game {
     pub store: String,
     pub status: String,
     pub in_library: bool,
+    pub supports_gamepad: bool,
     pub versions: Vec<StoreVersion>,
     pub color: [f32; 4],
     pub artwork: Option<String>,
@@ -65,6 +66,21 @@ impl Game {
             })
             .collect::<Vec<_>>();
         let variant = variants.get(selected).or_else(|| variants.first());
+        let supports_gamepad = value["supportedControls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                variant
+                    .and_then(|variant| variant["supportedControls"].as_array())
+                    .into_iter()
+                    .flatten(),
+            )
+            .any(|control| {
+                control
+                    .as_str()
+                    .is_some_and(|control| control.eq_ignore_ascii_case("GAMEPAD"))
+            });
         let id = value["id"].as_str().unwrap_or("").to_owned();
         let variant_id = variant.and_then(|variant| variant["id"].as_str()).unwrap_or("").to_owned();
         let in_library = variant.and_then(|variant| variant["inLibrary"].as_bool()).unwrap_or(false);
@@ -77,7 +93,7 @@ impl Game {
             .iter()
             .find_map(|key| value[*key].as_str().filter(|url| !url.is_empty()))
             .map(|url| url.replace(";w=900", ARTWORK_WIDTH).replace(";w=1200", ARTWORK_WIDTH));
-        Some(Self { id, variant_id, color: placeholder_color(&title), title, store, status, in_library, versions, artwork })
+        Some(Self { id, variant_id, color: placeholder_color(&title), title, store, status, in_library, supports_gamepad, versions, artwork })
     }
 
     /// Replaces the store list from a full catalog game, which includes every variant.
@@ -89,6 +105,7 @@ impl Game {
             return;
         }
         self.versions = detail.versions;
+        self.supports_gamepad = detail.supports_gamepad;
         if let Some(current) = self.versions.iter().find(|version| version.selected) {
             self.variant_id = current.id.clone();
             self.store = current.store.clone();

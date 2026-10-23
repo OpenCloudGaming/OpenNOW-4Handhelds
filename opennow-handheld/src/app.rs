@@ -13,7 +13,7 @@ use crate::stream::{self, NativeStream};
 use crate::system;
 use crate::text::Weight;
 use crate::theme::{self, *};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,9 @@ const LIBRARY_PAGE: u64 = 100;
 const LIBRARY_LIMIT: usize = 2000;
 /// Concurrent `artwork.resolve` requests; the core runs four background workers.
 const ARTWORK_IN_FLIGHT: usize = 3;
+/// No controller or pointer input for this long ends the live session.
+const INACTIVITY_LIMIT: Duration = Duration::from_secs(10 * 60);
+const ACTIVITY_DEADZONE: u16 = 8_000;
 
 enum Screen {
     Connecting,
@@ -55,6 +58,7 @@ struct Dialog {
 enum Pending {
     Hello,
     Session,
+    Providers,
     SignInStart,
     SignInPoll,
     SignInComplete,
@@ -104,6 +108,12 @@ struct LibraryRemoval {
 struct Region {
     name: String,
     url: String,
+}
+
+struct LoginProvider {
+    idp_id: String,
+    code: String,
+    display_name: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -203,6 +213,9 @@ pub struct App {
     play_settings_left: u8,
     play_message: String,
     session_wait_started: Option<Instant>,
+    /// Last controller or pointer input during a live session.
+    last_activity: Option<Instant>,
+    control_axes: [i16; 8],
     launch_catalog: String,
     launch_variant: String,
     launch_title: String,
@@ -217,9 +230,14 @@ pub struct App {
     /// A resumed seat may not include a remaining-time value in CloudMatch responses.
     resuming_existing_session: bool,
     session_recreate_attempted: bool,
+    retry_after_transport_mismatch: bool,
+    retry_after_queue_abandon: bool,
+    queue_rejoins: u8,
     next_session_poll: Option<Instant>,
     return_to_store: bool,
     sign_in: Phase,
+    login_providers: Vec<LoginProvider>,
+    login_provider_index: usize,
     next_poll: Option<Instant>,
     profile: Profile,
     settings_index: usize,
@@ -263,9 +281,10 @@ fn now_ms() -> u64 {
 }
 
 fn data_dir() -> PathBuf {
-    std::env::var_os("OPENNOW_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| core::executable_dir().join("data"))
+    if let Some(path) = std::env::var_os("OPENNOW_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    core::executable_dir().join("data")
 }
 
 impl App {
@@ -332,6 +351,8 @@ impl App {
             play_settings_left: 0,
             play_message: String::new(),
             session_wait_started: None,
+            last_activity: None,
+            control_axes: [0; 8],
             launch_catalog: String::new(),
             launch_variant: String::new(),
             launch_title: String::new(),
@@ -342,9 +363,14 @@ impl App {
             session_time_session_id: None,
             resuming_existing_session: false,
             session_recreate_attempted: false,
+            retry_after_transport_mismatch: false,
+            retry_after_queue_abandon: false,
+            queue_rejoins: 0,
             next_session_poll: None,
             return_to_store: false,
             sign_in: Phase::Starting,
+            login_providers: Vec::new(),
+            login_provider_index: 0,
             next_poll: None,
             profile: settings::load(),
             settings_index: 0,
@@ -397,6 +423,15 @@ impl App {
     // Input
 
     pub fn act(&mut self, action: Action, status: &Status) {
+        if self.notice.is_some() {
+            if matches!(action, Action::Confirm) {
+                self.notice = None;
+            }
+            return;
+        }
+        if self.play == PlayPhase::Live {
+            self.note_activity();
+        }
         match action {
             Action::Start(held) => self.start_held = held,
             Action::Select(held) => self.select_held = held,
@@ -419,7 +454,7 @@ impl App {
                     self.dialog = None;
                     self.confirmed(kind);
                 }
-                Action::Confirm | Action::Back | Action::Escape => {
+                Action::Confirm | Action::Back | Action::Escape | Action::Select(true) => {
                     self.dialog = None;
                     self.pending_add = None;
                 }
@@ -450,15 +485,9 @@ impl App {
                         _ => self.show_stats = !self.show_stats,
                     }
                 }
-                Action::Back | Action::Escape => self.session_menu = false,
+                Action::Back | Action::Escape | Action::Select(true) => self.session_menu = false,
                 _ => {}
             }
-            return;
-        }
-        if self.notice.is_some()
-            && matches!(action, Action::Confirm | Action::Back | Action::Escape)
-        {
-            self.notice = None;
             return;
         }
         match &self.screen {
@@ -475,6 +504,7 @@ impl App {
                 };
                 match self.home.act(action, &view) {
                     Some(Request::Quit) => self.open_dialog(DialogKind::Quit),
+                    Some(Request::Exit) => self.quit = true,
                     Some(Request::SignOut) => self.open_dialog(DialogKind::SignOut),
                     Some(Request::OpenStore) => self.open_store(),
                     Some(Request::OpenSettings) => self.open_settings(),
@@ -516,8 +546,20 @@ impl App {
                 }
             }
             Screen::SignIn => match action {
+                Action::Up | Action::Left if matches!(self.sign_in, Phase::ChooseProvider) => {
+                    self.cycle_login_provider(false)
+                }
+                Action::Down | Action::Right if matches!(self.sign_in, Phase::ChooseProvider) => {
+                    self.cycle_login_provider(true)
+                }
+                Action::Confirm if matches!(self.sign_in, Phase::ChooseProvider) => {
+                    self.begin_sign_in()
+                }
                 Action::Confirm if matches!(self.sign_in, Phase::Waiting(_) | Phase::Failed(_)) => {
                     self.begin_sign_in()
+                }
+                Action::Back if matches!(self.sign_in, Phase::Waiting(_) | Phase::Failed(_)) => {
+                    self.back_to_provider_selection()
                 }
                 Action::Escape => self.open_dialog(DialogKind::Quit),
                 _ => {}
@@ -563,7 +605,7 @@ impl App {
     /// Home, settings, the store, and open menus repeat a held direction.
     /// A live game keeps the D-pad and sticks for itself.
     pub fn repeats_navigation(&self) -> bool {
-        if self.mouse_mode {
+        if self.mouse_mode || self.notice.is_some() {
             return false;
         }
         match self.screen {
@@ -588,6 +630,17 @@ impl App {
         Some(self.profile.vsync)
     }
 
+    pub fn release_held_pad(&mut self) {
+        self.pad_select = false;
+        self.pad_x = false;
+        self.session_chord = false;
+        self.start_held = false;
+        self.select_held = false;
+        if let Some(stream) = self.stream.as_mut() {
+            stream.release_pad();
+        }
+    }
+
     pub fn note_fn_button(&mut self, present: bool) {
         if present {
             self.fn_button = true;
@@ -595,9 +648,10 @@ impl App {
     }
 
     pub fn pad_button(&mut self, button: u8, pressed: bool, raw_joystick: bool) {
-        if !matches!(self.screen, Screen::Stream) {
+        if self.notice.is_some() || !matches!(self.screen, Screen::Stream) {
             return;
         }
+        self.note_activity();
         if button == 16 {
             if pressed {
                 self.fn_button = true;
@@ -720,8 +774,10 @@ impl App {
 
     fn mouse_axis(&mut self, axis: u8, value: i16) {
         match axis {
-            0 | 2 => self.mouse_raw_x = value,
-            1 | 3 => self.mouse_raw_y = value,
+            // SDL's standardized game-controller layout exposes the left
+            // stick on axes 0 and 1. Keep right-stick events out of the cursor.
+            0 => self.mouse_raw_x = value,
+            1 => self.mouse_raw_y = value,
             4 | 5 => {
                 let press = value > 12_000;
                 let release = value < 4_000;
@@ -764,12 +820,19 @@ impl App {
         }
         self.mouse_x = next_x;
         self.mouse_y = next_y;
+        self.note_activity();
         self.send_mouse();
     }
 
     pub fn pad_axis(&mut self, axis: u8, value: i16) {
-        if !matches!(self.screen, Screen::Stream) {
+        if self.notice.is_some() || !matches!(self.screen, Screen::Stream) {
             return;
+        }
+        if (axis as usize) < self.control_axes.len() {
+            self.control_axes[axis as usize] = value;
+        }
+        if value.unsigned_abs() > ACTIVITY_DEADZONE {
+            self.note_activity();
         }
         if self.mouse_mode {
             self.mouse_axis(axis, value);
@@ -877,6 +940,7 @@ impl App {
         self.poll_removal();
         self.advance_play();
         self.move_mouse(elapsed);
+        self.check_inactivity();
         let mut keep_owned = Vec::new();
         match self.screen {
             Screen::Home => {
@@ -900,6 +964,37 @@ impl App {
         self.request_artwork(&keep_owned);
         let keep: Vec<&str> = keep_owned.iter().map(String::as_str).collect();
         self.artwork.update(painter, &keep);
+    }
+
+    fn note_activity(&mut self) {
+        if self.play == PlayPhase::Live {
+            self.last_activity = Some(Instant::now());
+        }
+    }
+
+    fn check_inactivity(&mut self) {
+        if self.play != PlayPhase::Live || self.profile.anti_afk {
+            return;
+        }
+        if self
+            .control_axes
+            .iter()
+            .any(|value| value.unsigned_abs() > ACTIVITY_DEADZONE)
+            || self.mouse_stick_x != 0.0
+            || self.mouse_stick_y != 0.0
+        {
+            self.last_activity = Some(Instant::now());
+        }
+        let Some(last) = self.last_activity else {
+            self.last_activity = Some(Instant::now());
+            return;
+        };
+        if last.elapsed() < INACTIVITY_LIMIT {
+            return;
+        }
+        eprintln!("stream: ended after inactivity");
+        self.end_stream("inactivity");
+        self.notice = Some("The session has ended due to inactivity.".into());
     }
 
     fn refresh_clock(&mut self) {
@@ -944,6 +1039,8 @@ impl App {
                 );
             }
             (Pending::Hello, Err(error)) => self.screen = Screen::CoreFailed(error.message),
+            (Pending::Providers, Ok(value)) => self.login_providers_loaded(&value),
+            (Pending::Providers, Err(error)) => self.sign_in = Phase::Failed(error.message),
             (Pending::Session | Pending::SignInComplete | Pending::Logout, Ok(envelope)) => {
                 self.apply_session(&envelope)
             }
@@ -1004,9 +1101,25 @@ impl App {
             (Pending::SessionList, Ok(value)) => self.remote_sessions_listed(&value),
             (Pending::SessionList, Err(error)) => self.fail_stream(error.message),
             (Pending::SessionClaim, Ok(value)) => self.session_claimed(&value),
-            (Pending::SessionClaim, Err(error)) => self.fail_stream(error.message),
+            (Pending::SessionClaim, Err(error)) => {
+                eprintln!("stream: {}", error.message);
+                self.notice = Some(error.message);
+                self.retry_after_transport_mismatch = false;
+                self.resuming_existing_session = false;
+                self.play = PlayPhase::Idle;
+                self.play_message.clear();
+                self.cloud_session = None;
+                self.finish_stream_screen();
+            }
             (Pending::SessionPoll, Ok(value)) => self.session_polled(&value),
-            (Pending::SessionPoll, Err(error)) => self.fail_stream(error.message),
+            (Pending::SessionPoll, Err(error)) => {
+                if error.code == "queue_abandoned" && self.queue_rejoins < 2 && self.play == PlayPhase::Poll
+                {
+                    self.queue_rejoins = self.queue_rejoins.saturating_add(1);
+                    self.retry_after_queue_abandon = true;
+                }
+                self.fail_stream(error.message);
+            }
             (Pending::StreamPrepare, Ok(value)) => self.stream_prepared(&value),
             (Pending::StreamPrepare, Err(error)) => self.fail_stream(error.message),
             (Pending::SessionStop, _) => {
@@ -1018,7 +1131,16 @@ impl App {
                 self.session_time_deadline = None;
                 self.session_time_session_id = None;
                 self.resuming_existing_session = false;
-                if self.quit_after_session {
+                if self.retry_after_transport_mismatch {
+                    self.retry_after_transport_mismatch = false;
+                    self.notice = None;
+                    self.request_new_cloud_session();
+                } else if self.retry_after_queue_abandon {
+                    self.retry_after_queue_abandon = false;
+                    self.notice = None;
+                    self.play_message = "The queue restarted. Joining it again…".into();
+                    self.request_new_cloud_session();
+                } else if self.quit_after_session {
                     self.quit = true;
                 } else if self.play == PlayPhase::Stop || self.play == PlayPhase::Idle {
                     self.finish_stream_screen();
@@ -1090,10 +1212,7 @@ impl App {
             "userId": user["userId"].clone(),
             "providerIdpId": envelope["session"]["provider"]["idpId"].clone(),
         });
-        eprintln!(
-            "auth: signed in, membership {}",
-            user["membershipTier"].as_str().unwrap_or("unknown")
-        );
+        eprintln!("auth: signed in");
         self.screen = Screen::Home;
         self.home.reset();
         self.load_library();
@@ -1109,6 +1228,9 @@ impl App {
         self.session_time_session_id = None;
         self.resuming_existing_session = false;
         self.session_recreate_attempted = false;
+        self.retry_after_transport_mismatch = false;
+        self.retry_after_queue_abandon = false;
+        self.queue_rejoins = 0;
         self.scope = Value::Null;
         self.games.clear();
         self.store_games.clear();
@@ -1116,7 +1238,69 @@ impl App {
         self.refresh_library = false;
         self.notice = None;
         self.screen = Screen::SignIn;
-        self.begin_sign_in();
+        self.sign_in = Phase::Starting;
+        self.login_providers.clear();
+        self.login_provider_index = 0;
+        self.send(
+            "auth.providers.list",
+            json!({}),
+            Duration::from_secs(30),
+            Pending::Providers,
+        );
+    }
+
+    fn login_providers_loaded(&mut self, value: &Value) {
+        self.login_providers = value["providers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|provider| {
+                Some(LoginProvider {
+                    idp_id: provider["idpId"].as_str()?.to_owned(),
+                    code: provider["code"].as_str()?.to_owned(),
+                    display_name: provider["displayName"].as_str()?.to_owned(),
+                })
+            })
+            .collect();
+        self.login_providers
+            .sort_by_key(|provider| !provider.code.eq_ignore_ascii_case("NVIDIA"));
+        self.login_provider_index = 0;
+        self.sign_in = Phase::ChooseProvider;
+    }
+
+    fn cycle_login_provider(&mut self, forward: bool) {
+        if self.login_providers.is_empty() {
+            return;
+        }
+        let count = self.login_providers.len();
+        self.login_provider_index = if forward {
+            (self.login_provider_index + 1).min(count - 1)
+        } else {
+            self.login_provider_index.saturating_sub(1)
+        };
+    }
+
+    fn back_to_provider_selection(&mut self) {
+        if let Phase::Waiting(challenge) = &self.sign_in {
+            self.send(
+                "auth.device.cancel",
+                json!({"attemptId":challenge.attempt_id}),
+                Duration::from_secs(5),
+                Pending::SignInCancel,
+            );
+        }
+        self.pending.retain(|_, pending| {
+            !matches!(
+                pending,
+                Pending::SignInStart | Pending::SignInPoll | Pending::SignInComplete
+            )
+        });
+        self.next_poll = None;
+        if self.login_providers.is_empty() {
+            self.show_sign_in();
+        } else {
+            self.sign_in = Phase::ChooseProvider;
+        }
     }
 
     fn begin_sign_in(&mut self) {
@@ -1137,9 +1321,13 @@ impl App {
         });
         self.sign_in = Phase::Starting;
         self.next_poll = None;
+        let provider_id = self
+            .login_providers
+            .get(self.login_provider_index)
+            .map(|provider| provider.idp_id.as_str());
         self.send(
             "auth.device.start",
-            json!({}),
+            json!({"providerIdpId":provider_id}),
             Duration::from_secs(30),
             Pending::SignInStart,
         );
@@ -1382,7 +1570,12 @@ impl App {
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or_default();
-        for game in incoming.iter().filter_map(Game::parse) {
+        let gamepad_only = self.store.gamepad_filter_selected();
+        for game in incoming
+            .iter()
+            .filter_map(Game::parse)
+            .filter(|game| !gamepad_only || game.supports_gamepad)
+        {
             let duplicate =
                 !game.id.is_empty() && self.store_games.iter().any(|have| have.id == game.id);
             if !duplicate && self.store_games.len() < LIBRARY_LIMIT {
@@ -1397,6 +1590,11 @@ impl App {
         self.store_has_more = more;
         if more {
             self.store_cursor = next.to_owned();
+        }
+        if gamepad_only && self.store_games.is_empty() && more {
+            self.store_status = store::Status::Loading;
+            self.request_store_page();
+            return;
         }
         self.store_status = store::Status::Ready;
         eprintln!("store: {} games, more={more}", self.store_games.len());
@@ -1940,6 +2138,7 @@ impl App {
         {
             self.membership_tier = tier.to_owned();
             self.session_limit_secs = settings::session_limit_secs(tier);
+            eprintln!("auth: membership {tier}");
         }
         self.playtime = settings::playtime_from_subscription(value);
         if let Some(limit) = self
@@ -2070,6 +2269,9 @@ impl App {
         self.cancel_session_create = false;
         self.resuming_existing_session = false;
         self.session_recreate_attempted = false;
+        self.retry_after_transport_mismatch = false;
+        self.retry_after_queue_abandon = false;
+        self.queue_rejoins = 0;
         self.launch_catalog = catalog_id.to_owned();
         self.launch_variant = variant_id.to_owned();
         self.launch_title = title.to_owned();
@@ -2135,6 +2337,8 @@ impl App {
                         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
                 }
                 self.play_message = self.launch_title.clone();
+                self.last_activity = Some(Instant::now());
+                self.control_axes = [0; 8];
                 eprintln!("stream: media started");
             }
         }
@@ -2338,6 +2542,7 @@ impl App {
             return;
         }
         self.resuming_existing_session = true;
+        self.cloud_session = Some(session.clone());
         eprintln!("stream: claiming session {session_id}");
         self.play_message = "Reconnecting to your running game…".into();
         self.send(
@@ -2415,11 +2620,16 @@ impl App {
         // A claim keeps the previous signaling addresses until a fresh poll
         // reports the seat ready. Connecting to those addresses returns HTTP 404.
         let resume_pending = session["resumePending"].as_bool() == Some(true);
+        let webrtc_ready = session["transportMode"] == "webrtc"
+            && session["signalingUrl"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("wss://"));
         let ready = !resume_pending
             && matches!(status, 2 | 3)
-            && session["rtspsEndpoints"]
-                .as_array()
-                .is_some_and(|endpoints| !endpoints.is_empty());
+            && (webrtc_ready
+                || session["rtspsEndpoints"]
+                    .as_array()
+                    .is_some_and(|endpoints| !endpoints.is_empty()));
         if !ready {
             self.play = PlayPhase::Poll;
             self.play_deadline = Some(Instant::now() + Duration::from_secs(30 * 60));
@@ -2476,15 +2686,16 @@ impl App {
             self.notice = Some(message);
             return;
         }
-        // The cloud seat is still theirs. Stopping it here is why the next Play
-        // says the session must be ended, while a fresh launch can resume it.
+        // Keep the cloud seat so a failed connection can resume the same session.
         let keep_seat = matches!(self.play, PlayPhase::Live | PlayPhase::Attach);
         eprintln!("stream: {message}");
         self.leave_mouse_mode();
         let session = self.cloud_session.clone();
         self.play = PlayPhase::Idle;
         self.play_message.clear();
-        self.notice = Some(if keep_seat {
+        self.notice = Some(if self.retry_after_queue_abandon {
+            "The queue restarted. Joining it again…".into()
+        } else if keep_seat {
             "The connection dropped. Start the game again to resume this session.".into()
         } else {
             message
@@ -2522,6 +2733,8 @@ impl App {
         self.resuming_existing_session = false;
         self.stream_frame = None;
         self.session_wait_started = None;
+        self.last_activity = None;
+        self.control_axes = [0; 8];
         if let Some(mut stream) = self.stream.take() {
             stream.stop_media();
             stream.release_pad();
@@ -2599,6 +2812,8 @@ impl App {
         self.stream_capabilities = None;
         self.stream_frame = None;
         self.session_wait_started = None;
+        self.last_activity = None;
+        self.control_axes = [0; 8];
         self.session_menu = false;
         self.screen = if self.return_to_store {
             Screen::Store
@@ -2663,18 +2878,33 @@ impl App {
                     200.0,
                     15.0,
                     Weight::SemiBold,
-                    "Details are in opennow.log next to the app.",
+                    "Details are in log.txt next to the app.",
                     MUTED,
                 );
                 theme::draw_footer(painter, "", &[("A", "Retry")]);
             }
             Screen::SignIn => {
-                signin::draw(painter, &self.sign_in, &self.clock, now_ms(), seconds);
-                theme::draw_footer(
+                let provider_names = self
+                    .login_providers
+                    .iter()
+                    .map(|provider| {
+                        if provider.code.eq_ignore_ascii_case("NVIDIA") {
+                            "GeForce NOW Global"
+                        } else {
+                            provider.display_name.as_str()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                signin::draw(
                     painter,
-                    "OpenNOW is not affiliated with NVIDIA",
-                    &signin::hints(&self.sign_in),
+                    &self.sign_in,
+                    &provider_names,
+                    self.login_provider_index,
+                    &self.clock,
+                    now_ms(),
+                    seconds,
                 );
+                theme::draw_footer(painter, "", &signin::hints(&self.sign_in));
             }
             Screen::Home => {
                 let view = HomeView {
@@ -2733,6 +2963,7 @@ impl App {
                         stream::fitted_rect(width, height, canvas());
                     painter.video(texture, x, y, fitted_width, fitted_height);
                 } else {
+                    theme::draw_session_status(painter, &self.clock);
                     theme::draw_spinner(
                         painter,
                         canvas().0 / 2.0,
@@ -2752,8 +2983,8 @@ impl App {
                     );
                     theme::draw_centered_footer_cycle(
                         painter,
-                        "FN or Select + X opens the session menu",
-                        "Low FPS or unstable internet? Lower bitrate and FPS in Settings.",
+                        "FN or Select + X opens the session overlay menu",
+                        "Frame drops and hitches? Lower the FPS and bit rate",
                         self.session_wait_started
                             .map(|started| started.elapsed().as_secs_f32())
                             .unwrap_or(0.0),
@@ -2763,7 +2994,12 @@ impl App {
         }
         if self.session_menu && self.play == PlayPhase::Live {
             let time_left = session_time_left_label(self.session_time_deadline);
-            theme::draw_session_menu(painter, self.session_menu_index as usize, &time_left, &self.clock);
+            theme::draw_session_menu(
+                painter,
+                self.session_menu_index as usize,
+                &time_left,
+                &self.clock,
+            );
         }
         if self.show_stats && matches!(self.screen, Screen::Stream) && self.play == PlayPhase::Live
         {
@@ -2940,38 +3176,88 @@ fn draw_stream_stats(
 }
 
 fn draw_notice(painter: &mut Painter, message: &str) {
-    let (x, y, width, height) = (70.0, 110.0, 500.0, 230.0);
-    theme::draw_panel(painter, x, y, width, height);
-    painter.text(x + 28.0, y + 24.0, 22.0, Weight::Black, "Play", TEXT);
+    let pad = 22.0;
+    let text_size = 22.0;
+    let line_gap = 28.0;
+    let button_height = 40.0;
+    let button_gap = 16.0;
+    let measured = painter.measure(message, text_size, Weight::Bold);
+    let max_width = canvas().0 - 32.0;
+    let width = (measured + pad * 2.0).clamp(220.0, max_width);
+    let text_width = width - pad * 2.0;
+    let mut lines = 1.0;
     let mut line = String::new();
-    let mut line_y = y + 68.0;
     for word in message.split_whitespace() {
         let candidate = if line.is_empty() {
             word.to_owned()
         } else {
             format!("{line} {word}")
         };
-        if !line.is_empty() && painter.measure(&candidate, 15.0, Weight::SemiBold) > width - 56.0 {
-            painter.text(x + 28.0, line_y, 15.0, Weight::SemiBold, &line, MUTED);
-            line_y += 22.0;
-            if line_y > y + height - 70.0 {
-                line = format!("{word}…");
-                break;
-            }
-            line = word.to_owned();
-        } else {
+        if line.is_empty() || painter.measure(&candidate, text_size, Weight::Bold) <= text_width {
             line = candidate;
+        } else {
+            lines += 1.0;
+            line = word.to_owned();
         }
     }
-    if !line.is_empty() {
-        painter.text_fit(
-            x + 28.0,
+    let max_height = canvas().1 - 32.0;
+    let height = (pad + lines * line_gap + button_gap + button_height + pad).min(max_height);
+    let x = (canvas().0 - width) / 2.0;
+    let y = ((canvas().1 - height) / 2.0).max(12.0);
+    theme::draw_panel(painter, x, y, width, height);
+    let mut line = String::new();
+    let mut line_y = y + pad;
+    let limit = y + height - pad - button_height - button_gap;
+    for word in message.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if line.is_empty() || painter.measure(&candidate, text_size, Weight::Bold) <= text_width {
+            line = candidate;
+            continue;
+        }
+        if line_y + line_gap > limit {
+            line = format!("{line}…");
+            break;
+        }
+        let drawn = painter.measure(&line, text_size, Weight::Bold);
+        painter.text(
+            x + (width - drawn) / 2.0,
             line_y,
-            15.0,
-            Weight::SemiBold,
+            text_size,
+            Weight::Bold,
             &line,
-            width - 56.0,
-            MUTED,
+            TEXT,
+        );
+        line_y += line_gap;
+        line = word.to_owned();
+    }
+    if !line.is_empty() && line_y < limit {
+        let drawn = painter.measure(&line, text_size, Weight::Bold).min(text_width);
+        painter.text_fit(
+            x + (width - drawn) / 2.0,
+            line_y,
+            text_size,
+            Weight::Bold,
+            &line,
+            text_width,
+            TEXT,
         );
     }
+    let label = "OK";
+    let label_width = painter.measure(label, 16.0, Weight::ExtraBold);
+    let button_width = (label_width + 48.0).max(108.0);
+    let button_x = x + (width - button_width) / 2.0;
+    let button_y = y + height - pad - button_height;
+    painter.fill(button_x, button_y, button_width, button_height, 17.0, FOCUS);
+    painter.text(
+        button_x + (button_width - label_width) / 2.0,
+        button_y + 10.0,
+        16.0,
+        Weight::ExtraBold,
+        label,
+        BACKGROUND,
+    );
 }

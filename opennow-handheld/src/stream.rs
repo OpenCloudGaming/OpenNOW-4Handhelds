@@ -205,7 +205,7 @@ impl NativeStream {
             return Err(format!("The streamer runtime did not start ({status})"));
         }
         stream.handle = handle;
-        let log = executable_dir().join("streamer.log");
+        let log = executable_dir().join("log.txt");
         if let Ok(bytes) = std::ffi::CString::new(log.to_string_lossy().as_bytes()) {
             unsafe {
                 if let Ok(set_log) = stream.api._library.get::<unsafe extern "C" fn(*const c_char) -> Status>(b"opennow_streamer_set_log_file\0") {
@@ -420,8 +420,9 @@ fn trigger(value: i16) -> u8 {
 }
 
 /// SDL game-controller buttons, or the RK3326 raw joystick layout.
-/// Nintendo is the default: the printed A/B/X/Y labels match the game.
-/// Xbox layout uses the standard SDL positions instead.
+/// These handhelds already use Switch labels: A east, B south, X north, Y west.
+/// A mapped pad's SDL A/B/X/Y follow that, so Nintendo keeps them.
+/// Xbox layout swaps the pairs.
 fn button_mask(button: u8, raw_joystick: bool, xbox_layout: bool) -> Option<u16> {
     if raw_joystick {
         return Some(match button {
@@ -441,9 +442,8 @@ fn button_mask(button: u8, raw_joystick: bool, xbox_layout: bool) -> Option<u16>
         });
     }
     Some(match button {
-        0 => if xbox_layout { 0x1000 } else { 0x2000 },
-        1 => if xbox_layout { 0x2000 } else { 0x1000 },
-        // Printed X is the top button. Xbox moves Y onto that button and X onto printed Y.
+        0 => if xbox_layout { 0x2000 } else { 0x1000 },
+        1 => if xbox_layout { 0x1000 } else { 0x2000 },
         2 => if xbox_layout { 0x8000 } else { 0x4000 },
         3 => if xbox_layout { 0x4000 } else { 0x8000 },
         4 => 0x0020,

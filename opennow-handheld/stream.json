@@ -5,7 +5,8 @@
   "aspectRatio": "4:3",
   "fps": 60,
   "maxBitrateMbps": 10,
-  "renderResolution": "640x480",
+  "renderResolution": "native",
   "vsync": false,
-  "xboxLayout": false
+  "xboxLayout": false,
+  "antiAfk": false
 }

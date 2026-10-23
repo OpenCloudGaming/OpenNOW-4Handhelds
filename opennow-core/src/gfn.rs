@@ -633,7 +633,7 @@ impl GfnService {
             ("client_id", STEAM_DECK_CLIENT_ID),
             ("scope", SCOPES),
             ("device_id", self.device_id.as_str()),
-            ("display_name", "OpenNOW"),
+            ("display_name", "OpenNOW-4Handhelds"),
             ("idp_id", provider.idp_id.as_str()),
         ];
         let response = self
@@ -1530,6 +1530,31 @@ impl GfnService {
         })
     }
 
+    pub fn network_test(&self, settings: &Value) -> Result<Value, ServiceError> {
+        let client = client_for_settings(&self.client, settings).map_err(ServiceError::invalid)?;
+        self.authenticated_read(|session, generation| {
+            self.check_scope(session, generation)?;
+            let base = match settings["region"]
+                .as_str()
+                .filter(|value| value.starts_with("https://"))
+            {
+                Some(region) => crate::cloudmatch::trusted_cloudmatch_base(region)?,
+                None => provider_streaming_base(&session.provider)?,
+            };
+            let mut result = crate::cloudmatch::run_network_test(
+                &client,
+                &base,
+                session.tokens.service_token(),
+                &self.device_id,
+                settings,
+            )?;
+            if result.get("zone").is_none() {
+                result["zone"] = json!(base.host_str().unwrap_or(""));
+            }
+            Ok(result)
+        })
+    }
+
     fn provider_regions(
         &self,
         client: &Client,
@@ -1608,7 +1633,20 @@ impl GfnService {
                 .then_with(|| right["height"].as_i64().cmp(&left["height"].as_i64()))
                 .then_with(|| right["fps"].as_i64().cmp(&left["fps"].as_i64()))
         });
-        let membership = data["membershipTier"].as_str().unwrap_or("FREE");
+        let membership = subscription_membership(&data);
+        if !membership.is_empty() && session.user.membership_tier != membership {
+            let mut state = self.state.lock().expect("GFN state poisoned");
+            if let Some(stored) = state.session.as_mut() {
+                if stored.user.user_id == session.user.user_id {
+                    stored.user.membership_tier = membership.clone();
+                    let snapshot = stored.clone();
+                    drop(state);
+                    if let Err(error) = self.vault.save(&snapshot) {
+                        eprintln!("auth: could not store membership: {error}");
+                    }
+                }
+            }
+        }
         let storage_addon = data["addons"].as_array().into_iter().flatten().find(|addon| {
             addon["type"].as_str() == Some("STORAGE")
                 && addon["subType"].as_str() == Some("PERMANENT_STORAGE")
@@ -1701,8 +1739,6 @@ impl GfnService {
             .expect("ready decision validated the exact variant");
         let (mut params, settings) = self.scoped_session_route(params, settings, &session)?;
         params["accountLinked"] = variant["inLibrary"].clone();
-        params["supportsInGameSettingsPersistence"] =
-            variant["supportsInGameSettingsPersistence"].clone();
         params["title"] = inspection["game"]["title"].clone();
         let result = admission
             .create(&params, &settings, &session, &self.device_id)
@@ -2165,13 +2201,18 @@ impl GfnService {
                 message: "The owned session is not ready for media attachment".into(),
             });
         }
-        if !owned["rtspsEndpoints"].as_array().is_some_and(|endpoints| {
+        let rtsps_ready = owned["rtspsEndpoints"].as_array().is_some_and(|endpoints| {
             endpoints.iter().any(|endpoint| {
                 endpoint
                     .as_str()
                     .is_some_and(|endpoint| endpoint.starts_with("rtsps://"))
             })
-        }) {
+        });
+        // A browser-identity Alliance seat has a wss://…/nvst/ socket and no
+        // RTSPS address. That socket is the media setup path.
+        let webrtc_ready = owned["transportMode"] == "webrtc"
+            && crate::cloudmatch::has_webrtc_endpoint(&owned);
+        if !rtsps_ready && !webrtc_ready {
             return Err(ServiceError {
                 code: "session_endpoint_missing",
                 message: "The owned session has no RTSPS media endpoint".into(),
@@ -2582,13 +2623,21 @@ impl GfnService {
     }
 
     fn fetch_user_info(&self, tokens: &AuthTokens) -> Result<AuthUser, ServiceError> {
-        if let Some(user) = tokens
-            .id_token
-            .as_deref()
-            .or(Some(tokens.access_token.as_str()))
-            .and_then(user_from_jwt)
-        {
+        let from_access = user_from_jwt(&tokens.access_token);
+        if let Some(mut user) = tokens.id_token.as_deref().and_then(user_from_jwt) {
+            if user.membership_tier.is_empty() {
+                if let Some(access) = from_access.as_ref() {
+                    if access.user_id == user.user_id && !access.membership_tier.is_empty() {
+                        user.membership_tier = access.membership_tier.clone();
+                    }
+                }
+            }
             if user.email.is_some() || user.avatar_url.is_some() {
+                return Ok(user);
+            }
+        } else if let Some(user) = from_access {
+            if user.email.is_some() || user.avatar_url.is_some() || !user.membership_tier.is_empty()
+            {
                 return Ok(user);
             }
         }
@@ -2626,7 +2675,7 @@ impl GfnService {
             display_name,
             email,
             avatar_url,
-            membership_tier: "FREE".to_owned(),
+            membership_tier: membership_claim(&payload).unwrap_or_default(),
         })
     }
 
@@ -3365,12 +3414,12 @@ fn provider_result(state: &ServiceState) -> Value {
         if let Some(session) = &state.session {
             providers.push(session.provider.clone());
         }
-        if !providers
-            .iter()
-            .any(|provider| provider.idp_id == DEFAULT_IDP_ID)
-        {
-            providers.push(LoginProvider::default_nvidia());
-        }
+    }
+    if !providers
+        .iter()
+        .any(|provider| provider.idp_id == DEFAULT_IDP_ID)
+    {
+        providers.push(LoginProvider::default_nvidia());
     }
     json!({"providers":providers,"defaultProviderIdpId":state.providers_default,"generation":state.generation,"discovery":{
         "state":if state.providers_error.is_some() {"degraded"} else {"ready"},
@@ -3405,6 +3454,22 @@ fn scoped_result(mut result: Value, session: &AuthSession, generation: u64) -> V
     result["scope"] = json!({"generation":generation,"providerIdpId":session.provider.idp_id,"userId":session.user.user_id});
     if result["session"].is_object() {
         result["session"]["ownerScope"] = result["scope"].clone();
+        // Carry the account's selected GFN provider alongside the CloudMatch seat.
+        // Stream startup happens after this response crosses the core/UI boundary,
+        // so the native streamer cannot infer Global vs Alliance from the seat host
+        // reliably (some Alliance seats use NVIDIA-owned hostnames).
+        let provider_code = session.provider.code.trim().to_ascii_uppercase();
+        result["session"]["providerCode"] = json!(provider_code);
+        // Alliance partners only have WebRTC. NVST is the Global path.
+        let alliance = !provider_code.is_empty() && provider_code != "NVIDIA";
+        let existing = result["session"]["transportMode"]
+            .as_str()
+            .filter(|mode| matches!(mode.to_ascii_lowercase().as_str(), "webrtc" | "nvst"))
+            .unwrap_or("nvst")
+            .to_owned();
+        let transport_mode = if alliance { "webrtc" } else { existing.as_str() };
+        result["session"]["transportMode"] = json!(transport_mode);
+        result["session"]["preferredTransportMode"] = json!(transport_mode);
     }
     result
 }
@@ -3490,6 +3555,50 @@ fn lcars_headers(
     Ok(headers)
 }
 
+fn subscription_membership(data: &Value) -> String {
+    let raw = data["membershipTier"]
+        .as_str()
+        .filter(|tier| !tier.trim().is_empty())
+        .or_else(|| {
+            data["currentSubscriptionState"]["membershipTier"]
+                .as_str()
+                .filter(|tier| !tier.trim().is_empty())
+        })
+        .unwrap_or("");
+    normalize_membership_tier(raw)
+}
+
+fn membership_claim(payload: &Value) -> Option<String> {
+    ["gfn_tier", "gfnTier", "membershipTier"]
+        .into_iter()
+        .find_map(|key| payload[key].as_str())
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(normalize_membership_tier)
+        .filter(|tier| !tier.is_empty())
+}
+
+fn normalize_membership_tier(raw: &str) -> String {
+    let compact: String = raw
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    if compact.is_empty() {
+        return String::new();
+    }
+    let tier = compact.to_ascii_uppercase();
+    let tier = tier.strip_prefix("GFN").unwrap_or(&tier);
+    match tier {
+        "ULTIMATE" => "ULTIMATE",
+        "PRIORITY" => "PRIORITY",
+        "PERFORMANCE" | "PREMIUM" => "PERFORMANCE",
+        "FOUNDER" | "FOUNDERS" => "FOUNDERS",
+        "FREE" | "BASIC" => "FREE",
+        _ => tier,
+    }
+    .to_owned()
+}
+
 fn user_from_jwt(token: &str) -> Option<AuthUser> {
     let encoded = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -3516,7 +3625,7 @@ fn user_from_jwt(token: &str) -> Option<AuthUser> {
         display_name,
         email,
         avatar_url,
-        membership_tier: payload["gfn_tier"].as_str().unwrap_or("FREE").to_owned(),
+        membership_tier: membership_claim(&payload).unwrap_or_default(),
     })
 }
 
@@ -4835,13 +4944,22 @@ pub(crate) mod tests {
     #[test]
     fn jwt_user_info_uses_claims_without_network() {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            br#"{"sub":"42","email":"player@example.com","preferred_username":"Player","gfn_tier":"ULTIMATE"}"#,
+            br#"{"sub":"42","email":"player@example.com","preferred_username":"Player"}"#,
         );
         let user = user_from_jwt(&format!("header.{payload}.signature")).unwrap();
         assert_eq!(user.user_id, "42");
         assert_eq!(user.display_name, "Player");
-        assert_eq!(user.membership_tier, "ULTIMATE");
+        assert!(user.membership_tier.is_empty());
         assert!(user.avatar_url.unwrap().contains("gravatar.com/avatar/"));
+        let ultimate = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            br#"{"sub":"42","gfn_tier":"GFNULTIMATE"}"#,
+        );
+        assert_eq!(
+            user_from_jwt(&format!("header.{ultimate}.signature"))
+                .unwrap()
+                .membership_tier,
+            "ULTIMATE"
+        );
     }
 
     #[test]
