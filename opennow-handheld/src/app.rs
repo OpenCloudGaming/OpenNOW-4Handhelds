@@ -29,6 +29,8 @@ const LIBRARY_LIMIT: usize = 2000;
 const ARTWORK_IN_FLIGHT: usize = 3;
 /// No controller or pointer input for this long ends the live session.
 const INACTIVITY_LIMIT: Duration = Duration::from_secs(10 * 60);
+const SESSION_MENU_ROWS: u8 = 5;
+const SESSION_BITRATE_ROW: u8 = 4;
 const ACTIVITY_DEADZONE: u16 = 8_000;
 
 enum Screen {
@@ -92,6 +94,7 @@ enum Pending {
     SettingsRead,
     RegionSet,
     Subscription,
+    LiveBitrate,
 }
 
 /// One title being removed, including the follow-up checks that it left the library.
@@ -466,14 +469,25 @@ impl App {
             match action {
                 Action::Up => {
                     self.session_menu_index = if self.session_menu_index == 0 {
-                        3
+                        SESSION_MENU_ROWS - 1
                     } else {
                         self.session_menu_index - 1
                     }
                 }
-                Action::Down => self.session_menu_index = (self.session_menu_index + 1) % 4,
+                Action::Down => {
+                    self.session_menu_index = (self.session_menu_index + 1) % SESSION_MENU_ROWS
+                }
+                Action::Left if self.session_menu_index == SESSION_BITRATE_ROW => {
+                    self.adjust_live_bitrate(-1)
+                }
+                Action::Right if self.session_menu_index == SESSION_BITRATE_ROW => {
+                    self.adjust_live_bitrate(1)
+                }
                 Action::Confirm => {
                     let choice = self.session_menu_index;
+                    if choice == SESSION_BITRATE_ROW {
+                        return;
+                    }
                     self.session_menu = false;
                     if let Some(stream) = self.stream.as_mut() {
                         stream.release_pad();
@@ -685,6 +699,23 @@ impl App {
         if let Some(stream) = self.stream.as_mut() {
             stream.button(button, pressed, raw_joystick, self.profile.xbox_layout);
         }
+    }
+
+    fn adjust_live_bitrate(&mut self, delta: i32) {
+        self.profile.nudge(0, delta);
+        self.profile.save();
+        let mbps = self.profile.max_bitrate_mbps;
+        let kbps = (mbps * 1_000.0).round() as u32;
+        self.send(
+            "settings.set",
+            json!({"key": "maxBitrateMbps", "value": mbps}),
+            Duration::from_secs(10),
+            Pending::LiveBitrate,
+        );
+        if let Some(stream) = self.stream.as_mut() {
+            let _ = stream.set_bitrate(kbps);
+        }
+        eprintln!("stream: bit rate set to {mbps} Mbps");
     }
 
     fn toggle_session_menu(&mut self) {
@@ -1172,6 +1203,10 @@ impl App {
                 eprintln!("settings: resolutions failed: {}", error.message);
                 self.notify("Couldn't load GeForce NOW resolutions");
             }
+            (Pending::LiveBitrate, Err(error)) => {
+                eprintln!("stream: bit rate was not saved: {}", error.message);
+            }
+            (Pending::LiveBitrate, Ok(_)) => {}
         }
     }
 
@@ -2999,6 +3034,7 @@ impl App {
                 self.session_menu_index as usize,
                 &time_left,
                 &self.clock,
+                &format!("Bit rate: < {} >", bitrate_label(self.profile.max_bitrate_mbps)),
             );
         }
         if self.show_stats && matches!(self.screen, Screen::Stream) && self.play == PlayPhase::Live
@@ -3008,6 +3044,7 @@ impl App {
                 self.stream_fps,
                 self.stream_display_fps,
                 self.stream_mbps,
+                self.profile.max_bitrate_mbps,
                 self.stream_ping_ms,
             );
         }
@@ -3095,6 +3132,14 @@ fn session_setup_message(status: i64, resume_pending: bool, queue_position: Opti
     }
 }
 
+fn bitrate_label(mbps: f64) -> String {
+    if (mbps - mbps.round()).abs() < 0.001 {
+        format!("{}", mbps.round() as i64)
+    } else {
+        format!("{mbps:.0}")
+    }
+}
+
 fn session_time_left_label(deadline: Option<Instant>) -> String {
     let Some(deadline) = deadline else {
         return "--:--:--".into();
@@ -3128,6 +3173,7 @@ fn draw_stream_stats(
     incoming_fps: Option<f64>,
     displayed_fps: Option<f64>,
     mbps: Option<f64>,
+    cap_mbps: f64,
     ping_ms: Option<f64>,
 ) {
     let incoming_fps = incoming_fps
@@ -3136,9 +3182,14 @@ fn draw_stream_stats(
     let displayed_fps = displayed_fps
         .map(|value| format!("{value:.0}"))
         .unwrap_or_else(|| "--".into());
-    let mbps = mbps
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "--".into());
+    let mbps = match mbps {
+        Some(used) if cap_mbps > 0.0 => {
+            let percent = (used / cap_mbps * 100.0).round().clamp(0.0, 999.0);
+            format!("{used:.1} ({percent:.0}%)")
+        }
+        Some(used) => format!("{used:.1}"),
+        None => "--".into(),
+    };
     let ping_ms = ping_ms
         .map(|value| format!("{value:.0}"))
         .unwrap_or_else(|| "--".into());

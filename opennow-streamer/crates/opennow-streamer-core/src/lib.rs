@@ -215,6 +215,7 @@ pub struct Engine {
     reserved_nvst_bundle: Option<ReservedNvstBundle>,
     nvst_hole_punch_socket: Option<UdpSocket>,
     nvst_rtsp: Option<ActiveNvstRtspSession>,
+    nvst_feedback: Option<SharedNvstFeedback>,
     events: EventSender,
     media_consumer: Option<MediaConsumer>,
     media_runtime: Option<MediaRuntime>,
@@ -242,6 +243,16 @@ struct Lifecycle {
     generation: u64,
 }
 
+fn configured_bitrate_kbps(settings: &Value) -> Option<u32> {
+    let mbps = settings
+        .get("maxBitrateMbps")
+        .and_then(Value::as_f64)
+        .filter(|mbps| mbps.is_finite())?;
+    (0.22..=200.0)
+        .contains(&mbps)
+        .then_some((mbps * 1_000.0).round() as u32)
+}
+
 impl Engine {
     pub fn new(events: Sender<Value>) -> Self {
         Self::with_event_sender(EventSender::unbounded(events))
@@ -260,6 +271,7 @@ impl Engine {
             reserved_nvst_bundle: None,
             nvst_hole_punch_socket: None,
             nvst_rtsp: None,
+            nvst_feedback: None,
             events,
             media_consumer: None,
             media_runtime: None,
@@ -300,6 +312,7 @@ impl Engine {
             reserved_nvst_bundle: None,
             nvst_hole_punch_socket: None,
             nvst_rtsp: None,
+            nvst_feedback: None,
             events,
             media_consumer: Some(media_consumer),
             media_runtime: None,
@@ -336,6 +349,7 @@ impl Engine {
             reserved_nvst_bundle: None,
             nvst_hole_punch_socket: None,
             nvst_rtsp: None,
+            nvst_feedback: None,
             events,
             media_consumer: None,
             media_runtime: Some(media_runtime),
@@ -410,10 +424,11 @@ impl Engine {
                 Ok(vec![response(id, "replay-stopped")])
             }
             "microphone-set" | "microphone-toggle" => self.set_microphone(command),
-            "bitrate" | "update-shortcuts" => Err(error(
+            "bitrate" => self.set_live_bitrate(command),
+            "update-shortcuts" => Err(error(
                 Some(&id),
                 "unsupported-command",
-                format!("Native streamer cannot apply the {} command", command.kind),
+                "Native streamer cannot apply the update-shortcuts command".to_owned(),
             )),
             "stop" => {
                 self.stop(command.reason.as_deref().unwrap_or("stopped"));
@@ -786,6 +801,7 @@ impl Engine {
         if let Some(mut rtsp) = self.nvst_rtsp.take() {
             rtsp.shutdown();
         }
+        self.nvst_feedback = None;
         self.stop_media_resources();
         if let Some(runtime) = self.media_runtime.clone() {
             let (feedback_sender, feedback_receiver) = std::sync::mpsc::channel();
@@ -884,6 +900,10 @@ impl Engine {
                 };
             let mjolnir_udp_port = config.mjolnir_udp_port();
             let feedback = config.feedback();
+            if let Some(kbps) = configured_bitrate_kbps(&context.settings) {
+                feedback.set_bitrate_cap_kbps(kbps);
+            }
+            self.nvst_feedback = Some(Arc::clone(&feedback));
             let (upstream_ready, upstream_waiter) = if prepared_nvst.is_some() {
                 let (sender, receiver) = std::sync::mpsc::sync_channel(1);
                 (Some(sender), Some(receiver))
@@ -1277,6 +1297,7 @@ impl Engine {
         if let Some(mut rtsp) = self.nvst_rtsp.take() {
             rtsp.shutdown();
         }
+        self.nvst_feedback = None;
         self.reserved_nvst_bundle = None;
         self.nvst_hole_punch_socket = None;
         self.stop_media_resources();
@@ -1518,6 +1539,29 @@ impl Engine {
             Ok(None) => Ok(vec![response(command.id, "recording-not-active")]),
             Err(message) => Err(error(Some(&command.id), "recording-failed", message)),
         }
+    }
+
+    fn set_live_bitrate(&self, command: Command) -> Result<Vec<Value>, Value> {
+        let Some(kbps) = command
+            .max_bitrate_kbps
+            .filter(|kbps| (220..=200_000).contains(kbps))
+        else {
+            return Err(error(
+                Some(&command.id),
+                "invalid-bitrate",
+                "Bit rate must be between 0.22 and 200 Mbps".to_owned(),
+            ));
+        };
+        if let Some(session) = self.nvst_rtsp.as_ref() {
+            session.set_bitrate(kbps);
+        }
+        if let Some(feedback) = self.nvst_feedback.as_ref() {
+            feedback.set_bitrate_cap_kbps(kbps);
+        }
+        if let Some(session) = self.webrtc_session.as_ref() {
+            let _ = session.set_bitrate(kbps);
+        }
+        Ok(vec![response(command.id, "ok")])
     }
 
     fn anti_afk_pulse(&self, command: Command) -> Result<Vec<Value>, Value> {

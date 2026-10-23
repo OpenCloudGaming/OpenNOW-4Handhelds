@@ -642,6 +642,8 @@ pub struct NvstFeedbackState {
     pending_frame_acks: Mutex<VecDeque<CompletedFrameFeedback>>,
     frame_packet_timings: Mutex<VecDeque<FramePacketTiming>>,
     frame_stage_timings: Mutex<FrameStageTimingsAccumulator>,
+    /// User's chosen ceiling, in kbps. Zero means the estimate is not capped.
+    bitrate_cap_kbps: AtomicU32,
 }
 
 impl Default for NvstFeedbackState {
@@ -667,6 +669,7 @@ impl Default for NvstFeedbackState {
             pending_frame_acks: Mutex::new(VecDeque::new()),
             frame_packet_timings: Mutex::new(VecDeque::new()),
             frame_stage_timings: Mutex::new(FrameStageTimingsAccumulator::default()),
+            bitrate_cap_kbps: AtomicU32::new(0),
         }
     }
 }
@@ -1106,8 +1109,30 @@ impl NvstFeedbackState {
             loss_per_ten_thousand,
             client_time_90khz: elapsed.as_millis().wrapping_mul(90) as u32,
             packet_snapshot,
-            bandwidth,
+            bandwidth: self.capped_bandwidth(bandwidth),
         }
+    }
+
+    /// The server treats this estimate as the path it may fill. Keep it inside
+    /// the bit rate the user chose, or a 5 Mbps setting is answered with a
+    /// much larger stream.
+    fn capped_bandwidth(
+        &self,
+        mut bandwidth: crate::nvst_bandwidth::BandwidthFeedback,
+    ) -> crate::nvst_bandwidth::BandwidthFeedback {
+        let cap = self.bitrate_cap_kbps.load(Ordering::Relaxed);
+        if cap > 0 {
+            bandwidth.estimate_kbps = if bandwidth.estimate_kbps == 0 {
+                cap
+            } else {
+                bandwidth.estimate_kbps.min(cap)
+            };
+        }
+        bandwidth
+    }
+
+    pub fn set_bitrate_cap_kbps(&self, kbps: u32) {
+        self.bitrate_cap_kbps.store(kbps, Ordering::Relaxed);
     }
 
     /// SSRC + highest sequence for the next Receiver Report, if a stream is bound.

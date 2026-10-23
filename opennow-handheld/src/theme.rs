@@ -79,7 +79,7 @@ pub fn draw_header(painter: &mut Painter, clock: &Clock) {
         31.0,
         13.0,
         Weight::Bold,
-        "v0.1.0",
+        "v0.1.1",
         MUTED,
     );
 
@@ -337,8 +337,20 @@ fn wrap_height(
     lines.max(1.0) * line_gap
 }
 
-pub fn draw_session_menu(painter: &mut Painter, selected: usize, time_left: &str, clock: &Clock) {
-    let rows = ["End session", "Exit OpenNOW", "Mouse mode", "Stats"];
+pub fn draw_session_menu(
+    painter: &mut Painter,
+    selected: usize,
+    time_left: &str,
+    clock: &Clock,
+    bitrate_label: &str,
+) {
+    let rows = [
+        "End session",
+        "Exit OpenNOW",
+        "Mouse mode",
+        "Stats",
+        bitrate_label,
+    ];
     let (width, row_h) = (380.0, 56.0);
     let x = (canvas().0 - width) / 2.0;
     let header_h = 76.0;

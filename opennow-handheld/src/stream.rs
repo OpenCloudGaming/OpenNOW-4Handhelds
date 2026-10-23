@@ -382,6 +382,14 @@ impl NativeStream {
         }
     }
 
+    pub fn set_bitrate(&self, kbps: u32) -> Result<(), String> {
+        self.send_json(&json!({
+            "id": format!("bitrate-{kbps}"),
+            "type": "bitrate",
+            "maxBitrateKbps": kbps,
+        }))
+    }
+
     fn send_json(&self, value: &Value) -> Result<(), String> {
         let bytes = value.to_string();
         let status = unsafe { (self.api.send)(self.handle, bytes.as_ptr(), bytes.len()) };

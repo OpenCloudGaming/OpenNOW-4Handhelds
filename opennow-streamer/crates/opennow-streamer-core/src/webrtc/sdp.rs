@@ -136,6 +136,23 @@ pub(super) fn nvst_answer(
     Ok(lines.join("\n"))
 }
 
+/// Live cap update. Alliance applies these same lines from the opening answer,
+/// so a later message can move the ceiling without renegotiating the call.
+pub(super) fn bitrate_parameters(kbps: u32) -> String {
+    let maximum = kbps.clamp(1_000, 200_000);
+    let minimum = maximum.min(5_000);
+    [
+        format!("a=video.initialBitrateKbps:{maximum}"),
+        format!("a=video.initialPeakBitrateKbps:{maximum}"),
+        format!("a=vqos.bw.maximumBitrateKbps:{maximum}"),
+        format!("a=vqos.bw.minimumBitrateKbps:{minimum}"),
+        format!("a=vqos.bw.peakBitrateKbps:{maximum}"),
+        format!("a=vqos.bw.serverPeakBitrateKbps:{maximum}"),
+        format!("a=vqos.grc.maximumBitrateKbps:{maximum}"),
+    ]
+    .join("\r\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +180,17 @@ mod tests {
         }
         assert!(!sdp.contains("remote"));
         assert!(!sdp.contains("m=mic"));
+    }
+
+    #[test]
+    fn live_bitrate_parameters_use_the_answer_ceiling() {
+        let parameters = bitrate_parameters(5_000);
+        assert!(parameters.contains("a=vqos.bw.maximumBitrateKbps:5000"));
+        assert!(parameters.contains("a=vqos.bw.minimumBitrateKbps:5000"));
+        assert!(parameters.contains("a=vqos.grc.maximumBitrateKbps:5000"));
+        let raised = bitrate_parameters(12_000);
+        assert!(raised.contains("a=vqos.bw.maximumBitrateKbps:12000"));
+        assert!(raised.contains("a=vqos.bw.minimumBitrateKbps:5000"));
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub(super) struct OwnedSession {
 enum SessionCommand {
     AntiAfk,
     Pause(bool),
+    SetBitrate(u32),
 }
 
 impl OwnedSession {
@@ -65,6 +66,12 @@ impl OwnedSession {
         self.commands
             .try_send(SessionCommand::AntiAfk)
             .map_err(|_| "WebRTC input command queue unavailable".to_owned())
+    }
+
+    pub(super) fn set_bitrate(&self, kbps: u32) -> Result<(), String> {
+        self.commands
+            .try_send(SessionCommand::SetBitrate(kbps))
+            .map_err(|_| "WebRTC bitrate command queue unavailable".to_owned())
     }
 
     pub(super) fn set_paused(&self, paused: bool) -> Result<(), String> {
@@ -569,6 +576,14 @@ impl Worker {
                     }
                 }
                 for command in self.commands.try_iter().take(4) {
+                    if let SessionCommand::SetBitrate(kbps) = command {
+                        let parameters = sdp::bitrate_parameters(kbps);
+                        let _ = signaling.send_peer(json!({
+                            "type": "nvstSdp",
+                            "nvstSdp": parameters,
+                        }));
+                        continue;
+                    }
                     let inputs = match command {
                         SessionCommand::Pause(paused) => {
                             if let Some(queue) = &self.captured_input {
@@ -584,6 +599,7 @@ impl Worker {
                             })
                             .to_vec(),
                         SessionCommand::AntiAfk => Vec::new(),
+                        SessionCommand::SetBitrate(_) => Vec::new(),
                     };
                     if !self.input_ready.load(Ordering::Acquire) {
                         continue;

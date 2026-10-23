@@ -32,7 +32,7 @@ fn socket_pair() -> (RtspClient, WebSocket<TcpStream>) {
 }
 
 fn active_session(client: RtspClient, ping: &NvstControlPing) -> ActiveNvstRtspSession {
-    ActiveNvstRtspSession::spawn(client, ping.clone()).unwrap()
+    ActiveNvstRtspSession::spawn(client, ping.clone(), None).unwrap()
 }
 
 fn server_ping(server: &mut WebSocket<TcpStream>) {

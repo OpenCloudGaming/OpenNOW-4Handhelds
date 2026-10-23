@@ -705,7 +705,15 @@ impl PreparedNvstRtspSession {
             .take()
             .ok_or_else(|| NvstRtspError::new("nvst-rtsp-failed", "RTSPS client is unavailable"))?;
         self.owns_session = false;
-        ActiveNvstRtspSession::spawn(client, self.control_ping.clone())
+        ActiveNvstRtspSession::spawn(
+            client,
+            self.control_ping.clone(),
+            Some(BitrateRoute {
+                target: self.target.clone(),
+                session: self.rtsp_session.clone(),
+                headers: self.common_headers.clone(),
+            }),
+        )
     }
 }
 
@@ -733,6 +741,13 @@ impl Drop for PreparedNvstRtspSession {
 
 enum Control {
     Shutdown,
+    SetBitrate(u32),
+}
+
+struct BitrateRoute {
+    target: String,
+    session: String,
+    headers: Vec<(&'static str, String)>,
 }
 
 pub struct ActiveNvstRtspSession {
@@ -741,7 +756,11 @@ pub struct ActiveNvstRtspSession {
 }
 
 impl ActiveNvstRtspSession {
-    fn spawn(mut client: RtspClient, control_ping: NvstControlPing) -> Result<Self, NvstRtspError> {
+    fn spawn(
+        mut client: RtspClient,
+        control_ping: NvstControlPing,
+        bitrate_route: Option<BitrateRoute>,
+    ) -> Result<Self, NvstRtspError> {
         set_io_timeout(&mut client.socket, CONTROL_IO_TIMEOUT);
         client.socket.set_config(|config| {
             config.max_message_size = Some(MAX_CONTROL_RESPONSE_BYTES);
@@ -755,10 +774,20 @@ impl ActiveNvstRtspSession {
                 let mut outstanding: Option<(u64, Instant)> = None;
                 let mut ping_sequence = 0u64;
                 loop {
-                    if receiver.try_recv().is_ok() {
-                        control_ping.clear();
-                        let _ = client.socket.close(None);
-                        break;
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(Control::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                                control_ping.clear();
+                                let _ = client.socket.close(None);
+                                return;
+                            }
+                            Ok(Control::SetBitrate(kbps)) => {
+                                if let Some(route) = bitrate_route.as_ref() {
+                                    push_live_bitrate(&mut client, route, kbps);
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                        }
                     }
                     let now = Instant::now();
                     if outstanding.is_some_and(|(_, sent_at)| {
@@ -831,10 +860,63 @@ impl ActiveNvstRtspSession {
         })
     }
 
+    pub fn set_bitrate(&self, kbps: u32) {
+        let _ = self.control.send(Control::SetBitrate(kbps));
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.control.send(Control::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+    }
+}
+
+fn push_live_bitrate(client: &mut RtspClient, route: &BitrateRoute, kbps: u32) {
+    let mut headers: Vec<(&str, String)> = route
+        .headers
+        .iter()
+        .map(|(name, value)| (*name, value.clone()))
+        .collect();
+    headers.push(("Session", route.session.clone()));
+    headers.push(("Content-Type", "text/parameters".to_owned()));
+    let floor = kbps.min(1_000);
+    let body = format!(
+        "x-nv-vqos[0].bw.maximumBitrateKbps:{kbps}\r\n\
+         x-nv-vqos[0].bw.minimumBitrateKbps:{floor}\r\n\
+         x-nv-video[0].initialBitrateKbps:{kbps}\r\n\
+         x-nv-video[0].initialPeakBitrateKbps:{kbps}\r\n"
+    );
+    match client.request_with_timeout(
+        "SET_PARAMETER",
+        &route.target,
+        &headers,
+        &body,
+        Duration::from_secs(2),
+    ) {
+        Ok(response) if response.status == 200 => {
+            opennow_streamer_protocol::log::log_line(
+                "INFO",
+                "rtsps",
+                &format!("live bitrate updated to {kbps} kbps"),
+            );
+        }
+        Ok(response) => {
+            opennow_streamer_protocol::log::log_line(
+                "WARN",
+                "rtsps",
+                &format!(
+                    "live bitrate update rejected status={} text={}",
+                    response.status, response.status_text
+                ),
+            );
+        }
+        Err(error) => {
+            opennow_streamer_protocol::log::log_line(
+                "WARN",
+                "rtsps",
+                &format!("live bitrate update failed code={}", error.code),
+            );
         }
     }
 }
