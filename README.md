@@ -59,7 +59,7 @@ build.sh             R36S build on Linux
 This project also relies on many open-source libraries. Some key ones are [SDL](https://github.com/libsdl-org/SDL) for the handheld interface and controller support, [FFmpeg](https://github.com/FFmpeg/FFmpeg), [OpenH264](https://github.com/cisco/openh264), and [Opus](https://github.com/xiph/opus) for media handling, [str0m](https://github.com/algesten/str0m) for WebRTC, [serde](https://github.com/serde-rs/serde) for data serialization, and [rustls](https://github.com/rustls/rustls) for TLS. See the Cargo manifests and lockfiles for the complete dependency list and versions.
 
 ## AI disclosure
-Most of the work is being done with the help of AI, i don't wanna hide or deny anything, this project is meant to help me and potentially others to easily stream their GeForce NOW library on their RK3326 console from anywhere at anytime.
+Most of the work is being done with the help of AI, i don't wanna hide or deny anything, this project is meant to help me and potentially others to easily stream their GeForce NOW library on their RK3326 console from anywhere at any time.
 
 # Acknowledgements
 - [OpenNOW](https://github.com/OpenCloudGaming/OpenNOW), amazing project ^_^
