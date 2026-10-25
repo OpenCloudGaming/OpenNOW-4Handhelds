@@ -3576,7 +3576,14 @@ fn run_embedded_linux_monitor(
                         count: skipped,
                     });
                 }
-                if let Some(lease) = publisher.context() {
+                if opennow_streamer_platform_linux::present_display_plane(&decoded) {
+                    if !playback_started {
+                        playback_started = true;
+                        let _ = shared.feedback.send(MediaFeedback::PlaybackStarted {
+                            backend: backend_label,
+                        });
+                    }
+                } else if let Some(lease) = publisher.context() {
                     match producer
                         .frame(decoded)
                         .map_err(|error| error.to_string())

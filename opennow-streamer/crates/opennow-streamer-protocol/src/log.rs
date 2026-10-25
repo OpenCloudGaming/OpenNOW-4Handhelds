@@ -196,6 +196,7 @@ pub fn message_summary(value: &serde_json::Value) -> String {
         "status",
         "code",
         "backend",
+        "codec",
         "phase",
         "protocolVersion",
         "protocol",
@@ -244,6 +245,11 @@ pub fn message_summary(value: &serde_json::Value) -> String {
             Some("Linux decoder requires a fresh keyframe") => Some("decoder-reference-required"),
             Some("Linux decoder device was lost") => Some("decoder-device-lost"),
             Some("Linux decoder fallback requires a fresh keyframe") => Some("decoder-fallback"),
+            Some("local compressed-video queue reached capacity") => {
+                Some("compressed-video-queue-full")
+            }
+            Some("incoming frame marked discontinuous") => Some("compressed-video-discontinuity"),
+            Some("waiting for a fresh keyframe") => Some("keyframe-required"),
             _ => None,
         };
         if let Some(code) = code {
@@ -500,6 +506,15 @@ mod tests {
                 "Linux decoder fallback requires a fresh keyframe",
                 "decoder-fallback",
             ),
+            (
+                "local compressed-video queue reached capacity",
+                "compressed-video-queue-full",
+            ),
+            (
+                "incoming frame marked discontinuous",
+                "compressed-video-discontinuity",
+            ),
+            ("waiting for a fresh keyframe", "keyframe-required"),
         ] {
             let summary = message_summary(&serde_json::json!({
                 "type": "log", "event": "keyframe-request", "reason": reason,

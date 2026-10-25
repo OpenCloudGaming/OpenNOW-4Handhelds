@@ -1,8 +1,8 @@
 //! OpenGL ES presenter for the handheld EGLFS runtime.
 //!
-//! Qt makes the GLES context current around `beginExternal`. This module samples
-//! NV12 or P010 (CPU planes or a DMA-BUF) into one RGBA texture per QRhi slot.
-//! The texture name is returned to Qt; this presenter keeps owning it.
+//! The caller makes the GLES context current before the first frame. This module samples
+//! NV12 or P010 (CPU planes or a DMA-BUF) into one RGBA texture per slot.
+//! The texture name is returned to the caller; this presenter keeps owning it.
 //!
 //! OpenGL ES 3 imports a decoder DMA-BUF and reads it on the GPU. NV12 chroma is
 //! sampled as individual bytes, because Mali returns only the red channel of an
@@ -11,7 +11,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use libloading::Library;
 
@@ -282,6 +282,7 @@ type FenceSync = unsafe extern "C" fn(u32, u32) -> *mut c_void;
 type ClientWaitSync = unsafe extern "C" fn(*mut c_void, u32, u64) -> u32;
 type DeleteSync = unsafe extern "C" fn(*mut c_void);
 type CreateShader = unsafe extern "C" fn(u32) -> u32;
+type CompileShader = unsafe extern "C" fn(u32);
 type ShaderSource = unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32);
 type ShaderIv = unsafe extern "C" fn(u32, u32, *mut i32);
 type ShaderLog = unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char);
@@ -310,8 +311,10 @@ type EglDestroyImage = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
 type ImageTarget = unsafe extern "C" fn(u32, *mut c_void);
 
 struct Gl {
-    _gles: Library,
-    _egl: Library,
+    /// Keeps a dlopened driver mapped. Empty when the pointers came from SDL,
+    /// which already holds that driver for the life of the process.
+    _libraries: Vec<Library>,
+    compile_shader: CompileShader,
     gen_textures: GenObjects,
     delete_textures: DeleteObjects,
     bind_texture: Bind1,
@@ -433,6 +436,9 @@ pub(super) struct GlesPresenter {
 
 impl Gl {
     fn load() -> Result<Self> {
+        if let Some(gl) = load_from_registered_driver()? {
+            return Ok(gl);
+        }
         let gles = open_library(&["libGLESv2.so.2", "libGLESv2.so"])?;
         let egl = open_library(&["libEGL.so.1", "libEGL.so"])?;
         let get_proc: EglProc = load_symbol(&egl, b"eglGetProcAddress\0")?;
@@ -461,6 +467,7 @@ impl Gl {
             client_wait_sync: load_symbol(&gles, b"glClientWaitSync\0").ok(),
             delete_sync: load_symbol(&gles, b"glDeleteSync\0").ok(),
             create_shader: load_symbol(&gles, b"glCreateShader\0")?,
+            compile_shader: load_symbol(&gles, b"glCompileShader\0")?,
             shader_source: load_symbol(&gles, b"glShaderSource\0")?,
             get_shaderiv: load_symbol(&gles, b"glGetShaderiv\0")?,
             get_shader_log: load_symbol(&gles, b"glGetShaderInfoLog\0")?,
@@ -496,8 +503,7 @@ impl Gl {
             create_image,
             destroy_image,
             image_target,
-            _gles: gles,
-            _egl: egl,
+            _libraries: vec![gles, egl],
         })
     }
 
@@ -601,7 +607,7 @@ impl GlesPresenter {
         if !gl.context_is_current() {
             return Err(Error::unavailable(
                 Subsystem::OpenGlEs,
-                "Qt must make the EGL context current before the first video frame",
+                "the GLES context is not current on this thread",
             ));
         }
         let display = unsafe { (gl.get_current_display)() };
@@ -708,6 +714,7 @@ impl GlesPresenter {
                             self.plane_import = false;
                             self.draw_external(slot_index)?;
                             self.fence_slot(slot_index);
+                            self.release_imported_decoder_buffer(slot_index);
                             self.generation = self.generation.wrapping_add(1);
                             let resources = self.slots[slot_index].as_ref().expect("slot created");
                             return Ok(RecordedGpuFrame {
@@ -1577,6 +1584,31 @@ impl GlesPresenter {
     }
 
     /// Marks the end of the draw that just sampled this slot's images.
+    /// The external draw has copied the picture into the RGBA texture. Return
+    /// the decoder buffer now instead of keeping it for several frames.
+    fn release_imported_decoder_buffer(&mut self, index: usize) {
+        let (external_image, retained, fence) = {
+            let Some(slot) = self.slots[index].as_mut() else {
+                return;
+            };
+            let image = slot.external_image;
+            slot.external_image = 0;
+            (
+                image,
+                slot.retained.take(),
+                std::mem::take(&mut slot.fence),
+            )
+        };
+        if external_image == 0 && retained.is_none() {
+            self.delete_fence(fence);
+            return;
+        }
+        unsafe { (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0) };
+        self.wait_fence_or_finish(fence);
+        self.destroy_one_image(external_image as *mut c_void);
+        drop(retained);
+    }
+
     fn fence_slot(&mut self, index: usize) {
         let (Some(create), Some(delete), Some(_)) = (
             self.gl.fence_sync,
@@ -2239,9 +2271,7 @@ fn compile_shader(gl: &Gl, kind: u32, source: &str) -> Result<u32> {
 }
 
 fn compile_only(gl: &Gl, shader: u32) -> Result<()> {
-    type Compile = unsafe extern "C" fn(u32);
-    let compile: Compile = load_symbol(&gl._gles, b"glCompileShader\0")?;
-    unsafe { compile(shader) };
+    unsafe { (gl.compile_shader)(shader) };
     Ok(())
 }
 
@@ -2283,6 +2313,155 @@ fn program_log(gl: &Gl, program: u32) -> String {
     String::from_utf8_lossy(&bytes)
         .trim_end_matches('\0')
         .to_owned()
+}
+
+static GL_PROC: AtomicUsize = AtomicUsize::new(0);
+static LOGGED_SDL_MISS: AtomicBool = AtomicBool::new(false);
+
+/// Records SDL's `SDL_GL_GetProcAddress`. Recording then uses that driver's
+/// entry points instead of opening a second EGL library.
+pub fn set_gl_proc(proc_address: unsafe extern "C" fn(*const c_char) -> *mut c_void) {
+    GL_PROC.store(proc_address as usize, Ordering::Release);
+}
+
+fn registered_gl_proc() -> Option<EglProc> {
+    let pointer = GL_PROC.load(Ordering::Acquire);
+    if pointer == 0 {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute(pointer) })
+    }
+}
+
+/// Builds the presenter from the GLES driver SDL already made current.
+///
+/// Returns `Ok(None)` when SDL has no current context, so the caller can open
+/// `libEGL` itself. A missing entry point is an error: falling through to a
+/// different EGL copy is what hides the picture on dArkOS RE.
+fn load_from_registered_driver() -> Result<Option<Gl>> {
+    let Some(get) = registered_gl_proc() else {
+        return Ok(None);
+    };
+    let Some(current) = proc_symbol::<EglDisplayFn>(&get, b"eglGetCurrentContext\0") else {
+        note_sdl_miss();
+        return Ok(None);
+    };
+    if unsafe { current() }.is_null() {
+        note_sdl_miss();
+        return Ok(None);
+    }
+    let gl_get_string = unsafe { get(b"glGetString\0".as_ptr().cast()) };
+    let driver = shared_object_containing(gl_get_string as usize).unwrap_or_else(|| "SDL".to_owned());
+    eprintln!("stream: GLES driver {driver}");
+    Ok(Some(Gl {
+        gen_textures: must_proc(&get, b"glGenTextures\0")?,
+        delete_textures: must_proc(&get, b"glDeleteTextures\0")?,
+        bind_texture: must_proc(&get, b"glBindTexture\0")?,
+        tex_image: must_proc(&get, b"glTexImage2D\0")?,
+        tex_storage: proc_symbol(&get, b"glTexStorage2D\0"),
+        tex_parameteri: must_proc(&get, b"glTexParameteri\0")?,
+        pixel_storei: must_proc(&get, b"glPixelStorei\0")?,
+        gen_framebuffers: must_proc(&get, b"glGenFramebuffers\0")?,
+        delete_framebuffers: must_proc(&get, b"glDeleteFramebuffers\0")?,
+        bind_framebuffer: must_proc(&get, b"glBindFramebuffer\0")?,
+        framebuffer_texture: must_proc(&get, b"glFramebufferTexture2D\0")?,
+        check_framebuffer: must_proc(&get, b"glCheckFramebufferStatus\0")?,
+        viewport: must_proc(&get, b"glViewport\0")?,
+        use_program: must_proc(&get, b"glUseProgram\0")?,
+        draw_arrays: must_proc(&get, b"glDrawArrays\0")?,
+        finish: proc_symbol(&get, b"glFinish\0"),
+        fence_sync: proc_symbol(&get, b"glFenceSync\0"),
+        client_wait_sync: proc_symbol(&get, b"glClientWaitSync\0"),
+        delete_sync: proc_symbol(&get, b"glDeleteSync\0"),
+        create_shader: must_proc(&get, b"glCreateShader\0")?,
+        compile_shader: must_proc(&get, b"glCompileShader\0")?,
+        shader_source: must_proc(&get, b"glShaderSource\0")?,
+        get_shaderiv: must_proc(&get, b"glGetShaderiv\0")?,
+        get_shader_log: must_proc(&get, b"glGetShaderInfoLog\0")?,
+        create_program: must_proc(&get, b"glCreateProgram\0")?,
+        attach_shader: must_proc(&get, b"glAttachShader\0")?,
+        link_program: must_proc(&get, b"glLinkProgram\0")?,
+        get_programiv: must_proc(&get, b"glGetProgramiv\0")?,
+        get_program_log: must_proc(&get, b"glGetProgramInfoLog\0")?,
+        delete_shader: must_proc(&get, b"glDeleteShader\0")?,
+        delete_program: must_proc(&get, b"glDeleteProgram\0")?,
+        get_uniform: must_proc(&get, b"glGetUniformLocation\0")?,
+        uniform_1i: must_proc(&get, b"glUniform1i\0")?,
+        uniform_1ui: proc_symbol(&get, b"glUniform1ui\0"),
+        uniform_1f: must_proc(&get, b"glUniform1f\0")?,
+        uniform_2f: must_proc(&get, b"glUniform2f\0")?,
+        active_texture: must_proc(&get, b"glActiveTexture\0")?,
+        get_error: must_proc(&get, b"glGetError\0")?,
+        get_integerv: must_proc(&get, b"glGetIntegerv\0")?,
+        get_string: must_proc(&get, b"glGetString\0")?,
+        get_stringi: proc_symbol(&get, b"glGetStringi\0"),
+        gen_buffers: must_proc(&get, b"glGenBuffers\0")?,
+        delete_buffers: must_proc(&get, b"glDeleteBuffers\0")?,
+        bind_buffer: must_proc(&get, b"glBindBuffer\0")?,
+        buffer_data: must_proc(&get, b"glBufferData\0")?,
+        enable_attrib: must_proc(&get, b"glEnableVertexAttribArray\0")?,
+        attrib_pointer: must_proc(&get, b"glVertexAttribPointer\0")?,
+        bind_attrib: must_proc(&get, b"glBindAttribLocation\0")?,
+        get_current_display: must_proc(&get, b"eglGetCurrentDisplay\0")?,
+        get_current_context: current,
+        get_egl_error: must_proc(&get, b"eglGetError\0")?,
+        query_string: must_proc(&get, b"eglQueryString\0")?,
+        query_dmabuf_formats: proc_symbol(&get, b"eglQueryDmaBufFormatsEXT\0"),
+        create_image: proc_symbol(&get, b"eglCreateImageKHR\0"),
+        destroy_image: proc_symbol(&get, b"eglDestroyImageKHR\0"),
+        image_target: proc_symbol(&get, b"glEGLImageTargetTexture2DOES\0"),
+        _libraries: Vec::new(),
+    }))
+}
+
+fn note_sdl_miss() {
+    if LOGGED_SDL_MISS.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("stream: SDL did not expose the current GLES context");
+}
+
+fn must_proc<T>(get: &EglProc, name: &[u8]) -> Result<T> {
+    proc_symbol(get, name).ok_or_else(|| {
+        Error::unavailable(
+            Subsystem::OpenGlEs,
+            format!("missing {}", symbol_name(name)),
+        )
+    })
+}
+
+fn shared_object_containing(address: usize) -> Option<String> {
+    if address == 0 {
+        return None;
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(range) = parts.next() else {
+            continue;
+        };
+        let mut bounds = range.split('-');
+        let (Some(start_text), Some(end_text)) = (bounds.next(), bounds.next()) else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start_text, 16),
+            usize::from_str_radix(end_text, 16),
+        ) else {
+            continue;
+        };
+        if address < start || address >= end {
+            continue;
+        }
+        let Some(path) = parts.last() else {
+            return None;
+        };
+        if path.starts_with('/') && path.contains(".so") && !path.ends_with("(deleted)") {
+            return Some(path.to_owned());
+        }
+        return None;
+    }
+    None
 }
 
 fn open_library(names: &[&str]) -> Result<Library> {

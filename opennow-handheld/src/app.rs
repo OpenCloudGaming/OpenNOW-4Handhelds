@@ -14,7 +14,7 @@ use crate::system;
 use crate::text::Weight;
 use crate::theme::{self, *};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +27,12 @@ const LIBRARY_PAGE: u64 = 100;
 const LIBRARY_LIMIT: usize = 2000;
 /// Concurrent `artwork.resolve` requests; the core runs four background workers.
 const ARTWORK_IN_FLIGHT: usize = 3;
+/// One profile save at a time. A slow card can spend this long inside a single
+/// fsync, and launching the six settings together fills the core's request slots.
+const STREAM_SETTING_TIMEOUT: Duration = Duration::from_secs(45);
+/// Cold start from a slow card can outlast one hello. Stay on the connecting
+/// screen and start the core again instead of failing the first try.
+const HELLO_ATTEMPTS: u8 = 3;
 /// No controller or pointer input for this long ends the live session.
 const INACTIVITY_LIMIT: Duration = Duration::from_secs(10 * 60);
 const SESSION_MENU_ROWS: u8 = 5;
@@ -145,6 +151,9 @@ pub struct App {
     core: Option<Core>,
     pending: HashMap<u64, Pending>,
     screen: Screen,
+    /// Hello tries already used for this start. A slow card gets another process
+    /// before the failure screen.
+    hello_attempts: u8,
     dialog: Option<Dialog>,
     /// Session menu drawn over the live stream. The picture stays up.
     session_menu: bool,
@@ -203,6 +212,11 @@ pub struct App {
     removal: Option<LibraryRemoval>,
     notice: Option<String>,
     stream: Option<NativeStream>,
+    /// The display controller is scanning the video out, so the GPU picture is idle.
+    scanout_on: bool,
+    scanout_tried: bool,
+    scanout_suspended: bool,
+    scanout_sequence: u64,
     /// Last presented frame. The streamer only hands over a picture when a new
     /// one is decoded, and the shell must not paint its loading chrome in the gaps.
     stream_frame: Option<(u32, u32, u32)>,
@@ -214,6 +228,8 @@ pub struct App {
     /// Play already tried to mark the store version as the default.
     play_selected: bool,
     play_settings_left: u8,
+    /// Profile settings still waiting for a successful `settings.set`.
+    stream_settings: VecDeque<(String, Value)>,
     play_message: String,
     session_wait_started: Option<Instant>,
     /// Last controller or pointer input during a live session.
@@ -296,6 +312,7 @@ impl App {
             core: None,
             pending: HashMap::new(),
             screen: Screen::Connecting,
+            hello_attempts: 0,
             dialog: None,
             session_menu: false,
             session_menu_index: 0,
@@ -345,6 +362,10 @@ impl App {
             removal: None,
             notice: None,
             stream: None,
+            scanout_on: false,
+            scanout_tried: false,
+            scanout_suspended: true,
+            scanout_sequence: 0,
             stream_frame: None,
             stream_capabilities: None,
             cloud_session: None,
@@ -352,6 +373,7 @@ impl App {
             play_added: false,
             play_selected: false,
             play_settings_left: 0,
+            stream_settings: VecDeque::new(),
             play_message: String::new(),
             session_wait_started: None,
             last_activity: None,
@@ -392,6 +414,11 @@ impl App {
     }
 
     fn start_core(&mut self) {
+        self.hello_attempts = 0;
+        self.spawn_core();
+    }
+
+    fn spawn_core(&mut self) {
         self.core = None;
         self.pending.clear();
         self.screen = Screen::Connecting;
@@ -634,6 +661,66 @@ impl App {
 
     pub fn vsync_enabled(&self) -> bool {
         self.profile.vsync
+    }
+
+    /// Arms the display plane once a stream is up, and hides it whenever the
+    /// menu, a dialog, or the stats need the GPU picture underneath.
+    pub fn sync_scanout(&mut self, drm_fd: Option<i32>, width: u32, height: u32) {
+        let playing = matches!(self.screen, Screen::Stream) && self.stream.is_some();
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.scanout_failed())
+        {
+            self.scanout_on = false;
+        }
+        if !playing {
+            self.scanout_tried = false;
+            self.scanout_on = false;
+        } else if !self.scanout_tried {
+            self.scanout_tried = true;
+            if let Some(fd) = drm_fd
+                && self
+                    .stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.enable_scanout(fd, width, height))
+            {
+                self.scanout_on = true;
+            }
+        }
+        let suspend = !self.scanout_on
+            || !playing
+            || self.session_menu
+            || self.dialog.is_some()
+            || self.show_stats
+            || self.notice.is_some();
+        if let Some(stream) = self.stream.as_ref() {
+            stream.set_scanout_suspended(suspend);
+        }
+        self.scanout_suspended = suspend;
+    }
+
+    fn plane_is_showing(&self) -> bool {
+        self.scanout_on && !self.scanout_suspended
+    }
+
+    fn note_plane_frame(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        let sequence = stream.scanout_sequence();
+        if sequence == 0 || sequence == self.scanout_sequence {
+            return;
+        }
+        let advanced = sequence.saturating_sub(self.scanout_sequence);
+        self.scanout_sequence = sequence;
+        self.stream_display_frames = self.stream_display_frames.saturating_add(advanced);
+        let elapsed = self.stream_display_window.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.stream_display_fps = Some(self.stream_display_frames as f64 / elapsed.as_secs_f64());
+            self.stream_display_frames = 0;
+            self.stream_display_window = Instant::now();
+        }
     }
 
     pub fn take_vsync_change(&mut self) -> Option<bool> {
@@ -1069,7 +1156,15 @@ impl App {
                     Pending::Session,
                 );
             }
-            (Pending::Hello, Err(error)) => self.screen = Screen::CoreFailed(error.message),
+            (Pending::Hello, Err(error)) => {
+                if error.code == "timeout" && self.hello_attempts + 1 < HELLO_ATTEMPTS {
+                    self.hello_attempts += 1;
+                    eprintln!("core: hello slow, retrying");
+                    self.spawn_core();
+                } else {
+                    self.screen = Screen::CoreFailed(error.message);
+                }
+            }
             (Pending::Providers, Ok(value)) => self.login_providers_loaded(&value),
             (Pending::Providers, Err(error)) => self.sign_in = Phase::Failed(error.message),
             (Pending::Session | Pending::SignInComplete | Pending::Logout, Ok(envelope)) => {
@@ -2325,16 +2420,37 @@ impl App {
         self.play_message = format!("Preparing {title} at {}…", profile.label());
         self.play_deadline = Some(Instant::now() + Duration::from_secs(180));
         self.screen = Screen::Stream;
-        let settings = profile.settings();
-        self.play_settings_left = settings.len() as u8;
-        for (key, value) in settings {
-            self.send(
-                "settings.set",
-                json!({"key": key, "value": value}),
-                Duration::from_secs(10),
-                Pending::StreamSetting,
-            );
+        self.stream_settings = profile
+            .settings()
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect();
+        self.play_settings_left = self.stream_settings.len() as u8;
+        self.send_next_stream_setting();
+    }
+
+    /// Writes the next launch setting. A poor card finishes one synced save, then
+    /// the next; a timeout or a busy core retries the same setting.
+    fn send_next_stream_setting(&mut self) {
+        if self.play != PlayPhase::Settings {
+            return;
         }
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::StreamSetting))
+        {
+            return;
+        }
+        let Some((key, value)) = self.stream_settings.front().cloned() else {
+            return;
+        };
+        self.send(
+            "settings.set",
+            json!({"key": key, "value": value}),
+            STREAM_SETTING_TIMEOUT,
+            Pending::StreamSetting,
+        );
     }
 
     fn advance_play(&mut self) {
@@ -2427,9 +2543,27 @@ impl App {
     }
 
     fn stream_setting_finished(&mut self, result: Result<Value, CoreError>) {
-        self.play_settings_left = self.play_settings_left.saturating_sub(1);
-        if let Err(error) = result {
-            self.fail_stream(error.message);
+        match result {
+            Ok(_) => {
+                self.stream_settings.pop_front();
+                self.play_settings_left = self.stream_settings.len() as u8;
+                self.send_next_stream_setting();
+            }
+            Err(error)
+                if self.play == PlayPhase::Settings
+                    && matches!(error.code.as_str(), "timeout" | "busy") =>
+            {
+                if self
+                    .play_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    self.fail_stream(error.message);
+                    return;
+                }
+                eprintln!("stream: settings.set slow, retrying");
+                self.send_next_stream_setting();
+            }
+            Err(error) => self.fail_stream(error.message),
         }
     }
 
@@ -2724,6 +2858,8 @@ impl App {
         // Keep the cloud seat so a failed connection can resume the same session.
         let keep_seat = matches!(self.play, PlayPhase::Live | PlayPhase::Attach);
         eprintln!("stream: {message}");
+        self.stream_settings.clear();
+        self.play_settings_left = 0;
         self.leave_mouse_mode();
         let session = self.cloud_session.clone();
         self.play = PlayPhase::Idle;
@@ -2977,23 +3113,23 @@ impl App {
                 self.store.draw(painter, &view);
             }
             Screen::Stream => {
-                let covered = self.session_menu || self.dialog.is_some();
                 if self.stream.is_none() {
                     self.stream_frame = None;
-                } else if !covered {
-                    if let Some(picture) = self.stream.as_mut().and_then(NativeStream::picture) {
-                        self.stream_frame = Some((picture.texture, picture.width, picture.height));
-                        self.stream_display_frames = self.stream_display_frames.saturating_add(1);
-                        let elapsed = self.stream_display_window.elapsed();
-                        if elapsed >= Duration::from_secs(1) {
-                            self.stream_display_fps =
-                                Some(self.stream_display_frames as f64 / elapsed.as_secs_f64());
-                            self.stream_display_frames = 0;
-                            self.stream_display_window = Instant::now();
-                        }
+                } else if self.plane_is_showing() {
+                    self.note_plane_frame();
+                } else if let Some(picture) = self.stream.as_mut().and_then(NativeStream::picture) {
+                    self.stream_frame = Some((picture.texture, picture.width, picture.height));
+                    self.stream_display_frames = self.stream_display_frames.saturating_add(1);
+                    let elapsed = self.stream_display_window.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        self.stream_display_fps =
+                            Some(self.stream_display_frames as f64 / elapsed.as_secs_f64());
+                        self.stream_display_frames = 0;
+                        self.stream_display_window = Instant::now();
                     }
                 }
-                if let Some((texture, width, height)) = self.stream_frame {
+                if self.plane_is_showing() {
+                } else if let Some((texture, width, height)) = self.stream_frame {
                     let (x, y, fitted_width, fitted_height) =
                         stream::fitted_rect(width, height, canvas());
                     painter.video(texture, x, y, fitted_width, fitted_height);
@@ -3127,7 +3263,7 @@ fn session_setup_message(status: i64, resume_pending: bool, queue_position: Opti
     }
     match queue_position {
         Some(position) => format!("GeForce NOW queue position: {position}"),
-        None if status == 1 => "Waiting for GeForce NOW to assign a machine…".into(),
+        None if status == 1 => "Loading…".into(),
         None => "Waiting for GeForce NOW to set up your session…".into(),
     }
 }

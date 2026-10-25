@@ -270,6 +270,7 @@ pub fn load() -> Profile {
     if !render_ok(&profile.render_resolution) {
         profile.render_resolution = fallback.render_resolution.clone();
     }
+    profile.vsync = true;
     eprintln!(
         "settings: {} · {} at {} fps, {} Mbps, render {}, vsync {}, {}, anti-afk {}",
         profile.resolution,

@@ -373,14 +373,14 @@ fn stream_ping_keeps_fresh_source_priority_when_other_samples_arrive_later() {
 }
 
 #[test]
-fn stream_ping_prefers_video_with_fresh_bundle_fallback_and_resets_per_session() {
+fn stream_ping_reports_the_smallest_fresh_sample_and_resets_per_session() {
     let feedback = NvstFeedbackState::default();
     let start = Instant::now();
     assert_eq!(feedback.ping_ms(start), None);
     feedback.publish_ping(false, start, Duration::from_micros(22_500));
     assert_eq!(feedback.ping_ms(start), Some(22.5));
     feedback.publish_ping(true, start, Duration::from_millis(30));
-    assert_eq!(feedback.ping_ms(start), Some(30.0));
+    assert_eq!(feedback.ping_ms(start), Some(22.5));
     feedback.publish_ping(
         false,
         start + Duration::from_secs(1),

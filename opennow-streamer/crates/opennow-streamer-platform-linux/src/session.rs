@@ -5,6 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// Cold start from a slow card can spend this long opening the decoder and
+/// the audio device. A short wait aborts a seat that is already assigned.
+const WORKER_START_TIMEOUT: Duration = Duration::from_secs(20);
+
 use crate::audio::{AudioSink, OpusDecoder, open_audio_fallback, open_audio_sink};
 use crate::queue::{BoundedQueue, QueuePop, QueuePush};
 use crate::timing::{DecodeTimingProbe, DecodeTimings};
@@ -236,7 +240,7 @@ impl LinuxSession {
                 })
                 .map_err(|error| Error::io(Subsystem::Session, error))?
         };
-        match startup_rx.recv_timeout(Duration::from_secs(3)) {
+        match startup_rx.recv_timeout(WORKER_START_TIMEOUT) {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 video_commands.close();
@@ -279,7 +283,7 @@ impl LinuxSession {
                     }
                 }
             };
-            match audio_start_rx.recv_timeout(Duration::from_secs(3)) {
+            match audio_start_rx.recv_timeout(WORKER_START_TIMEOUT) {
                 Ok(Ok(_)) => (Some(queue), Some(worker)),
                 Ok(Err(error)) => {
                     queue.close();

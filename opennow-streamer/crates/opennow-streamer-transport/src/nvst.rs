@@ -104,12 +104,12 @@ struct StreamPingTracker {
 }
 
 #[derive(Default)]
-struct IceResponseTracker {
+pub(crate) struct IceResponseTracker {
     requests: VecDeque<([u8; 12], bool)>,
 }
 
 impl IceResponseTracker {
-    fn sent(&mut self, packet: &[u8]) {
+    pub(crate) fn sent(&mut self, packet: &[u8]) {
         if !looks_like_stun(packet) || packet[..2] != STUN_BINDING_REQUEST.to_be_bytes() {
             return;
         }
@@ -123,7 +123,7 @@ impl IceResponseTracker {
         self.requests.push_back((transaction_id, false));
     }
 
-    fn accept(&mut self, packet: &[u8], remote_password: &str) -> bool {
+    pub(crate) fn accept(&mut self, packet: &[u8], remote_password: &str) -> bool {
         if !looks_like_stun(packet)
             || packet[..2] != STUN_BINDING_SUCCESS_RESPONSE.to_be_bytes()
             || STUN_HEADER_LEN + usize::from(u16::from_be_bytes([packet[2], packet[3]]))
@@ -742,9 +742,12 @@ impl NvstFeedbackState {
     }
 
     fn ping(&self, now: Instant) -> Option<Duration> {
-        [&self.ice_ping, &self.video_ping, &self.bundle_ping]
+        // The smallest fresh sample. An ICE consent check on a busy handheld
+        // can sit near two seconds while the video STUN round trip is the
+        // path the picture actually takes.
+        [&self.video_ping, &self.bundle_ping, &self.ice_ping]
             .into_iter()
-            .find_map(|sample| {
+            .filter_map(|sample| {
                 sample
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -753,6 +756,7 @@ impl NvstFeedbackState {
                     })
                     .map(|(_, elapsed)| elapsed)
             })
+            .min()
     }
 
     #[cfg(test)]

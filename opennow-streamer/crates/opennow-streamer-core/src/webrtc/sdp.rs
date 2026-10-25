@@ -78,7 +78,6 @@ pub(super) fn nvst_answer(
     if stream.fps > 60 {
         lines.extend([
             "a=vqos.resControl.dfc.useClientFpsPerf:0".to_owned(),
-            "a=bwe.iirFilterFactor:8".to_owned(),
             "a=video.encoderFeatureSetting:47".to_owned(),
             "a=video.encoderPreset:6".to_owned(),
             format!("a=vqos.maxStreamFpsEstimate:{}", stream.fps),
@@ -214,6 +213,12 @@ mod tests {
             "a=video.bitDepth:10",
             "a=video.dynamicRangeMode:0",
             "a=video.framePacing.pid.minTargetFrameTimeUs:15833",
+            "a=bwe.iirFilterFactor:8",
+            "a=vqos.drc.bitrateIirFilterFactor:128",
+            "a=vqos.resControl.bitrateIirFilterFactor:128",
+            "a=video.rtpNackQueueLength:2048",
+            "a=video.rtpNackQueueMaxPackets:1024",
+            "a=video.rtpNackMaxPacketCount:64",
         ] {
             assert!(
                 sdp.lines().any(|line| line == expected),

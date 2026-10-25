@@ -1,10 +1,21 @@
-//! Runtime-loaded SDL2. Handheld ports use PortMaster's libSDL2 when
-//! `OPENNOW_SDL2` points at it. dArkOS otherwise uses the system SDL2, which
-//! drives the panel through KMSDRM and the Mali EGL driver, so no window
-//! manager is involved.
+//! Runtime-loaded system SDL2. It drives the panel through KMSDRM and the Mali
+//! EGL driver, so no window manager is involved. `OPENNOW_SDL2` can point at
+//! another build. Controller mappings come from PortMaster's `get_controls`.
 
 use libloading::Library;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static GL_RESOLVER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn gl_resolver() -> Option<unsafe extern "C" fn(*const c_char) -> *mut c_void> {
+    let pointer = GL_RESOLVER.load(Ordering::Acquire);
+    if pointer == 0 {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute(pointer) })
+    }
+}
 
 const INIT_VIDEO: u32 = 0x20;
 const INIT_JOYSTICK: u32 = 0x200;
@@ -117,8 +128,17 @@ pub struct Sdl {
     joystick_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     joystick_num_buttons: unsafe extern "C" fn(*mut c_void) -> c_int,
     joystick_instance_id: unsafe extern "C" fn(*mut c_void) -> i32,
-    controller_joysticks: Vec<i32>,
+    game_controller_mapping: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_char>,
+    sdl_free: Option<unsafe extern "C" fn(*mut c_void)>,
+    mapped_pads: Vec<MappedPad>,
     _library: Library,
+}
+
+struct MappedPad {
+    instance: i32,
+    /// Raw buttons the SDL mapping already reports as stick clicks.
+    /// `None` means that mapping string could not be read.
+    stick_clicks: Option<(Option<u8>, Option<u8>)>,
 }
 
 pub struct Window {
@@ -132,6 +152,34 @@ fn symbol<T: Copy>(library: &Library, name: &str) -> Result<T, String> {
     unsafe { library.get::<T>(name.as_bytes()) }
         .map(|symbol| *symbol)
         .map_err(|error| format!("SDL2 is missing {name}: {error}"))
+}
+
+fn optional_symbol<T: Copy>(library: &Library, name: &str) -> Option<T> {
+    unsafe { library.get::<T>(name.as_bytes()) }
+        .ok()
+        .map(|symbol| *symbol)
+}
+
+fn parse_stick_clicks(mapping: &str) -> (Option<u8>, Option<u8>) {
+    let mut left = None;
+    let mut right = None;
+    for part in mapping.split(',') {
+        let Some((name, value)) = part.split_once(':') else {
+            continue;
+        };
+        let Some(button) = value
+            .strip_prefix('b')
+            .and_then(|text| text.parse::<u8>().ok())
+        else {
+            continue;
+        };
+        match name {
+            "leftstick" => left = Some(button),
+            "rightstick" => right = Some(button),
+            _ => {}
+        }
+    }
+    (left, right)
 }
 
 fn text(pointer: *const c_char) -> String {
@@ -184,7 +232,11 @@ impl Sdl {
             gl_make_current: symbol(&library, "SDL_GL_MakeCurrent")?,
             gl_set_swap_interval: symbol(&library, "SDL_GL_SetSwapInterval")?,
             gl_swap_window: symbol(&library, "SDL_GL_SwapWindow")?,
-            gl_get_proc_address: symbol(&library, "SDL_GL_GetProcAddress")?,
+            gl_get_proc_address: {
+                let resolver = symbol(&library, "SDL_GL_GetProcAddress")?;
+                GL_RESOLVER.store(resolver as usize, Ordering::Release);
+                resolver
+            },
             gl_get_drawable_size: symbol(&library, "SDL_GL_GetDrawableSize")?,
             poll_event: symbol(&library, "SDL_PollEvent")?,
             is_game_controller: symbol(&library, "SDL_IsGameController")?,
@@ -195,7 +247,9 @@ impl Sdl {
             joystick_name: symbol(&library, "SDL_JoystickName")?,
             joystick_num_buttons: symbol(&library, "SDL_JoystickNumButtons")?,
             joystick_instance_id: symbol(&library, "SDL_JoystickInstanceID")?,
-            controller_joysticks: Vec::new(),
+            game_controller_mapping: optional_symbol(&library, "SDL_GameControllerMapping"),
+            sdl_free: optional_symbol(&library, "SDL_free"),
+            mapped_pads: Vec::new(),
             _library: library,
         })
     }
@@ -330,6 +384,66 @@ impl Sdl {
         unsafe { (self.gl_swap_window)(window.window) };
     }
 
+    /// DRM file descriptor for the KMSDRM window, shared with the streamer's
+    /// overlay plane. Other video drivers have no plane to borrow.
+    pub fn drm_fd(&self, window: &Window) -> Option<i32> {
+        #[repr(C)]
+        struct Version {
+            major: u8,
+            minor: u8,
+            patch: u8,
+        }
+        #[repr(C)]
+        struct WmInfo {
+            major: u8,
+            minor: u8,
+            patch: u8,
+            _pad: u8,
+            subsystem: i32,
+            dev_index: i32,
+            drm_fd: i32,
+            _rest: [u8; 192],
+        }
+        const KMSDRM: i32 = 13;
+        let get_version = unsafe {
+            self._library
+                .get::<unsafe extern "C" fn(*mut Version)>(b"SDL_GetVersion\0")
+                .ok()?
+        };
+        let get_wm = unsafe {
+            self._library
+                .get::<unsafe extern "C" fn(*mut c_void, *mut WmInfo) -> c_int>(
+                    b"SDL_GetWindowWMInfo\0",
+                )
+                .ok()?
+        };
+        let mut info = WmInfo {
+            major: 0,
+            minor: 0,
+            patch: 0,
+            _pad: 0,
+            subsystem: 0,
+            dev_index: 0,
+            drm_fd: -1,
+            _rest: [0; 192],
+        };
+        let mut version = Version {
+            major: 0,
+            minor: 0,
+            patch: 0,
+        };
+        unsafe { get_version(&mut version) };
+        info.major = version.major;
+        info.minor = version.minor;
+        info.patch = version.patch;
+        let ok = unsafe { get_wm(window.window, &mut info) };
+        if ok == 0 || info.subsystem != KMSDRM || info.drm_fd < 0 {
+            None
+        } else {
+            Some(info.drm_fd)
+        }
+    }
+
     pub fn gl_proc(&self, name: &str) -> *mut c_void {
         debug_assert!(name.ends_with('\0'));
         unsafe { (self.gl_get_proc_address)(name.as_ptr().cast()) }
@@ -351,10 +465,20 @@ impl Sdl {
                 let controller = (self.game_controller_open)(index);
                 if !controller.is_null() {
                     let joystick = (self.game_controller_joystick)(controller);
-                    self.controller_joysticks
-                        .push((self.joystick_instance_id)(joystick));
+                    let instance = (self.joystick_instance_id)(joystick);
+                    let mapping = self.controller_mapping(controller);
+                    let stick_clicks = mapping.as_deref().map(parse_stick_clicks);
+                    let name = text((self.game_controller_name)(controller));
+                    eprintln!(
+                        "pad: {name} config {}",
+                        mapping.as_deref().unwrap_or("none")
+                    );
+                    self.mapped_pads.push(MappedPad {
+                        instance,
+                        stick_clicks,
+                    });
                     let buttons = (self.joystick_num_buttons)(joystick);
-                    return (text((self.game_controller_name)(controller)), buttons > 16);
+                    return (name, buttons > 16);
                 }
             }
             let joystick = (self.joystick_open)(index);
@@ -362,11 +486,51 @@ impl Sdl {
                 return (format!("device {index} failed: {}", self.error()), false);
             }
             let buttons = (self.joystick_num_buttons)(joystick);
-            (
-                format!("{} (no SDL mapping)", text((self.joystick_name)(joystick))),
-                buttons > 16,
-            )
+            let name = text((self.joystick_name)(joystick));
+            eprintln!("pad: {name} config none");
+            (format!("{name} (no SDL mapping)"), buttons > 16)
         }
+    }
+
+    fn is_mapped(&self, which: i32) -> bool {
+        self.mapped_pads.iter().any(|pad| pad.instance == which)
+    }
+
+    /// Face buttons and sticks already arrive through the controller API.
+    /// Select, Start, and FN stay raw. These boards click the sticks with
+    /// buttons 14 and 15. PortMaster's mapping already names those, so they
+    /// are left to the controller events. System SDL, used when PortMaster is
+    /// not installed, often names different buttons or none, so the raw clicks
+    /// are sent as well.
+    fn forward_raw_button(&self, which: i32, button: u8) -> bool {
+        let Some(pad) = self.mapped_pads.iter().find(|pad| pad.instance == which) else {
+            return true;
+        };
+        if matches!(button, 12 | 13 | 16) {
+            return true;
+        }
+        if !matches!(button, 14 | 15) {
+            return false;
+        }
+        let Some((left, right)) = pad.stick_clicks else {
+            return true;
+        };
+        left != Some(button) && right != Some(button)
+    }
+
+    fn controller_mapping(&self, controller: *mut c_void) -> Option<String> {
+        let (Some(mapping), Some(free)) = (self.game_controller_mapping, self.sdl_free) else {
+            return None;
+        };
+        let pointer = unsafe { mapping(controller) };
+        if pointer.is_null() {
+            return None;
+        }
+        let text = unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { free(pointer.cast()) };
+        Some(text)
     }
 
     pub fn poll(&self) -> Option<(Event, Option<i32>)> {
@@ -384,18 +548,19 @@ impl Sdl {
                 axis: event.bytes[12],
                 value: event.i16_at(16),
             },
+            // Select and Start stay on raw buttons 12 and 13. The PortMaster
+            // map also names them, and forwarding both presses each one twice.
+            EVENT_CONTROLLERBUTTONDOWN | EVENT_CONTROLLERBUTTONUP
+                if matches!(event.bytes[12], 4 | 6) =>
+            {
+                Event::Other
+            }
             EVENT_CONTROLLERBUTTONDOWN | EVENT_CONTROLLERBUTTONUP => Event::ControllerButton {
                 button: event.bytes[12],
                 pressed: kind == EVENT_CONTROLLERBUTTONDOWN,
             },
-            // A mapped pad already reports face buttons, the D-pad, and the
-            // sticks through the controller API. Forwarding the raw copies
-            // presses each one twice. Xbox layout sends those two copies to
-            // different face buttons, so both A and B fire. Select, Start, and
-            // FN stay raw: this port does not take those from the controller map.
             EVENT_JOYBUTTONDOWN | EVENT_JOYBUTTONUP
-                if !self.controller_joysticks.contains(&which)
-                    || matches!(event.bytes[12], 12 | 13 | 16) =>
+                if self.forward_raw_button(which, event.bytes[12]) =>
             {
                 Event::JoyButton {
                     which,
@@ -403,16 +568,16 @@ impl Sdl {
                     pressed: kind == EVENT_JOYBUTTONDOWN,
                 }
             }
-            EVENT_JOYHATMOTION if !self.controller_joysticks.contains(&which) => Event::JoyHat {
+            EVENT_JOYHATMOTION if !self.is_mapped(which) => Event::JoyHat {
                 which,
                 value: event.bytes[13],
             },
-            EVENT_JOYAXISMOTION if !self.controller_joysticks.contains(&which) => Event::JoyAxis {
+            EVENT_JOYAXISMOTION if !self.is_mapped(which) => Event::JoyAxis {
                 which,
                 axis: event.bytes[12],
                 value: event.i16_at(16),
             },
-            _ if self.controller_joysticks.contains(&which) => Event::Other,
+            _ if self.is_mapped(which) => Event::Other,
             _ => Event::Other,
         };
         Some((parsed, None))
@@ -422,5 +587,19 @@ impl Sdl {
 impl Drop for Sdl {
     fn drop(&mut self) {
         unsafe { (self.quit)() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stick_clicks;
+
+    #[test]
+    fn stick_clicks_come_from_the_mapping_buttons() {
+        let mapping = "GO-Super Gamepad,a:b1,b:b0,leftstick:b10,rightstick:b11,dpup:h0.1,platform:Linux";
+        assert_eq!(parse_stick_clicks(mapping), (Some(10), Some(11)));
+        let handheld = "a:b0,b:b1,leftstick:b14,rightstick:b15,platform:Linux";
+        assert_eq!(parse_stick_clicks(handheld), (Some(14), Some(15)));
+        assert_eq!(parse_stick_clicks("a:b0,b:b1"), (None, None));
     }
 }

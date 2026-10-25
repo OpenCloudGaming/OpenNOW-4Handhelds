@@ -14,12 +14,10 @@ fi
 
 if [ -f "$controlfolder/control.txt" ]; then
   source "$controlfolder/control.txt"
-fi
-
-[ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
-
-if type get_controls >/dev/null 2>&1; then
+  [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
   get_controls
+else
+  echo "PortMaster control.txt was not found."
 fi
 
 if [ -n "${directory:-}" ]; then
@@ -48,50 +46,37 @@ if [ -e /dev/vpu_service ] && [ ! -w /dev/vpu_service ]; then
   fi
 fi
 
-arch="${DEVICE_ARCH:-aarch64}"
+export LD_LIBRARY_PATH="$GAMEDIR/libraries${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-pm_sdl=""
-for candidate in \
-  "$controlfolder/libs/libSDL2-2.0.so.0" \
-  "$controlfolder/libs/libSDL2-2.0.so" \
-  "$controlfolder/libs.${arch}/libSDL2-2.0.so.0" \
-  "$controlfolder/libSDL2-2.0.so.0"
-do
-  if [ -f "$candidate" ]; then
-    export OPENNOW_SDL2="$candidate"
-    pm_sdl="$(dirname "$candidate")"
-    break
-  fi
-done
-if [ -z "$pm_sdl" ]; then
-  echo "PortMaster SDL was not found. Using the system SDL."
+# Same controller list PortMaster gives every port. Select and Start are still
+# this port's own buttons; the gamepad map supplies the rest.
+db="${SDL_GAMECONTROLLERCONFIG_FILE:-}"
+if [ -n "$db" ] && [ -f "$db" ]; then
+  db_count=$(grep -c . "$db" 2>/dev/null || true)
+  db_count=${db_count:-0}
+  echo "controls: loaded gamecontrollerdb $db (${db_count} mappings, device ${DEVICE:-any})"
+elif [ -f "$controlfolder/gamecontrollerdb.txt" ]; then
+  echo "controls: gamecontrollerdb $controlfolder/gamecontrollerdb.txt was not copied into the selected config"
+else
+  echo "controls: gamecontrollerdb was not found"
 fi
-export LD_LIBRARY_PATH="${pm_sdl:+$pm_sdl:}$GAMEDIR/libraries${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
 if [ -n "${sdl_controllerconfig:-}" ]; then
-  # Face buttons, sticks, and the D-pad come from PortMaster. Select and Start
-  # stay on this port's own buttons.
-  filtered=""
+  export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
+  config_count=0
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
-    cleaned=""
-    IFS=','
-    for field in $line; do
-      case "$field" in
-        back:*|start:*) continue ;;
-      esac
-      if [ -z "$cleaned" ]; then
-        cleaned="$field"
-      else
-        cleaned="$cleaned,$field"
-      fi
-    done
-    unset IFS
-    filtered="${filtered}${cleaned}"$'\n'
+    config_count=$((config_count + 1))
+    if [ "$config_count" -le 8 ]; then
+      echo "controls: selected gamepad config $line"
+    fi
   done <<EOF
 $sdl_controllerconfig
 EOF
-  export SDL_GAMECONTROLLERCONFIG="$filtered"
+  if [ "$config_count" -gt 8 ]; then
+    echo "controls: selected gamepad config has $config_count mappings"
+  fi
+else
+  echo "controls: selected gamepad config was empty"
 fi
 export SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0
 

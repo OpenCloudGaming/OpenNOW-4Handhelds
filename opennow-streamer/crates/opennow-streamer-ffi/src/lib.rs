@@ -573,7 +573,12 @@ fn spawn_dispatcher(
                     _ => "",
                 };
                 if level == "WARN" || level == "ERROR" {
-                    log::log_line(level, "native-to-qt", &log::message_summary(&value));
+                    let summary = log::message_summary(&value);
+                    // A redacted event with no safe field left is just "type=log".
+                    // The specific line was already written by the call site.
+                    if summary != "type=log" && summary != "type=error" {
+                        log::log_line(level, "core", &summary);
+                    }
                 }
                 callback.invoke(&value);
             }
@@ -827,6 +832,24 @@ pub unsafe extern "C" fn opennow_streamer_set_log_file(
     })) {
         Ok(status) => status,
         Err(_) => OpenNowStreamerStatus::Panic,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+/// Records `SDL_GL_GetProcAddress` so frame recording uses the GLES driver SDL
+/// already made current. Safe to call before the first frame. A null pointer
+/// is ignored.
+///
+/// # Safety
+///
+/// `proc_address` is either null or an `SDL_GL_GetProcAddress` that stays valid
+/// for the rest of the process.
+pub unsafe extern "C" fn opennow_streamer_set_gl_proc(
+    proc_address: Option<unsafe extern "C" fn(*const c_char) -> *mut c_void>,
+) {
+    if let Some(proc_address) = proc_address {
+        opennow_streamer_platform::set_gl_proc(proc_address);
     }
 }
 
@@ -1419,6 +1442,32 @@ pub unsafe extern "C" fn opennow_streamer_acquire_latest_frame(
         Ok(status) => status,
         Err(_) => OpenNowStreamerStatus::Panic,
     }
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn opennow_streamer_set_display_scanout(drm_fd: i32, width: u32, height: u32) -> i32 {
+    i32::from(opennow_streamer_platform::arm_display_scanout(
+        drm_fd, width, height,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn opennow_streamer_set_scanout_suspended(suspended: i32) {
+    opennow_streamer_platform::set_display_scanout_suspended(suspended != 0);
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn opennow_streamer_scanout_sequence() -> u64 {
+    opennow_streamer_platform::display_scanout_sequence()
+}
+
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn opennow_streamer_scanout_failed() -> i32 {
+    i32::from(opennow_streamer_platform::display_scanout_failed())
 }
 
 #[unsafe(no_mangle)]

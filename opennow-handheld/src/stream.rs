@@ -15,10 +15,9 @@ const GRAPHICS_CONTEXT_VERSION: u32 = 3;
 const RENDER_COMMAND_VERSION: u32 = 3;
 const GRAPHICS_API_OPENGL_ES: u32 = 4;
 const PROTOCOL_VERSION: u64 = 7;
-// All embedded Linux video publishers currently allocate at least four GLES
-// slots. Rotating them avoids reusing one DMA-BUF import every frame, which
-// otherwise forces the presenter to drain the GPU before releasing it.
-const GLES_FRAME_SLOTS: u32 = 4;
+// One slot. The picture is copied into a texture and the decoder buffer is
+// returned before the next frame, so the decoder is not left holding several.
+const GLES_FRAME_SLOTS: u32 = 1;
 
 type Status = i32;
 type Callback = unsafe extern "C" fn(*const u8, usize, *mut c_void);
@@ -103,6 +102,10 @@ struct Api {
     submit_mouse_absolute: unsafe extern "C" fn(*const c_void, u16, u16, u16, u16) -> Status,
     submit_mouse_button: unsafe extern "C" fn(*const c_void, u8, bool) -> Status,
     set_capture: unsafe extern "C" fn(*const c_void, bool, bool, usize, *mut bool) -> Status,
+    set_display_scanout: Option<unsafe extern "C" fn(i32, u32, u32) -> i32>,
+    set_scanout_suspended: Option<unsafe extern "C" fn(i32)>,
+    scanout_sequence: Option<unsafe extern "C" fn() -> u64>,
+    scanout_failed: Option<unsafe extern "C" fn() -> i32>,
     _library: Library,
 }
 
@@ -150,6 +153,19 @@ impl NativeStream {
     pub fn open() -> Result<Self, String> {
         let path = library_path();
         let library = unsafe { Library::new(&path) }.map_err(|error| format!("Could not load {}: {error}", path.display()))?;
+        if let Some(resolver) = crate::sdl::gl_resolver() {
+            let set_gl_proc = unsafe {
+                library
+                    .get::<unsafe extern "C" fn(Option<unsafe extern "C" fn(*const c_char) -> *mut c_void>)>(
+                        b"opennow_streamer_set_gl_proc\0",
+                    )
+                    .ok()
+                    .map(|symbol| *symbol)
+            };
+            if let Some(set_gl_proc) = set_gl_proc {
+                unsafe { set_gl_proc(Some(resolver)) };
+            }
+        }
         let api = unsafe {
             Api {
                 create: *library.get(b"opennow_streamer_create\0").map_err(|error| error.to_string())?,
@@ -164,6 +180,22 @@ impl NativeStream {
                 submit_mouse_absolute: *library.get(b"opennow_streamer_submit_mouse_absolute\0").map_err(|error| error.to_string())?,
                 submit_mouse_button: *library.get(b"opennow_streamer_submit_mouse_button\0").map_err(|error| error.to_string())?,
                 set_capture: *library.get(b"opennow_streamer_set_capture_active\0").map_err(|error| error.to_string())?,
+                set_display_scanout: library
+                    .get::<unsafe extern "C" fn(i32, u32, u32) -> i32>(b"opennow_streamer_set_display_scanout\0")
+                    .ok()
+                    .map(|symbol| *symbol),
+                set_scanout_suspended: library
+                    .get::<unsafe extern "C" fn(i32)>(b"opennow_streamer_set_scanout_suspended\0")
+                    .ok()
+                    .map(|symbol| *symbol),
+                scanout_sequence: library
+                    .get::<unsafe extern "C" fn() -> u64>(b"opennow_streamer_scanout_sequence\0")
+                    .ok()
+                    .map(|symbol| *symbol),
+                scanout_failed: library
+                    .get::<unsafe extern "C" fn() -> i32>(b"opennow_streamer_scanout_failed\0")
+                    .ok()
+                    .map(|symbol| *symbol),
                 _library: library,
             }
         };
@@ -233,9 +265,38 @@ impl NativeStream {
     }
 
     pub fn stop_media(&mut self) {
+        self.set_scanout_suspended(true);
         let _ = self.send_json(&json!({"id": "stop", "type": "stop", "reason": "ended from the handheld"}));
         self.release_held();
         self.pad_buttons = 0;
+    }
+
+    /// Hands SDL's DRM device to the streamer so decoded frames can be scanned
+    /// out directly. Failure leaves the GLES picture path in place.
+    pub fn enable_scanout(&self, drm_fd: i32, width: u32, height: u32) -> bool {
+        let Some(set) = self.api.set_display_scanout else {
+            return false;
+        };
+        unsafe { set(drm_fd, width, height) != 0 }
+    }
+
+    pub fn set_scanout_suspended(&self, suspended: bool) {
+        if let Some(set) = self.api.set_scanout_suspended {
+            unsafe { set(i32::from(suspended)) };
+        }
+    }
+
+    pub fn scanout_sequence(&self) -> u64 {
+        self.api
+            .scanout_sequence
+            .map(|sequence| unsafe { sequence() })
+            .unwrap_or(0)
+    }
+
+    pub fn scanout_failed(&self) -> bool {
+        self.api
+            .scanout_failed
+            .is_some_and(|failed| unsafe { failed() != 0 })
     }
 
     /// Records the newest decoded frame into a texture. The OpenGL ES context

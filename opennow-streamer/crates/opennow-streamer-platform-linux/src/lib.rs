@@ -11,6 +11,8 @@ mod audio_devices;
 #[cfg(target_os = "linux")]
 mod capability;
 #[cfg(target_os = "linux")]
+mod drm_scanout;
+#[cfg(target_os = "linux")]
 mod error;
 #[cfg(target_os = "linux")]
 mod format;
@@ -46,6 +48,11 @@ pub use capability::{
 #[cfg(target_os = "linux")]
 pub use error::{Error, Result, Subsystem};
 #[cfg(target_os = "linux")]
+pub use drm_scanout::{
+    arm_display_scanout, display_scanout_failed, display_scanout_sequence, present_display_plane,
+    set_display_scanout_suspended,
+};
+#[cfg(target_os = "linux")]
 pub use format::{
     ChromaLocation, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, DecodedVideoFrame,
     DmaBufFrame, DmaBufLayer, DmaBufObject, DmaBufPlane, EncodedVideoFrame, FramePlane,
@@ -55,7 +62,7 @@ pub use format::{
 pub use frame_producer::{
     CpuNv12Frame, GpuTextureFormat, ImportedNv12Frame, LinuxFrameProducer, LinuxGpuFrame,
     LinuxGpuFrameProducer, LinuxGpuRenderResources, LinuxTextureColorSpace, PreparedLinuxFrame,
-    PreparedVulkanFrame, PreparedVulkanImage, RecordedGpuFrame, VulkanRenderDevice,
+    PreparedVulkanFrame, PreparedVulkanImage, RecordedGpuFrame, VulkanRenderDevice, set_gl_proc,
 };
 #[cfg(all(target_os = "linux", feature = "vulkan"))]
 pub use presentation::{NativeSurface, VulkanPresenter};

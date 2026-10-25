@@ -1792,7 +1792,7 @@ fn forward_shortcut_action(
         if let Err(message) = result {
             let _ = output.send(event(
                 "log",
-                json!({"level":"warn", "message":format!("Shortcut {} failed: {message}", action.protocol_name())}),
+                json!({"level":"warn","event":"shortcut-failed","message":format!("Shortcut {} failed: {message}", action.protocol_name())}),
             ));
         }
         return;
@@ -2020,6 +2020,7 @@ fn forward_nvst_session_events<R: NvstSessionResources>(
                             "log",
                             json!({
                                 "level": "warn",
+                                "event": "decode-stall",
                                 "message": format!(
                                     "Decoder produced no frame for {idle_for:?} with {in_flight} frame(s) outstanding; requested a keyframe"
                                 )
@@ -2169,6 +2170,7 @@ fn forward_nvst_event<R: NvstSessionResources>(
                 "log",
                 json!({
                     "level": "warn",
+                    "event": "frame-stall",
                     "message": format!(
                         "Produced-frame stall for {idle_for:?}; requested a fresh keyframe"
                     )
@@ -2193,6 +2195,7 @@ fn forward_nvst_event<R: NvstSessionResources>(
                 "log",
                 json!({
                     "level": "warn",
+                    "event": "packet-gap",
                     "message": format!(
                         "Recovering NVST packet gap with a fresh keyframe: {first_missing_index}..={last_missing_index}"
                     )
@@ -2233,6 +2236,7 @@ fn forward_nvst_event<R: NvstSessionResources>(
                 "log",
                 json!({
                     "level": "warn",
+                    "event": "frame-dropped",
                     "message": "Dropped a backpressured NVST video frame and requested a fresh keyframe"
                 }),
             ));
@@ -2548,16 +2552,16 @@ fn forward_nvst_media_feedback<R: NvstSessionResources>(
         MediaFeedback::VideoFrameAccepted {
             frame_index,
             bytes,
-            keyframe,
             ..
         } => {
             state.transport_frame_progress_stalled = false;
             if let Some(frame_index) = frame_index {
                 resources.acknowledge_video_frame(frame_index, bytes);
             }
-            if keyframe {
-                state.recovery_attempts = 0;
-            }
+            // A recovered picture is a new episode. Keeping the previous
+            // attempt armed made the next stall terminal even though video
+            // had been flowing again.
+            state.recovery_attempts = 0;
             state.telemetry_frames = state.telemetry_frames.saturating_add(1);
             state.telemetry_bytes = state.telemetry_bytes.saturating_add(u64::from(bytes));
             state.telemetry_started = true;
@@ -3042,6 +3046,7 @@ fn consume_encoded_media(
                     "log",
                     json!({
                         "level": "warn",
+                        "event": "codec-unsupported",
                         "message": "Dropping a frame for a codec not built into native streamer v2"
                     }),
                 ));
@@ -5663,7 +5668,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_decode_stall_after_resumed_output_exhausts_session_recovery() {
+    fn resumed_picture_clears_the_recovery_budget() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let sender = EventSender::unbounded(sender);
         let lifecycle = connected_lifecycle();
@@ -5690,52 +5695,71 @@ mod tests {
             unmatched_submissions: 0,
         };
 
-        let mut episode_started_at = base;
-        for episode in 0..2 {
-            let stalled_at = episode_started_at + policy.stall;
-            assert!(matches!(
-                watchdog.poll(&report, false, None, stalled_at, policy),
-                Some(DecodeProgressEvent::KeyframeRequested { .. })
-            ));
-            resources.request_keyframe();
-            let recovery_at = stalled_at + policy.keyframe_grace;
-            assert!(matches!(
-                watchdog.poll(&report, false, None, recovery_at, policy),
-                Some(DecodeProgressEvent::RecoveryNeeded { .. })
-            ));
-            assert_eq!(
-                attempt_nvst_recovery(
-                    &sender,
-                    &lifecycle,
-                    7,
-                    &resources,
-                    &mut recovery_attempts,
-                    "scripted decoder stall".to_owned(),
-                ),
-                episode == 1
-            );
-            if episode == 0 {
-                episode_started_at = recovery_at + Duration::from_secs(1);
-                report.last_output_at = Some(episode_started_at);
-                report.outputs_total = 1;
-                report.oldest_in_flight_at = Some(episode_started_at);
-                assert_eq!(
-                    watchdog.poll(&report, false, None, episode_started_at, policy),
-                    None
-                );
-            }
-        }
+        let stalled_at = base + policy.stall;
+        assert!(matches!(
+            watchdog.poll(&report, false, None, stalled_at, policy),
+            Some(DecodeProgressEvent::KeyframeRequested { .. })
+        ));
+        let recovery_at = stalled_at + policy.keyframe_grace;
+        assert!(matches!(
+            watchdog.poll(&report, false, None, recovery_at, policy),
+            Some(DecodeProgressEvent::RecoveryNeeded { .. })
+        ));
+        assert!(!attempt_nvst_recovery(
+            &sender,
+            &lifecycle,
+            7,
+            &resources,
+            &mut recovery_attempts,
+            "scripted decoder stall".to_owned(),
+        ));
+        let mut state = NvstMediaFeedbackState::new(true);
+        state.recovery_attempts = recovery_attempts;
+        forward_nvst_media_feedback(
+            &sender,
+            &lifecycle,
+            7,
+            &resources,
+            MediaFeedback::VideoFrameAccepted {
+                frame_index: Some(4),
+                timestamp: 90_000,
+                bytes: 1_024,
+                keyframe: false,
+            },
+            &mut state,
+        );
+        recovery_attempts = state.recovery_attempts;
+
+        let episode_started_at = recovery_at + Duration::from_secs(1);
+        report.last_output_at = Some(episode_started_at);
+        report.outputs_total = 1;
+        report.oldest_in_flight_at = Some(episode_started_at);
+        report.epoch = report.epoch.wrapping_add(1);
+        report.epoch_started_at = Some(episode_started_at);
+        let stalled_again = episode_started_at + policy.stall;
+        assert!(matches!(
+            watchdog.poll(&report, false, None, stalled_again, policy),
+            Some(DecodeProgressEvent::KeyframeRequested { .. })
+        ));
+        let recovery_again = stalled_again + policy.keyframe_grace;
+        assert!(matches!(
+            watchdog.poll(&report, false, None, recovery_again, policy),
+            Some(DecodeProgressEvent::RecoveryNeeded { .. })
+        ));
+        assert!(!attempt_nvst_recovery(
+            &sender,
+            &lifecycle,
+            7,
+            &resources,
+            &mut recovery_attempts,
+            "scripted decoder stall".to_owned(),
+        ));
 
         assert_eq!(recovery_attempts, 1);
-        assert_eq!(resources.recoveries.load(Ordering::Relaxed), 1);
-        assert_eq!(resources.stops.load(Ordering::Relaxed), 1);
-        assert_eq!(lock_lifecycle(&lifecycle).state, State::Idle);
-        assert!(lock_lifecycle(&lifecycle).context.is_none());
-        assert!(receiver.try_iter().any(|message| {
-            message["type"] == "status"
-                && message["status"] == "stopped"
-                && message["termination"]["code"] == "nvst-recovery-exhausted"
-        }));
+        assert_eq!(resources.recoveries.load(Ordering::Relaxed), 2);
+        assert_eq!(resources.stops.load(Ordering::Relaxed), 0);
+        assert_eq!(lock_lifecycle(&lifecycle).state, State::Connected);
+        assert!(receiver.try_iter().all(|message| message["status"] != "stopped"));
     }
 
     #[test]

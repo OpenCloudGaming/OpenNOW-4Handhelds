@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: i64 = 5;
 const MAXIMUM_LINE_BYTES: usize = 1024 * 1024;
+const HELLO_TIMEOUT: Duration = Duration::from_secs(45);
 const FIRST_BUSY_RETRY: Duration = Duration::from_millis(100);
 const LAST_BUSY_RETRY: Duration = Duration::from_secs(1);
 
@@ -288,7 +289,7 @@ impl Core {
         self.request(
             "core.hello",
             json!({"protocolVersion": PROTOCOL_VERSION, "shell": "handheld", "shellVersion": env!("CARGO_PKG_VERSION")}),
-            Duration::from_secs(5),
+            HELLO_TIMEOUT,
         )
     }
 

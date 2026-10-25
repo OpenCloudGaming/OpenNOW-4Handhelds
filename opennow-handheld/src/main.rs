@@ -458,6 +458,11 @@ fn run() -> Result<(), String> {
         }
         theme::set_canvas_for_display(window.width, window.height);
         app.update(now - last_frame, &mut painter);
+        app.sync_scanout(
+            sdl.drm_fd(&window),
+            window.width.max(0) as u32,
+            window.height.max(0) as u32,
+        );
         if let Some(enabled) = app.take_vsync_change() {
             vsync = sdl.set_vsync(enabled);
             eprintln!("vsync: {}", if enabled { "on" } else { "off" });

@@ -170,7 +170,7 @@ impl BandwidthEstimator {
                     - previous.sender_gap_ms)
                     .max(0.5);
                 if frame_ms > 0.0 && frame_ms < 1_000.0 {
-                    self.average_frame_ms = Some(smooth(self.average_frame_ms, frame_ms));
+                    self.average_frame_ms = Some(blend(self.average_frame_ms, frame_ms, 0.5, 0.5));
                     let receive_kbps = previous.bytes as f64 * 8.0 / received_ms;
                     // A train shorter than the receive clock can resolve, such as a
                     // single-packet frame in a static scene, only bounds capacity from
@@ -180,12 +180,22 @@ impl BandwidthEstimator {
                             .average_receive_kbps
                             .is_none_or(|average| receive_kbps > average)
                     {
-                        self.average_receive_kbps =
-                            Some(smooth(self.average_receive_kbps, receive_kbps));
+                        // A cut to 30 fps sends less, so a symmetric average falls
+                        // with that send rate and the server then treats the lower
+                        // number as the path limit. Capacity climbs within a few
+                        // frames and only gives ground slowly.
+                        self.average_receive_kbps = Some(blend(
+                            self.average_receive_kbps,
+                            receive_kbps,
+                            0.5,
+                            0.02,
+                        ));
                     }
-                    self.average_utilization_percent = Some(smooth(
+                    self.average_utilization_percent = Some(blend(
                         self.average_utilization_percent,
                         (100.0 * received_ms / self.average_frame_ms.unwrap()).min(100.0),
+                        0.125,
+                        0.5,
                     ));
                     self.frames_observed = self.frames_observed.saturating_add(1);
                     if self.frames_observed % 60 == 0 {
@@ -242,8 +252,14 @@ impl BandwidthEstimator {
     }
 }
 
-fn smooth(previous: Option<f64>, value: f64) -> f64 {
-    previous.map_or(value, |previous| previous * 0.875 + value * 0.125)
+fn blend(previous: Option<f64>, value: f64, rise: f64, fall: f64) -> f64 {
+    match previous {
+        None => value,
+        Some(previous) => {
+            let weight = if value >= previous { rise } else { fall };
+            previous.mul_add(1.0 - weight, value * weight)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -413,5 +429,64 @@ mod tests {
         assert_eq!(estimator.frames_observed, 1);
         assert_eq!(estimator.lossy_frames, 0);
         assert_eq!(estimator.average_receive_kbps, Some(6_400.0));
+    }
+
+    #[test]
+    fn a_slower_send_rate_keeps_capacity_and_a_faster_one_climbs_back() {
+        let mut estimator = BandwidthEstimator::default();
+        let origin = Instant::now();
+        for frame in 0..=100_u32 {
+            let at = origin + Duration::from_millis(u64::from(frame) * 20);
+            let timestamp = 90_000 + frame * 1_800;
+            for part in 0..3_u32 {
+                estimator.observe(packet(
+                    frame,
+                    frame * 3 + part,
+                    timestamp,
+                    200,
+                    (part == 0, part == 2),
+                    at + Duration::from_micros(u64::from(part) * 500),
+                ));
+            }
+        }
+        assert_eq!(estimator.average_receive_kbps, Some(4_800.0));
+        for frame in 101..=140_u32 {
+            let at = origin + Duration::from_millis(u64::from(frame) * 20);
+            let timestamp = 90_000 + frame * 1_800;
+            for part in 0..3_u32 {
+                estimator.observe(packet(
+                    frame,
+                    frame * 3 + part,
+                    timestamp,
+                    100,
+                    (part == 0, part == 2),
+                    at + Duration::from_micros(u64::from(part) * 500),
+                ));
+            }
+        }
+        let held = estimator.average_receive_kbps.unwrap();
+        assert!(
+            held > 3_200.0,
+            "a 30 fps send rate must not become the path limit, held {held}"
+        );
+        for frame in 141..=146_u32 {
+            let at = origin + Duration::from_millis(u64::from(frame) * 20);
+            let timestamp = 90_000 + frame * 1_800;
+            for part in 0..3_u32 {
+                estimator.observe(packet(
+                    frame,
+                    frame * 3 + part,
+                    timestamp,
+                    200,
+                    (part == 0, part == 2),
+                    at + Duration::from_micros(u64::from(part) * 500),
+                ));
+            }
+        }
+        let recovered = estimator.average_receive_kbps.unwrap();
+        assert!(
+            recovered > 4_500.0,
+            "capacity should be back within a few 60 fps frames, recovered {recovered}"
+        );
     }
 }

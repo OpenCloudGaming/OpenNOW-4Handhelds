@@ -8,6 +8,8 @@ use std::time::Duration;
 use ash::vk::{self, Handle};
 
 mod gles;
+
+pub use gles::set_gl_proc;
 mod sand;
 
 use crate::{

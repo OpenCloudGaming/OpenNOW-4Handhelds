@@ -687,8 +687,8 @@ impl Worker {
                 &reason,
                 keyframe_attempt,
             )?,
-            MediaFeedback::DecoderError { message, .. } => {
-                self.emit("log", json!({"level":"warn","message":message}));
+            MediaFeedback::DecoderError { codec, message } => {
+                self.emit("log", json!({"level":"warn","event":"decoder-error","codec":codec,"message":message}));
                 Self::request_recovery_keyframe(
                     control,
                     signaling,
@@ -698,10 +698,10 @@ impl Worker {
                 )?;
             }
             MediaFeedback::OutputError { message } => return Err(Failure { code:"media-output-error", message }),
-            MediaFeedback::AudioDecoderError { message, consecutive } => self.emit("log", json!({"level":"warn","message":message,"consecutive":consecutive})),
-            MediaFeedback::AudioUnavailable { backend, reason, rejected } => self.emit("log", json!({"level":"warn","backend":backend,"message":reason,"rejected":rejected})),
+            MediaFeedback::AudioDecoderError { message, consecutive } => self.emit("log", json!({"level":"warn","event":"decoder-error","codec":"opus","consecutive":consecutive,"message":message})),
+            MediaFeedback::AudioUnavailable { backend, reason, rejected } => self.emit("log", json!({"level":"warn","event":"audio-unavailable","backend":backend,"message":reason,"rejected":rejected})),
             MediaFeedback::BackendFallback { from, to, reason } => self.emit("log", json!({"event":"backend-fallback","fromBackend":from,"toBackend":to,"reason":reason})),
-            MediaFeedback::ColorFormatChanged { requested, actual } => self.emit("log", json!({"level":"warn","message":format!("Color format changed from {requested:?} to {actual:?}")})),
+            MediaFeedback::ColorFormatChanged { requested, actual } => self.emit("log", json!({"level":"warn","event":"color-format-changed","message":format!("Color format changed from {requested:?} to {actual:?}")})),
             MediaFeedback::DeviceLost { subsystem, recovered, message } => {
                 self.emit("log", json!({"event":"device-state","subsystem":subsystem,"recovered":recovered,"message":message}));
                 if recovered {

@@ -43,7 +43,9 @@ pub use microphone::{
 };
 #[cfg(target_os = "linux")]
 pub use opennow_streamer_platform_linux::{
-    LinuxGpuFrame, LinuxGpuFrameProducer, SharedVulkanDevice,
+    LinuxGpuFrame, LinuxGpuFrameProducer, SharedVulkanDevice, arm_display_scanout,
+    display_scanout_failed, display_scanout_sequence, present_display_plane, set_gl_proc,
+    set_display_scanout_suspended,
 };
 #[cfg(not(target_os = "linux"))]
 pub enum SharedVulkanDevice {}

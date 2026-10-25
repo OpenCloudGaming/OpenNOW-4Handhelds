@@ -15,6 +15,7 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use thiserror::Error;
 
+use crate::nvst::IceResponseTracker;
 use crate::{EncodedMediaFrame, MediaConsumer, install_crypto};
 
 mod diagnostics;
@@ -438,6 +439,12 @@ pub fn negotiate(
             .start_dtls(true)
             .map_err(|error| TransportError::Offer(error.to_string()))?;
     }
+    let remote_ice_password = offer
+        .session
+        .ice_creds()
+        .or_else(|| offer.media_lines.iter().find_map(|media| media.ice_creds()))
+        .ok_or_else(|| TransportError::Offer("missing a=ice-ufrag/pwd".to_owned()))?
+        .pass;
     let answer = rtc
         .sdp_api()
         .accept_offer(offer.into())
@@ -546,6 +553,8 @@ pub fn negotiate(
                 media_consumer,
                 video_codec: codec,
                 stats: Stats::new(video_mid, video_clock_rate),
+                ice_responses: IceResponseTracker::default(),
+                remote_ice_password,
                 channels,
                 input: InputChannelState::default(),
                 input_ready,
@@ -800,6 +809,8 @@ struct TransportWorker {
     media_consumer: MediaConsumer,
     video_codec: NegotiatedVideoCodec,
     stats: Stats,
+    ice_responses: IceResponseTracker,
+    remote_ice_password: String,
     channels: InputChannels,
     input: InputChannelState,
     input_ready: Arc<AtomicBool>,
@@ -1087,6 +1098,7 @@ impl TransportWorker {
                     Output::Timeout(timeout) => break timeout,
                     Output::Transmit(packet) => {
                         self.traffic.transmitted.record(&packet.contents);
+                        self.ice_responses.sent(&packet.contents);
                         self.traffic.last_tx_port = Some(packet.destination.port());
                         if packet.destination.ip() == self.peer {
                             self.traffic.tx_to_known_peer += 1;
@@ -1138,7 +1150,11 @@ impl TransportWorker {
                             contents,
                         },
                     );
-                    if self.rtc.accepts(&input) {
+                    if self.rtc.accepts(&input)
+                        && self
+                            .ice_responses
+                            .accept(&bytes[..length], &self.remote_ice_password)
+                    {
                         self.traffic.routed.record(&bytes[..length]);
                         self.rtc
                             .handle_input(input)
